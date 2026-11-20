@@ -140,7 +140,7 @@ export function logPath(home: string): string {
 export interface EnsureAgentOptions {
   root: string
   name: string
-  /** Working directory the log starts in (remote when the machine kind is ssh). */
+  /** Working directory the log starts in; a delegated worker inherits it. */
   cwd: string
   /** Only used when the log is being created; afterwards `session_created` wins. */
   model: string

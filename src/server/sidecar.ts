@@ -1,19 +1,23 @@
-// `<agentHome>/sessions/main/ctrl.json` — the machine binding (CONTRACT §4, §8).
+// `<agentHome>/sessions/main/ctrl.json` — where this agent works (CONTRACT §4, §8).
 //
 // The event log belongs to pi-durable and ctrl adds no fields to it, so "which
-// machine are this agent's hands on, and where" lives next to it instead. In v2
-// the session id is always "main" and `home` is the agent's directory
-// (`<root>/agents/<name>`), so the file lands exactly where CONTRACT §4 draws it.
+// workspace was this agent using" lives next to it instead. In v3 there is no
+// machine: a worker runs where ctrl runs, and the only thing worth remembering
+// is the directory. The session id is always "main" and `home` is the agent's
+// directory, so the file lands exactly where CONTRACT §4 draws it.
+//
 // Reading is best-effort by design: a corrupt sidecar must never make an agent
-// un-openable, it just means we fall back to the cwd recorded in the log.
+// un-openable, it just means we fall back to the cwd recorded in the log. A v2
+// file still carries `machine`/`remoteCwd`; `machine` is ignored and the old
+// `remoteCwd` is still understood as the workspace.
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { resolvePaths } from "../engine/durable.ts"
 
 export interface SessionSidecar {
-  machine: string
-  remoteCwd: string
+  /** The workspace the agent (and therefore its workers) works in. */
+  cwd: string
   createdAt: string
 }
 
@@ -31,11 +35,7 @@ export function writeSidecar(
   value: SessionSidecar,
 ): SessionSidecar {
   const file = sidecarPath(home, sessionId)
-  const record: SessionSidecar = {
-    machine: value.machine,
-    remoteCwd: value.remoteCwd,
-    createdAt: value.createdAt,
-  }
+  const record: SessionSidecar = { cwd: value.cwd, createdAt: value.createdAt }
   mkdirSync(path.dirname(file), { recursive: true })
   writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, "utf8")
   return record
@@ -57,13 +57,17 @@ export function readSidecar(home: string | undefined, sessionId: string): Sessio
   }
   try {
     const parsed: unknown = JSON.parse(raw)
-    if (typeof parsed !== "object" || parsed === null) return undefined
-    const candidate = parsed as Partial<SessionSidecar>
-    if (typeof candidate.machine !== "string" || candidate.machine === "") return undefined
-    if (typeof candidate.remoteCwd !== "string" || candidate.remoteCwd === "") return undefined
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined
+    const candidate = parsed as Partial<SessionSidecar> & { remoteCwd?: unknown }
+    // v2 wrote `remoteCwd`; v3 writes `cwd`. Both mean the workspace.
+    const cwd = typeof candidate.cwd === "string" && candidate.cwd !== ""
+      ? candidate.cwd
+      : typeof candidate.remoteCwd === "string"
+        ? candidate.remoteCwd
+        : undefined
+    if (cwd === undefined || cwd === "") return undefined
     return {
-      machine: candidate.machine,
-      remoteCwd: candidate.remoteCwd,
+      cwd,
       createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : new Date(0).toISOString(),
     }
   } catch {

@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-// ctrl — one process, one named agent, one log, one machine.
+// ctrl — one process, one named agent, one log, one workspace.
 //
-//   node --experimental-strip-types src/cli/index.ts --agent builder --machine hw-nj
+//   node --experimental-strip-types src/cli/index.ts --agent builder
 //   node --experimental-strip-types src/cli/index.ts agent new builder --model workbuddy/deepseek-v4.1-flash
 //   node --experimental-strip-types src/cli/index.ts agent list
 //
-// There is no `--home` and no session id anywhere: an agent is a directory
-// under `--root`, and that directory is the whole of its state.
+// There is no `--home`, no session id and no `--machine` anywhere: an agent is
+// a directory under `--root`, and work happens in the pi workers it delegates
+// to, not in this process.
 
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
@@ -27,9 +28,9 @@ import {
   DEFAULT_MODEL,
   DEFAULT_PORT,
   DEFAULT_REASONING_EFFORT,
-  readSshHosts,
   startServer,
 } from "../server/server.ts"
+import { DEFAULT_MAX_WORKERS, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER } from "../jobs/runner.ts"
 
 export type Mode = "serve" | "agent-list" | "agent-new" | "agent-rm" | "help" | "version"
 
@@ -42,8 +43,12 @@ interface Flags {
   workspace?: string
   root?: string
   agent: string
-  machine: string
-  allowBash: boolean
+  /** The `pi` binary a worker is spawned as. */
+  piBin: string
+  /** Provider a worker is told to use (`pi -p` is ambiguous without one). */
+  piProvider: string
+  /** How many workers may run at once. */
+  maxWorkers: number
   maxSteps: number
   /** Undefined means "let the server resolve": PI_DURABLE_MODEL, then the default. */
   model?: string
@@ -56,7 +61,7 @@ interface Flags {
 
 const AGENT_SUBCOMMANDS = ["list", "new", "rm"] as const
 
-const USAGE = `ctrl — one named agent, one log, one machine.
+const USAGE = `ctrl — one named agent, one log, one workspace.
 
 Usage:
   ctrl [serve] [options]
@@ -68,10 +73,10 @@ Serve options:
   --agent <name>     the agent to serve (default ${DEFAULT_AGENT}); its directory
                      is created on first start
   --root <dir>       where agents live (default $CTRL_ROOT or ~/.ctrl)
-  --machine <name>   local only for now (remote machines are parked)
-  --workspace <dir>  working directory for the agent's hands
-                     (default: current directory for --machine local, ~ for ssh)
-  --allow-bash       advertise the bash tool to the model (hidden otherwise)
+  --workspace <dir>  directory the agent works in (default: current directory)
+  --pi-bin <path>    the pi binary a worker is spawned as (default ${DEFAULT_PI_BIN})
+  --pi-provider <p>  provider a worker passes to pi (default ${DEFAULT_PI_PROVIDER})
+  --max-workers <n>  how many workers may run at once (default ${DEFAULT_MAX_WORKERS})
   --max-steps <n>    tool-loop budget per turn (default ${DEFAULT_MAX_STEPS})
   --model <id>       model for a brand-new log (default workbuddy/deepseek-v4.1-flash,
                      or $PI_DURABLE_MODEL); afterwards the log decides
@@ -98,8 +103,9 @@ export function parseArgs(argv: string[]): Flags {
     port: DEFAULT_PORT,
     host: DEFAULT_HOST,
     agent: DEFAULT_AGENT,
-    machine: "local",
-    allowBash: false,
+    piBin: DEFAULT_PI_BIN,
+    piProvider: DEFAULT_PI_PROVIDER,
+    maxWorkers: DEFAULT_MAX_WORKERS,
     maxSteps: DEFAULT_MAX_STEPS,
     json: false,
     purge: false,
@@ -162,16 +168,17 @@ export function parseArgs(argv: string[]): Flags {
       case "--agent":
         flags.agent = agentNameFlag("--agent", value())
         break
-      case "--machine": {
-        // The ssh executor exists in the tree, but remote machines are parked:
-        // one local agent is the whole v1. Reopening this is a two-line change.
-        const machine = word(value(), "--machine")
-        if (machine !== "local") {
-          throw new UsageError(`remote machines are parked for now: v1 is local-only (got "${machine}")`)
-        }
-        flags.machine = machine
+      case "--pi-bin":
+        flags.piBin = word(value(), "--pi-bin")
         break
-      }
+      case "--pi-provider":
+        // An empty provider is allowed: pi then uses whatever it is configured
+        // with, which is exactly what somebody who passed "" asked for.
+        flags.piProvider = inline !== undefined ? inline.trim() : value().trim()
+        break
+      case "--max-workers":
+        flags.maxWorkers = integer(value(), "--max-workers", 1, 64)
+        break
       case "--max-steps":
         flags.maxSteps = integer(value(), "--max-steps", 1, 200)
         break
@@ -180,10 +187,6 @@ export function parseArgs(argv: string[]): Flags {
         break
       case "--reasoning-effort":
         flags.reasoningEffort = effort(value())
-        break
-      case "--allow-bash":
-        noValue(name, inline)
-        flags.allowBash = true
         break
       case "--json":
         noValue(name, inline)
@@ -368,9 +371,9 @@ function resolveModel(flags: Flags): string {
   return flags.model?.trim() || process.env.PI_DURABLE_MODEL?.trim() || DEFAULT_MODEL
 }
 
-/** Where `agent new` puts the log: current directory locally, ~ on an ssh host. */
+/** Where `agent new` puts the log: the current directory unless told otherwise. */
 function defaultWorkspace(flags: Flags): string {
-  return flags.workspace ?? (flags.machine === "local" ? process.cwd() : "~")
+  return flags.workspace ?? process.cwd()
 }
 
 function report(error: unknown): number {
@@ -393,15 +396,7 @@ async function serveCommand(flags: Flags): Promise<number> {
     return report(error)
   }
 
-  const isLocal = flags.machine === "local"
-  const workspace = flags.workspace ?? (isLocal ? process.cwd() : "~")
-  if (!isLocal && !readSshHosts().includes(flags.machine)) {
-    // Not fatal: a plain host name that resolves is a legitimate machine too.
-    // No probing either — the first real tool call is the probe (PLAN §4).
-    process.stderr.write(
-      `ctrl: "${flags.machine}" is not a Host in ~/.ssh/config; using it anyway\n`,
-    )
-  }
+  const workspace = flags.workspace ?? process.cwd()
 
   let running
   try {
@@ -410,9 +405,10 @@ async function serveCommand(flags: Flags): Promise<number> {
       agent: flags.agent,
       port: flags.port,
       host: flags.host,
-      machine: flags.machine,
       workspace,
-      allowBash: flags.allowBash,
+      piBin: flags.piBin,
+      piProvider: flags.piProvider,
+      maxWorkers: flags.maxWorkers,
       maxSteps: flags.maxSteps,
       ...(flags.model !== undefined ? { model: flags.model } : {}),
       ...(flags.reasoningEffort !== undefined ? { reasoningEffort: flags.reasoningEffort } : {}),
@@ -433,10 +429,12 @@ async function serveCommand(flags: Flags): Promise<number> {
   const model = running.ctx.defaultModel
   process.stdout.write(
     `ctrl ${version()} listening on ${running.url}\n` +
-      `  agent: ${running.ctx.agent} (log ${summary?.events ?? 0} events) / machine: ${running.ctx.machine.name} / model: ${model}\n` +
-      `  directory: ${running.ctx.agentHome}\n` +
+      `  agent: ${running.ctx.agent} (log ${summary?.events ?? 0} events)\n` +
       `  workspace: ${workspace}\n` +
-      `  bash: ${flags.allowBash ? "advertised" : "hidden (--allow-bash to enable)"}\n`,
+      `  model: ${model}\n` +
+      `  pi bin: ${running.ctx.jobs.piBin} (provider ${running.ctx.jobs.piProvider || "default"})\n` +
+      `  max workers: ${running.ctx.jobs.maxWorkers}\n` +
+      `  directory: ${running.ctx.agentHome}\n`,
   )
 
   const shutdown = (signal: string) => {

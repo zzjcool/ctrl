@@ -1,7 +1,8 @@
-// `<sessionDir>/ctrl.json`: the machine binding (CONTRACT §8, PLAN §2.6).
+// `<sessionDir>/ctrl.json`: the workspace this agent works in (CONTRACT §4, §8).
 //
 // The rule that matters: a broken sidecar must never make a session
-// un-openable — it degrades to "unknown, use the cwd from the log".
+// un-openable — it degrades to "unknown, use the cwd from the log". v3 dropped
+// the machine, so a v2 file must still be readable (its `machine` is ignored).
 
 import assert from "node:assert/strict"
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises"
@@ -20,17 +21,16 @@ test("sidecar lives next to the session log, not inside it", async () => {
   assert.equal(file, path.join(root, "sessions", "20261016T193612Z-abc12345", "ctrl.json"))
 })
 
-test("write then read round trips the binding", async () => {
+test("write then read round trips the workspace", async () => {
   const root = await home()
   const written = writeSidecar(root, "s1", {
-    machine: "hw-nj",
-    remoteCwd: "/home/u/proj",
+    cwd: "/home/u/proj",
     createdAt: "2026-10-16T19:36:12.000Z",
   })
   assert.deepEqual(readSidecar(root, "s1"), written)
   const onDisk = JSON.parse(await readFile(sidecarPath(root, "s1"), "utf8"))
-  assert.equal(onDisk.machine, "hw-nj")
-  assert.equal(onDisk.remoteCwd, "/home/u/proj")
+  assert.deepEqual(Object.keys(onDisk).sort(), ["createdAt", "cwd"], "v3 writes cwd and createdAt, nothing else")
+  assert.equal(onDisk.cwd, "/home/u/proj")
 })
 
 test("a missing sidecar is not an error", async () => {
@@ -42,7 +42,7 @@ test("a corrupt sidecar is ignored instead of thrown", async () => {
   const root = await home()
   const file = sidecarPath(root, "s2")
   await mkdir(path.dirname(file), { recursive: true })
-  for (const body of ["{", "", "[]", "null", '{"machine":42}', '{"machine":"hw-nj"}']) {
+  for (const body of ["{", "", "[]", "null", '{"cwd":42}', '{"machine":"hw-nj"}']) {
     await writeFile(file, body)
     assert.equal(readSidecar(root, "s2"), undefined, `body: ${body}`)
   }
@@ -52,11 +52,21 @@ test("a partially valid sidecar keeps the fields it has and defaults the rest", 
   const root = await home()
   const file = sidecarPath(root, "s3")
   await mkdir(path.dirname(file), { recursive: true })
-  await writeFile(file, JSON.stringify({ machine: "hw-nj", remoteCwd: "/srv" }))
+  await writeFile(file, JSON.stringify({ cwd: "/srv" }))
   const value = readSidecar(root, "s3")
-  assert.equal(value?.machine, "hw-nj")
-  assert.equal(value?.remoteCwd, "/srv")
+  assert.equal(value?.cwd, "/srv")
   assert.equal(value?.createdAt, new Date(0).toISOString())
+})
+
+test("a v2 sidecar still yields a workspace: machine is ignored, remoteCwd is the cwd", async () => {
+  const root = await home()
+  const file = sidecarPath(root, "s4")
+  await mkdir(path.dirname(file), { recursive: true })
+  await writeFile(
+    file,
+    JSON.stringify({ machine: "hw-nj", remoteCwd: "/home/u/proj", createdAt: "2026-10-16T19:36:12.000Z" }),
+  )
+  assert.deepEqual(readSidecar(root, "s4"), { cwd: "/home/u/proj", createdAt: "2026-10-16T19:36:12.000Z" })
 })
 
 test("an id that could escape the sessions directory is refused", async () => {

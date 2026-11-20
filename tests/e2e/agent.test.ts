@@ -1,15 +1,17 @@
-// End-to-end: a fake LLM, a real ctrl server, a real local executor, one agent.
+// End-to-end: a fake LLM, a fake pi, a real ctrl server, one agent.
 //
-// No real network: the "model" is a scripted OpenAI-compatible HTTP server on
-// 127.0.0.1 (the same trick pi-durable's tests/e2e/fake-llm-server.ts uses), so
-// the whole path — HTTP route → TurnRegistry → runAgent → tools → events — is
-// exercised for real. The identity under test is a directory: `<root>/agents/<name>`.
+// No real network and no real worker: the "model" is a scripted OpenAI-compatible
+// HTTP server on 127.0.0.1 (the same trick pi-durable's tests/e2e/fake-llm-server.ts
+// uses) and "pi" is a shell script. Everything between them is real — HTTP route →
+// TurnRegistry → runAgent → delegate → spawn → meta.json → /api/jobs — so the whole
+// v3 split (ctrl talks, pi works) is exercised end to end. The identity under test
+// is a directory: `<root>/agents/<name>`.
 
 import assert from "node:assert/strict"
 import { createServer, request as httpRequest } from "node:http"
 import type { IncomingMessage, ServerResponse } from "node:http"
 import type { AddressInfo } from "node:net"
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { after, before, test } from "node:test"
@@ -169,11 +171,24 @@ function request(port: number, method: string, requestPath: string, body?: unkno
 
 const AGENT = "tester"
 
+/** Stands in for `pi`: it prints its argv, waits, prints a result, exits 0. */
+const FAKE_PI_SOURCE = `#!/bin/sh
+printf 'args: %s\\n' "$*"
+sleep 0.3
+printf 'found 42 files\\n'
+printf 'done\\n'
+exit 0
+`
+
 interface Fixture {
   running: RunningServer
   fake: FakeLlm
   root: string
   workspace: string
+  /** The fake `pi` binary handed to the server as --pi-bin. */
+  piBin: string
+  /** Directory holding the fake pi, removed after the run. */
+  binDir: string
 }
 
 let fixture: Fixture
@@ -183,6 +198,7 @@ interface StartOptions {
   agent?: string
   root?: string
   workspace?: string
+  piBin?: string
 }
 
 async function startCtrl(opts: StartOptions): Promise<RunningServer> {
@@ -192,9 +208,11 @@ async function startCtrl(opts: StartOptions): Promise<RunningServer> {
     workspace: opts.workspace,
     port: 0,
     host: "127.0.0.1",
-    machine: "local",
-    allowBash: true,
     maxSteps: 6,
+    // A fake worker keeps this honest: no test may call the real pi.
+    piBin: opts.piBin,
+    piProvider: "any-endpoint",
+    maxWorkers: 3,
     env: {
       ...process.env,
       PI_DURABLE_API_KEY: "test-key",
@@ -204,11 +222,19 @@ async function startCtrl(opts: StartOptions): Promise<RunningServer> {
   })
 }
 
+async function makeFakePi(): Promise<{ piBin: string; binDir: string }> {
+  const binDir = await mkdtemp(path.join(tmpdir(), "ctrl-e2e-bin-"))
+  const piBin = path.join(binDir, "pi")
+  await writeFile(piBin, FAKE_PI_SOURCE, { mode: 0o755 })
+  return { piBin, binDir }
+}
+
 async function startFixture(baseUrl: string): Promise<Fixture> {
   const root = await mkdtemp(path.join(tmpdir(), "ctrl-e2e-root-"))
   const workspace = await mkdtemp(path.join(tmpdir(), "ctrl-e2e-work-"))
-  const running = await startCtrl({ baseUrl, root, workspace })
-  return { running, fake: undefined as unknown as FakeLlm, root, workspace }
+  const { piBin, binDir } = await makeFakePi()
+  const running = await startCtrl({ baseUrl, root, workspace, piBin })
+  return { running, fake: undefined as unknown as FakeLlm, root, workspace, piBin, binDir }
 }
 
 before(async () => {
@@ -222,6 +248,7 @@ after(async () => {
   await fixture.fake.close()
   await rm(fixture.root, { recursive: true, force: true })
   await rm(fixture.workspace, { recursive: true, force: true })
+  await rm(fixture.binDir, { recursive: true, force: true })
 })
 
 function api(method: string, requestPath: string, body?: unknown): Promise<Reply> {
@@ -260,22 +287,22 @@ async function send(text: string): Promise<Reply> {
 // Tests — one narrative, in order; the agent IS the directory
 // ---------------------------------------------------------------------------
 
-test("one agent, named on disk, with one log", async () => {
+test("one agent, named on disk, with one log and no machine", async () => {
   const health = await api("GET", "/api/health")
   assert.equal(health.status, 200)
-  assert.deepEqual(health.json, { status: "ok", agent: AGENT, machine: "local", kind: "local" })
+  assert.deepEqual(health.json, { status: "ok", agent: AGENT }, "no machine and no kind: ctrl has no hands")
 
   const detail = await api("GET", "/api/agent")
   assert.equal(detail.status, 200, detail.text)
   assert.equal(detail.json.agent, AGENT, "the agent is a name, not a title")
   assert.equal(detail.json.session.sessionId, "main", "the log id is always main")
   assert.equal(detail.json.session.model, "fake-model")
-  assert.equal(detail.json.session.machine, "local")
-  assert.equal(detail.json.session.remoteCwd, fixture.workspace)
+  assert.equal(detail.json.session.cwd, fixture.workspace, "the workspace comes from the sidecar")
   assert.equal(detail.json.session.eventCount, 1, "a fresh agent has exactly session_created")
   assert.deepEqual(detail.json.resumePoint, { kind: "clean" })
   assert.equal(detail.json.turn.running, false)
-  assert.equal(detail.json.machine, "local")
+  assert.equal(detail.json.machine, undefined, "there is no machine to report")
+  assert.equal(detail.json.session.machine, undefined)
 
   const home = path.join(fixture.root, "agents", AGENT)
   const agentFile = JSON.parse(await readFile(path.join(home, "agent.json"), "utf8"))
@@ -284,22 +311,39 @@ test("one agent, named on disk, with one log", async () => {
   assert.equal(typeof agentFile.createdAt, "string")
   assert.ok((await stat(path.join(home, "sessions", "main", "events.jsonl"))).isFile())
   const sidecar = JSON.parse(await readFile(path.join(home, "sessions", "main", "ctrl.json"), "utf8"))
-  assert.equal(sidecar.machine, "local")
-  assert.equal(sidecar.remoteCwd, fixture.workspace)
+  assert.deepEqual(Object.keys(sidecar).sort(), ["createdAt", "cwd"], "v3 remembers a directory, not a machine")
+  assert.equal(sidecar.cwd, fixture.workspace)
+
+  // No worker has run yet, and there is no machines route to ask about.
+  assert.deepEqual((await api("GET", "/api/jobs")).json, { jobs: [] })
+  assert.equal((await api("GET", "/api/machines")).status, 404)
 
   // Nothing pretends to be a second agent.
   assert.equal((await api("GET", "/api/agents")).status, 404)
 })
 
-test("a turn runs tools and the event stream carries the card data", async () => {
-  const target = path.join(fixture.workspace, "hello.txt")
+/** Poll `/api/jobs` until the job stops running, then return its summary. */
+async function waitForJob(id: string, timeoutMs = 10_000): Promise<Record<string, any>> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const reply = await api("GET", "/api/jobs")
+    assert.equal(reply.status, 200, reply.text)
+    const job = (reply.json.jobs as Record<string, any>[]).find((candidate) => candidate.id === id)
+    if (job !== undefined && job.state !== "running") return job
+    if (Date.now() > deadline) throw new Error(`job ${id} never finished: ${JSON.stringify(job)}`)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+}
+
+/** The id of the one job this narrative delegates to. */
+let delegatedJob = ""
+
+test("a turn delegates to a pi worker and the log carries the job id", async () => {
   fixture.fake.reset()
+  fixture.fake.push({ toolCalls: [{ name: "delegate", arguments: { task: "count the .ts files under src" } }] })
+  fixture.fake.push({ content: "the worker is counting them" })
 
-  fixture.fake.push({ toolCalls: [{ name: "write_file", arguments: { path: target, content: "hello" } }] })
-  fixture.fake.push({ toolCalls: [{ name: "bash", arguments: { command: "cat hello.txt" } }] })
-  fixture.fake.push({ content: "wrote and read hello.txt" })
-
-  const created = await send("make hello.txt")
+  const created = await send("how many .ts files are there?")
   assert.equal(created.status, 202, created.text)
   assert.equal(created.json.accepted, true)
   assert.equal(created.json.turn.running, true)
@@ -307,27 +351,43 @@ test("a turn runs tools and the event stream carries the card data", async () =>
   const snapshot = await settle()
   const events = snapshot.events
 
-  // The file really landed, in the directory the agent is bound to.
-  assert.equal(await readFile(target, "utf8"), "hello")
-
   const types = events.map((event) => event.type)
   assert.equal(types[0], "session_created")
   assert.ok(types.includes("user_message"))
   assert.ok(types.includes("tool_call"))
   assert.ok(types.includes("tool_result"))
-  assert.equal(types.filter((type) => type === "assistant_message").length, 3)
+  assert.equal(types.filter((type) => type === "assistant_message").length, 2)
 
   const calls = events.filter((event) => event.type === "tool_call") as Extract<SessionEvent, { type: "tool_call" }>[]
   const results = events.filter((event) => event.type === "tool_result") as Extract<SessionEvent, { type: "tool_result" }>[]
-  assert.deepEqual(calls.map((event) => event.data.name), ["write_file", "bash"])
-  assert.deepEqual(results.map((event) => event.data.ok), [true, true])
+  assert.deepEqual(calls.map((event) => event.data.name), ["delegate"])
+  assert.deepEqual(results.map((event) => event.data.ok), [true])
   assert.equal(results[0]?.data.callId, calls[0]?.data.callId)
-  assert.equal(results[1]?.data.output.trim(), "hello")
+
+  const match = /^started job (\S+) — poll with job_status$/.exec(results[0]?.data.output ?? "")
+  assert.ok(match, `unexpected delegate output: ${results[0]?.data.output}`)
+  const id = match[1] as string
+  delegatedJob = id
 
   const final = events.filter((event) => event.type === "assistant_message").at(-1) as
     | Extract<SessionEvent, { type: "assistant_message" }>
     | undefined
-  assert.equal(final?.data.text, "wrote and read hello.txt")
+  assert.equal(final?.data.text, "the worker is counting them")
+
+  // The job is a directory (CONTRACT §5.1): meta, log, and the worker's own pi session.
+  const jobDir = path.join(fixture.root, "agents", AGENT, "jobs", id)
+  const meta = JSON.parse(await readFile(path.join(jobDir, "meta.json"), "utf8"))
+  assert.equal(meta.id, id)
+  assert.equal(meta.task, "count the .ts files under src")
+  assert.equal(meta.cwd, fixture.workspace, "the worker runs in the agent's workspace")
+  assert.equal(meta.model, "fake-model", "the worker inherits ctrl's model unless delegate overrides it")
+  assert.equal(typeof meta.pid, "number")
+  assert.ok((await stat(path.join(jobDir, "pi"))).isDirectory())
+  assert.ok((await stat(path.join(jobDir, "out.log"))).isFile())
+
+  // ctrl itself touched nothing: the workspace is still empty. The work happened
+  // in the worker, which is the whole point of the v3 split.
+  assert.deepEqual(await readdir(fixture.workspace), [])
 
   // seq is dense and 0-based: the array index IS the seq.
   events.forEach((event, index) => assert.equal(event.seq, index))
@@ -339,6 +399,42 @@ test("a turn runs tools and the event stream carries the card data", async () =>
   assert.equal(tail.since, 3)
   assert.equal(tail.events.length, events.length - 3)
   assert.equal(tail.events[0]?.seq, 3)
+})
+
+test("job_status reports what the worker did, and /api/jobs agrees", async () => {
+  const job = await waitForJob(delegatedJob)
+  assert.equal(job.state, "exited")
+  assert.equal(job.code, 0)
+  assert.equal(job.task, "count the .ts files under src")
+  assert.equal(typeof job.startedAt, "string")
+  assert.ok(job.elapsedMs >= 250, `the worker's runtime is measured (got ${job.elapsedMs})`)
+  assert.deepEqual(Object.keys(job).sort(), ["code", "elapsedMs", "id", "startedAt", "state", "task"])
+
+  const log = await readFile(path.join(fixture.root, "agents", AGENT, "jobs", delegatedJob, "out.log"), "utf8")
+  assert.match(log, /args: -p count the \.ts files under src --provider any-endpoint --model fake-model --thinking max/)
+
+  fixture.fake.reset()
+  fixture.fake.push({ toolCalls: [{ name: "job_status", arguments: { id: delegatedJob, lines: 10 } }] })
+  fixture.fake.push({ content: "the worker found 42 files" })
+
+  assert.equal((await send("what did the worker say?")).status, 202)
+  const snapshot = await settle()
+  const calls = snapshot.events.filter((event) => event.type === "tool_call") as Extract<
+    SessionEvent,
+    { type: "tool_call" }
+  >[]
+  // The whole log is returned (since=0), so this is every call made so far.
+  assert.deepEqual(calls.map((event) => event.data.name), ["delegate", "job_status"])
+  assert.equal(calls.at(-1)?.data.name, "job_status", "the new turn polled the job")
+  const results = snapshot.events.filter((event) => event.type === "tool_result") as Extract<
+    SessionEvent,
+    { type: "tool_result" }
+  >[]
+  const output = results.at(-1)?.data.output ?? ""
+  assert.ok(output.includes(`job ${delegatedJob}`), output)
+  assert.match(output, /state: exited {2}exit: 0/)
+  assert.match(output, /found 42 files/)
+  assert.match(output, /done/)
 })
 
 test("tail and before page through one log without losing it", async () => {
@@ -384,7 +480,7 @@ test("a second turn while one is running is 409", async () => {
     SessionEvent,
     { type: "user_message" }
   >[]).map((event) => event.data.text)
-  assert.deepEqual(texts, ["make hello.txt", "slow"])
+  assert.deepEqual(texts, ["how many .ts files are there?", "what did the worker say?", "slow"])
 })
 
 test("abort stops the turn and says so in the log", async () => {
@@ -455,23 +551,35 @@ test("memory is the agent's own, with tombstone semantics", async () => {
   assert.equal(gone.status, 404)
 })
 
-test("restarting ctrl finds the same log, memory and machine binding", async () => {
+test("restarting ctrl finds the same log, memory, workspace and jobs", async () => {
   const beforeRestart = await eventsStream("?since=0")
   const lastSeq = beforeRestart.events.at(-1)?.seq
   assert.equal(typeof lastSeq, "number")
 
   await fixture.running.close()
-  fixture.running = await startCtrl({ baseUrl: fixture.fake.url, root: fixture.root, workspace: fixture.workspace })
+  fixture.running = await startCtrl({
+    baseUrl: fixture.fake.url,
+    root: fixture.root,
+    workspace: fixture.workspace,
+    piBin: fixture.piBin,
+  })
 
   const detail = await api("GET", "/api/agent")
   assert.equal(detail.status, 200, detail.text)
   assert.equal(detail.json.agent, AGENT)
   assert.equal(detail.json.session.eventCount, beforeRestart.total, "the log survived")
   assert.equal(detail.json.session.model, "fake-model", "the model is the one the log recorded")
-  assert.equal(detail.json.session.machine, "local", "the machine binding is in ctrl.json")
-  assert.equal(detail.json.session.remoteCwd, fixture.workspace)
+  assert.equal(detail.json.session.cwd, fixture.workspace, "the workspace is remembered in ctrl.json")
   assert.deepEqual(detail.json.resumePoint, { kind: "clean" })
   assert.equal(detail.json.turn.running, false, "a restart is not a running turn")
+
+  // The job's final state was never in memory: it is meta.json on disk.
+  const jobs = await api("GET", "/api/jobs")
+  assert.equal(jobs.status, 200, jobs.text)
+  const job = (jobs.json.jobs as Record<string, any>[]).find((candidate) => candidate.id === delegatedJob)
+  assert.ok(job, "the job directory survived the restart")
+  assert.equal(job.state, "exited")
+  assert.equal(job.code, 0)
 
   // And it keeps writing to the same log: seq continues, nothing is renumbered.
   fixture.fake.reset()
@@ -548,16 +656,14 @@ test("a request body over the limit is refused before it is parsed", async () =>
   assert.equal(reply.status, 413, reply.text)
 })
 
-test("an empty message is refused, and machines describe one current machine", async () => {
+test("an empty message is refused, and there is no machine to describe", async () => {
   const empty = await api("POST", "/api/agent/messages", { text: "   " })
   assert.equal(empty.status, 400, empty.text)
 
-  const machines = await api("GET", "/api/machines")
-  assert.equal(machines.status, 200)
-  const current = machines.json.machines.filter((machine: { current: boolean }) => machine.current)
-  assert.equal(current.length, 1)
-  assert.equal(current[0].name, "local")
-  assert.equal(current[0].kind, "local")
+  // CONTRACT §2: no machines, local or remote.
+  assert.equal((await api("GET", "/api/machines")).status, 404)
+  // `/api/jobs` is a read-only projection of the jobs directory.
+  assert.equal((await api("POST", "/api/jobs", {})).status, 405)
 })
 
 test("the page is served, and only from the public directory", async () => {

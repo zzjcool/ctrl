@@ -1,23 +1,20 @@
 // node:http assembly: API routes plus the one page (CONTRACT §9).
 //
 // No framework, no middleware, no dependency. The process holds one named
-// agent — one log, one memory, one machine binding — and that is the whole
-// surface. There is nothing to switch to, so nothing here takes an id.
+// agent — one log, one memory, one workspace — and that is the whole surface.
+// There is nothing to switch to, so nothing here takes an id, and there is no
+// executor: work happens in pi workers (src/jobs), not in ctrl.
 
-import { readFileSync } from "node:fs"
 import { createServer } from "node:http"
 import type { IncomingMessage, Server, ServerResponse } from "node:http"
-import { homedir } from "node:os"
-import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createChatCompletionsClient } from "../engine/durable.ts"
 import type { LlmClient } from "../engine/durable.ts"
-import { LocalExecutor } from "../exec/local.ts"
-import { SshExecutor } from "../exec/ssh.ts"
+import { DEFAULT_MAX_WORKERS, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER, JobRunner } from "../jobs/runner.ts"
 import { createTools } from "../tools/index.ts"
 import { DEFAULT_AGENT, LOG_ID, ensureAgent, resolveRoot } from "./agents.ts"
 import { sendJson, serveStatic } from "./http.ts"
-import { handleApiRequest, type AppContext, type MachineKind } from "./routes.ts"
+import { handleApiRequest, type AppContext } from "./routes.ts"
 import { readSidecar, writeSidecar } from "./sidecar.ts"
 import { TurnRegistry } from "./turns.ts"
 
@@ -41,11 +38,8 @@ export interface ServerConfig {
   agent?: string
   port?: number
   host?: string
-  /** `local` or an ssh host alias from ~/.ssh/config. */
-  machine?: string
-  /** Working directory the agent's hands start in (remote when kind is ssh). */
+  /** The one directory the agent and its workers live in. Defaults to cwd. */
   workspace?: string
-  allowBash?: boolean
   maxSteps?: number
   /** Model id for a new log; falls back to PI_DURABLE_MODEL, then DEFAULT_MODEL. */
   model?: string
@@ -53,6 +47,12 @@ export interface ServerConfig {
   reasoningEffort?: string
   /** Completion cap per model call. */
   maxTokens?: number
+  /** The `pi` binary a worker is spawned as. Defaults to `pi` on PATH. */
+  piBin?: string
+  /** Provider a worker is told to use; `pi -p` is ambiguous without one. */
+  piProvider?: string
+  /** How many workers may run at once. Defaults to 3. */
+  maxWorkers?: number
   publicDir?: string
   env?: NodeJS.ProcessEnv
   /** Injected by tests; by default a real chat/completions client. */
@@ -69,13 +69,7 @@ export interface RunningServer {
 
 export function buildContext(config: ServerConfig = {}): AppContext {
   const env = config.env ?? process.env
-  const machineName = config.machine && config.machine.trim() !== "" ? config.machine.trim() : "local"
-  const kind: MachineKind = machineName === "local" ? "local" : "ssh"
-  const workspace = config.workspace ?? (kind === "local" ? process.cwd() : "~")
-  const executor =
-    kind === "local"
-      ? new LocalExecutor({ machine: "local", cwd: workspace })
-      : new SshExecutor({ host: machineName, cwd: workspace })
+  const workspace = config.workspace?.trim() || process.cwd()
   const model = config.model?.trim() || env.PI_DURABLE_MODEL || DEFAULT_MODEL
   const reasoningEffort =
     config.reasoningEffort?.trim() || env.PI_DURABLE_REASONING_EFFORT || DEFAULT_REASONING_EFFORT
@@ -83,7 +77,6 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     Number.isFinite(config.maxTokens) && (config.maxTokens ?? 0) > 0
       ? Math.floor(config.maxTokens as number)
       : DEFAULT_MAX_TOKENS
-  const allowBash = config.allowBash === true
   const maxSteps = Number.isFinite(config.maxSteps) && (config.maxSteps ?? 0) > 0
     ? Math.floor(config.maxSteps as number)
     : DEFAULT_MAX_STEPS
@@ -94,34 +87,41 @@ export function buildContext(config: ServerConfig = {}): AppContext {
   const requestedAgent = config.agent?.trim()
   const agentName = requestedAgent !== undefined && requestedAgent !== "" ? requestedAgent : DEFAULT_AGENT
   const ensured = ensureAgent({ root, name: agentName, cwd: workspace, model })
-  // The machine binding lives next to the log, never inside it (CONTRACT §3).
-  // Restarting on another machine is a supported edit; switching mid-run is not.
+  // The workspace lives next to the log, never inside it (CONTRACT §3).
+  // Moving the agent to another directory is a supported edit; a half-remembered
+  // one is not, so `createdAt` is carried over rather than rewritten.
   writeSidecar(ensured.home, LOG_ID, {
-    machine: machineName,
-    remoteCwd: workspace,
+    cwd: workspace,
     createdAt: readSidecar(ensured.home, LOG_ID)?.createdAt ?? ensured.meta.createdAt,
+  })
+
+  // The log is the truth once it exists (PLAN §5); buildContext only picks
+  // the model for a log that is being created right now.
+  const defaultModel = ensured.session.meta().model || model
+  const runner = new JobRunner({
+    agentHome: ensured.home,
+    piBin: config.piBin ?? DEFAULT_PI_BIN,
+    piProvider: config.piProvider ?? DEFAULT_PI_PROVIDER,
+    maxWorkers: config.maxWorkers ?? DEFAULT_MAX_WORKERS,
+    model: defaultModel,
+    thinking: reasoningEffort,
   })
 
   return {
     root,
     agent: agentName,
     agentHome: ensured.home,
-    machine: { name: machineName, kind },
-    executor,
     workspace,
-    allowBash,
     maxSteps,
-    // The log is the truth once it exists (PLAN §5); buildContext only picks
-    // the model for a log that is being created right now.
-    defaultModel: ensured.session.meta().model || model,
+    defaultModel,
+    jobs: runner,
     turns: new TurnRegistry(),
-    tools: createTools(executor, { allowBash }),
+    tools: createTools({ agentHome: ensured.home, runner }),
     env,
     createLlm:
       config.createLlm ??
       ((requested: string) =>
         createChatCompletionsClient({ model: requested || model, env, reasoningEffort, maxTokens })),
-    machines: ["local", ...readSshHosts()],
   }
 }
 
@@ -159,6 +159,7 @@ export async function startServer(config: ServerConfig = {}): Promise<RunningSer
     port,
     url: `http://${host}:${port}`,
     close: async () => {
+      // Workers are detached on purpose: closing ctrl does not cancel a job.
       await ctx.turns.shutdown()
       await new Promise<void>((resolve) => {
         server.closeAllConnections()
@@ -184,31 +185,4 @@ async function handleRequest(
     if (!response.headersSent) sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
     else if (!response.writableEnded) response.end()
   }
-}
-
-/**
- * `Host` entries from ~/.ssh/config, in file order.
- *
- * Only the top-level file is read: `Include` targets are skipped on purpose
- * (the machine you want is nearly always declared where you can see it), and
- * wildcards are not machines.
- */
-export function readSshHosts(configPath = path.join(homedir(), ".ssh", "config")): string[] {
-  let raw: string
-  try {
-    raw = readFileSync(configPath, "utf8")
-  } catch {
-    return []
-  }
-  const hosts: string[] = []
-  for (const line of raw.split(/\r?\n/)) {
-    const match = /^\s*Host\s+(.+)$/i.exec(line)
-    if (!match) continue
-    for (const token of (match[1] ?? "").trim().split(/\s+/)) {
-      if (token === "") continue
-      if (token.includes("*") || token.includes("?") || token.startsWith("!")) continue
-      hosts.push(token)
-    }
-  }
-  return [...new Set(hosts)]
 }

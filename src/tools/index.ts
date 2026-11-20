@@ -1,22 +1,27 @@
-// The frozen tool set: eight tools (CONTRACT §6).
+// The frozen tool set of v3 (CONTRACT §5): three job tools plus the engine's
+// own remember/recall.
 //
-// Six execution tools (ctrl) + remember/recall (pi-durable, imported unchanged
-// so memory semantics never fork). `bash` is hidden unless --allow-bash.
+// There is nothing else. ctrl does not read files, write files, list
+// directories, run bash or reach a machine — everything that touches the world
+// happens inside a pi worker started by `delegate`. `remember`/`recall` are
+// pulled straight out of pi-durable so memory semantics never fork.
 
 import { buildTools } from "../engine/durable.ts"
 import type { ToolSpec } from "../engine/durable.ts"
-import type { Executor } from "../exec/types.ts"
-import { createExecutionTools } from "./execution.ts"
+import { createJobTools } from "../jobs/tools.ts"
+import type { JobRunner } from "../jobs/runner.ts"
 
 export interface CreateToolsOptions {
-  allowBash?: boolean
+  /** `<root>/agents/<name>` — the directory the jobs live under. */
+  agentHome: string
+  runner: JobRunner
 }
 
-/** pull remember/recall straight out of the engine's own tool table. */
+/** remember/recall, exactly as the engine defines them. */
 export function memoryTools(): ToolSpec[] {
   return buildTools().filter((tool) => tool.name === "remember" || tool.name === "recall")
 }
 
-export function createTools(executor: Executor, opts: CreateToolsOptions = {}): ToolSpec[] {
-  return [...createExecutionTools(executor, opts), ...memoryTools()]
+export function createTools(opts: CreateToolsOptions): ToolSpec[] {
+  return [...createJobTools({ agentHome: opts.agentHome, runner: opts.runner }), ...memoryTools()]
 }

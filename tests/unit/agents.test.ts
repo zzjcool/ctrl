@@ -252,15 +252,18 @@ test("rm of a missing agent is a not-found, not a crash", async () => {
 // what the model is told (CONTRACT §6)
 // ---------------------------------------------------------------------------
 
-test("the system prompt names the agent, its machine and its directory", () => {
-  const prompt = agentSystemPrompt({ name: "builder", machine: "hw-nj", cwd: "/srv/proj" })
+test("the system prompt names the agent and says it has no hands", () => {
+  const prompt = agentSystemPrompt({ name: "builder", cwd: "/srv/proj" })
   assert.equal(
     prompt,
-    "You are builder, a persistent agent. Your tools run on hw-nj, working directory /srv/proj. The log is your memory; there is no conversation.",
+    "You are builder, a persistent agent with long-term memory. " +
+      "You do not edit files or run commands yourself: delegate work to a pi worker with the delegate tool, " +
+      "then report what it did. The log is your memory; there is no conversation. " +
+      "Your workspace is /srv/proj.",
   )
   assert.notEqual(
     prompt,
-    agentSystemPrompt({ name: "builder", machine: "local", cwd: "/tmp" }),
-    "machine and cwd are woven in per call, never cached",
+    agentSystemPrompt({ name: "builder", cwd: "/tmp" }),
+    "the workspace is woven in per call, never cached",
   )
 })

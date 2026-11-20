@@ -1,4 +1,4 @@
-// The routes of CONTRACT §7, and nothing else (v2: one named agent).
+// The routes of CONTRACT §7, and nothing else (v3: one named agent, no machine).
 //
 // Shape rules that matter to the page:
 //   * `POST /api/agent/messages` answers 202 immediately; the turn runs on.
@@ -6,6 +6,8 @@
 //   * events has three paging modes with the priority `before` > `tail` > `since`,
 //     capped at 200 per call; `since` is a *seq*, never an array index.
 //   * there is no sessions route: the log id is "main" and nobody may ask for another.
+//   * `/api/jobs` is read straight from disk, so a delegate card keeps updating
+//     long after the turn that started the worker has ended.
 
 import type { IncomingMessage, ServerResponse } from "node:http"
 import {
@@ -25,36 +27,32 @@ import type {
   SessionEvent,
   ToolSpec,
 } from "../engine/durable.ts"
-import type { Executor } from "../exec/types.ts"
+import type { JobRunner } from "../jobs/runner.ts"
+import { DEFAULT_LIST_LIMIT, listJobs } from "../jobs/store.ts"
+import type { JobView } from "../jobs/store.ts"
 import { LOG_ID } from "./agents.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
 import { readSidecar } from "./sidecar.ts"
 import { createAbortableLlm, type TurnRegistry } from "./turns.ts"
-
-export type MachineKind = "local" | "ssh"
 
 export interface AppContext {
   /** `<root>`: holds `agents/` and `trash/`. */
   root: string
   /** The agent name this process serves — its identity, not a title. */
   agent: string
-  /** `<root>/agents/<name>` — pi-durable's home for this agent. */
+  /** `<root>/agents/<name>` — pi-durable's home for this agent, and the jobs. */
   agentHome: string
-  /** The machine the agent's hands are on, fixed at start (CONTRACT §2, D8). */
-  machine: { name: string; kind: MachineKind }
-  executor: Executor
-  /** Default working directory when the sidecar has none yet. */
+  /** The directory the agent (and therefore its workers) works in. */
   workspace: string
-  allowBash: boolean
   maxSteps: number
   /** Model for a log that has not recorded one yet. */
   defaultModel: string
+  /** Starts and stops pi workers; the only thing here that touches a process. */
+  jobs: JobRunner
   turns: TurnRegistry
   tools: ToolSpec[]
   env: NodeJS.ProcessEnv
   createLlm: (model: string) => LlmClient
-  /** Every machine the page may show in the strip: `local` plus ssh hosts. */
-  machines: string[]
 }
 
 const MEMORY_KINDS = new Set<MemoryKind>(["fact", "preference", "event", "skill"])
@@ -123,22 +121,16 @@ export async function handleApiRequest(
 
   try {
     if (method === "GET" && url.pathname === "/api/health") {
-      sendJson(response, 200, {
-        status: "ok",
-        agent: ctx.agent,
-        machine: ctx.machine.name,
-        kind: ctx.machine.kind,
-      })
+      sendJson(response, 200, { status: "ok", agent: ctx.agent })
       return true
     }
 
-    if (method === "GET" && url.pathname === "/api/machines") {
-      const machines = unique([ctx.machine.name, ...ctx.machines]).map((name) => ({
-        name,
-        kind: name === "local" ? ("local" as const) : ("ssh" as const),
-        current: name === ctx.machine.name,
-      }))
-      sendJson(response, 200, { machines })
+    if (url.pathname === "/api/jobs") {
+      if (method !== "GET") {
+        sendJson(response, 405, { error: `method ${method} not allowed` })
+        return true
+      }
+      sendJson(response, 200, { jobs: listJobs(ctx.agentHome, { limit: DEFAULT_LIST_LIMIT }).map(jobSummary) })
       return true
     }
 
@@ -281,12 +273,24 @@ function describeAgent(ctx: AppContext): Record<string, unknown> {
     agent: ctx.agent,
     session: {
       ...meta,
-      machine: sidecar?.machine ?? ctx.machine.name,
-      remoteCwd: sidecar?.remoteCwd ?? meta.cwd,
+      // The sidecar is the workspace the agent was last started with; the
+      // log's own cwd is the fallback when there is no sidecar yet.
+      cwd: sidecar?.cwd ?? meta.cwd,
     },
     resumePoint: detectResumePoint(events),
     turn: ctx.turns.state(LOG_ID),
-    machine: ctx.machine.name,
+  }
+}
+
+/** CONTRACT §7: the six fields the page polls for a delegate card. */
+export function jobSummary(job: JobView): Record<string, unknown> {
+  return {
+    id: job.id,
+    state: job.state,
+    task: job.task,
+    startedAt: job.startedAt,
+    elapsedMs: job.elapsedMs,
+    ...(typeof job.code === "number" ? { code: job.code } : {}),
   }
 }
 
@@ -305,7 +309,7 @@ async function runTurn(ctx: AppContext, log: Session, text: string, signal: Abor
   const store = createMemoryStore(resolvePaths(ctx.agentHome))
   const meta = log.meta()
   const sidecar = readSidecar(ctx.agentHome, LOG_ID)
-  const cwd = sidecar?.remoteCwd ?? meta.cwd
+  const cwd = sidecar?.cwd ?? meta.cwd
 
   let base: LlmClient
   try {
@@ -328,10 +332,12 @@ async function runTurn(ctx: AppContext, log: Session, text: string, signal: Abor
       tools: ctx.tools,
       cwd,
       maxSteps: ctx.maxSteps,
-      allowBash: ctx.allowBash,
-      // Rebuilt every turn: a restarted ctrl may be on a different machine or
-      // a different directory, and the model must not be told the old one.
-      systemPrompt: agentSystemPrompt({ name: ctx.agent, machine: ctx.machine.name, cwd }),
+      // ctrl has no hands (CONTRACT §2): the engine still takes the flag, but
+      // nothing in the tool set can reach it.
+      allowBash: false,
+      // Rebuilt every turn: a restarted ctrl may be in a different directory,
+      // and the model must not be told the old one.
+      systemPrompt: agentSystemPrompt({ name: ctx.agent, cwd }),
     })
   } catch (error) {
     if (signal.aborted) {
@@ -348,9 +354,14 @@ async function runTurn(ctx: AppContext, log: Session, text: string, signal: Abor
   }
 }
 
-/** CONTRACT §6, verbatim: the agent's name and where its hands are. */
-export function agentSystemPrompt(opts: { name: string; machine: string; cwd: string }): string {
-  return `You are ${opts.name}, a persistent agent. Your tools run on ${opts.machine}, working directory ${opts.cwd}. The log is your memory; there is no conversation.`
+/** CONTRACT §6, verbatim: the agent's name and what it is (and is not). */
+export function agentSystemPrompt(opts: { name: string; cwd: string }): string {
+  return (
+    `You are ${opts.name}, a persistent agent with long-term memory. ` +
+    "You do not edit files or run commands yourself: delegate work to a pi worker with the delegate tool, " +
+    "then report what it did. The log is your memory; there is no conversation. " +
+    `Your workspace is ${opts.cwd}.`
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -374,10 +385,6 @@ function intParam(value: unknown): number | undefined {
   if (!/^-?\d+$/.test(trimmed)) return undefined
   const parsed = Number.parseInt(trimmed, 10)
   return Number.isFinite(parsed) ? parsed : undefined
-}
-
-function unique(values: string[]): string[] {
-  return [...new Set(values.filter((value) => value.trim() !== ""))]
 }
 
 function errorMessage(error: unknown): string {
