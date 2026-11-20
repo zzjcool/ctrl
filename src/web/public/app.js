@@ -859,6 +859,14 @@ function buildRow(event) {
     case "user_message": {
       const text = String(data.text ?? "")
       if (!text.trim()) return null
+      if (text.startsWith("[ctrl]")) {
+        row.classList.add("row-system")
+        const line = el("p", "system-text")
+        line.appendChild(el("span", "system-mark", "⌃"))
+        line.appendChild(document.createTextNode(text.slice(6).trim()))
+        body.appendChild(line)
+        break
+      }
       row.classList.add("row-user")
       const line = el("p", "user-text")
       line.appendChild(el("span", "user-mark", "›"))

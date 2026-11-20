@@ -1,7 +1,3 @@
-/* ctrl — 一个命名 agent 的页面。
-   一条时间线，没有侧栏、没有气泡。所有颜色只在 :root / 浅色块里定义一次。
-   等宽字体只留给工具卡片、时间和状态条里的数字。 */
-
 :root {
   color-scheme: dark;
 
@@ -33,7 +29,7 @@
   --radius: 9px;
   --content-max: 820px;
   --time-col: 76px;
-  /* 右侧面板宽度；窄屏折叠时它变成 overlay（见文件末尾的 @media） */
+
   --rail: 320px;
   --scrim: rgba(6, 9, 13, 0.62);
 }
@@ -98,10 +94,6 @@ body {
   scrollbar-color: var(--line-strong) transparent;
 }
 
-/* ---------------------------------------------------------------- 骨架 */
-
-/* 三行两列：头 / （时间线 + 右侧面板） / 输入区。
-   面板自己占右边一列，窄屏那列宽度归零、面板变成滑出的 overlay。 */
 .page {
   height: 100%;
   display: grid;
@@ -112,8 +104,6 @@ body {
     "main aside"
     "composer aside";
 }
-
-/* ---------------------------------------------------------------- 头部 */
 
 .head {
   grid-area: head;
@@ -155,7 +145,7 @@ body {
   align-items: baseline;
   gap: 6px;
   min-width: 0;
-  /* 一行放不下就换行，别把最后一个数字剪成半截（窄屏上新加了记忆/窗口两项） */
+
   flex: 0 0 auto;
 }
 
@@ -180,7 +170,6 @@ body {
   color: var(--fg-faint);
 }
 
-/* 窄屏才出现的「面板」按钮（宽屏时那一列就在那儿，不需要按钮） */
 .panel-toggle {
   display: none;
   align-items: center;
@@ -238,8 +227,6 @@ body {
   background: var(--fail);
 }
 
-/* ---------------------------------------------------------------- 时间线 */
-
 .timeline {
   grid-area: main;
   overflow-y: auto;
@@ -253,8 +240,6 @@ body {
   margin: 0 auto;
   padding: 0 24px;
 }
-
-/* 一行 = 时间 + 内容；一行都没气泡 */
 
 .row {
   display: grid;
@@ -278,8 +263,6 @@ body {
   min-width: 0;
 }
 
-/* 日期分隔条：标签占时间列，右边一条细线 */
-
 .sep {
   display: grid;
   grid-template-columns: var(--time-col) minmax(0, 1fr);
@@ -302,8 +285,6 @@ body {
   background: var(--line);
 }
 
-/* 用户的话：› 前缀，稍重；换行后对齐到前缀之后 */
-
 .user-text {
   margin: 0;
   white-space: pre-wrap;
@@ -319,8 +300,6 @@ body {
   margin-right: 0.32em;
   font-weight: 600;
 }
-
-/* agent 的正文：占满列宽，比用户那句轻一点 */
 
 .row-agent .prose {
   margin: 0 0 8px;
@@ -363,8 +342,6 @@ body {
 .fence code {
   font-family: inherit;
 }
-
-/* ---------------------------------------------------------------- 工具卡片 */
 
 .tool {
   border: 1px solid var(--line);
@@ -479,10 +456,6 @@ body {
   color: var(--fg-faint);
 }
 
-/* ------------------------------------------------------ delegate 卡片（job） */
-
-/* 一行头部：delegate · 徽章 · job id · 耗时（耗时靠 margin-left:auto 顶到右边） */
-
 .job-head {
   align-items: center;
   gap: 7px;
@@ -528,7 +501,6 @@ body {
   border-color: var(--fail-line);
 }
 
-/* `killed`（job_stop 之后）：不是失败，是被人叫停的 */
 .job[data-state="killed"] .job-badge {
   color: var(--warn);
 }
@@ -566,9 +538,6 @@ body {
 .job-body {
   padding: 0 11px 9px;
 }
-
-/* 任务全文：默认两行；点「展开全文」或点文字本身展开。
-   line-clamp 负责省略号，max-height 保证每个浏览器都能真的钳住。 */
 
 .job-task {
   margin: 0;
@@ -619,8 +588,6 @@ body {
 .job-meta:empty {
   display: none;
 }
-
-/* ---------------------------------------------------------------- 错误 / 压缩 / 运行中 */
 
 .err-line {
   display: flex;
@@ -673,8 +640,6 @@ body {
   }
 }
 
-/* ---------------------------------------------------------------- 加载更早 */
-
 .load-earlier {
   display: flex;
   justify-content: center;
@@ -704,8 +669,6 @@ body {
   color: var(--fg-faint);
   cursor: default;
 }
-
-/* ---------------------------------------------------------------- 空状态 */
 
 .empty {
   max-width: var(--content-max);
@@ -754,9 +717,6 @@ body {
   color: var(--fg);
 }
 
-/* ---------------------------------------------------------------- 右侧面板 */
-
-/* 一列两行：可滚的面板体 + 固定在底部的「记忆」按钮。 */
 .aside {
   grid-area: aside;
   display: grid;
@@ -810,8 +770,6 @@ body {
   color: var(--fail);
 }
 
-/* ---- focus ---- */
-
 .focus-add {
   margin: 0 0 8px;
   padding: 0 4px;
@@ -853,7 +811,6 @@ body {
   gap: 1px;
 }
 
-/* 一条 focus：状态点 + 文字 + 状态名（点一下往下转一格） */
 .focus-item {
   display: grid;
   grid-template-columns: 7px minmax(0, 1fr) auto;
@@ -919,8 +876,6 @@ body {
   white-space: nowrap;
 }
 
-/* ---- 运行中的 worker ---- */
-
 .worker-list {
   display: grid;
   gap: 2px;
@@ -960,8 +915,6 @@ body {
   white-space: nowrap;
 }
 
-/* ---- 面板底部的「记忆」按钮 ---- */
-
 .aside-foot {
   padding: 10px 14px 14px;
   border-top: 1px solid var(--line);
@@ -996,8 +949,6 @@ body {
 .btn-memory-count:empty {
   display: none;
 }
-
-/* ---------------------------------------------------------------- 输入区 */
 
 .composer {
   grid-area: composer;
@@ -1099,9 +1050,6 @@ body {
   opacity: 1;
 }
 
-/* ---------------------------------------------------------------- 记忆抽屉 */
-
-/* 窄屏下面板靠它当遮罩（宽屏不显示） */
 .panel-backdrop {
   display: none;
 }
@@ -1226,7 +1174,6 @@ body {
   border-bottom: 0;
 }
 
-/* 被 supersede 的旧记忆：灰、带「已合并」，但还能读 */
 .memory-item[data-superseded="true"] {
   opacity: 0.5;
 }
@@ -1296,8 +1243,6 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
 }
-
-/* ---------------------------------------------------------------- 焦点 / 窄屏 / 动效 */
 
 .proposal-list {
   margin: 0;
@@ -1629,7 +1574,6 @@ body {
   outline-offset: 2px;
 }
 
-/* 窄屏：右边那一列折叠成头部的一个按钮，面板变成滑出来的 overlay */
 @media (max-width: 900px) {
   :root {
     --rail: 0px;
@@ -1708,4 +1652,20 @@ body {
     animation-iteration-count: 1 !important;
     transition-duration: 1ms !important;
   }
+}
+
+.row-system .system-text {
+  margin: 0 0 8px;
+  padding-left: 1.15em;
+  text-indent: -1.15em;
+  color: var(--fg-dim);
+  font-size: 0.94em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.system-mark {
+  margin-right: 0.32em;
+  opacity: 0.6;
+  font-weight: 600;
 }
