@@ -18,6 +18,8 @@ import type { AppContext } from "./routes.ts"
 import { createAbortableLlm } from "./turns.ts"
 import { readSidecar } from "./sidecar.ts"
 
+const processStartedAt = Date.now()
+
 export async function handleAgentRoutes(
   request: IncomingMessage,
   response: ServerResponse,
@@ -117,6 +119,7 @@ function describeAgent(ctx: AppContext): Record<string, unknown> {
     session: {
       ...meta,
       cwd: sidecar?.cwd ?? meta.cwd,
+      uptimeSeconds: uptimeSeconds(),
     },
     resumePoint: detectResumePoint(events),
     turn: ctx.turns.state(LOG_ID),
@@ -127,6 +130,10 @@ function describeAgent(ctx: AppContext): Record<string, unknown> {
     },
     context: { windowStart: window.windowStart, chars: window.chars },
   }
+}
+
+function uptimeSeconds(): number {
+  return Math.max(0, Math.floor((Date.now() - processStartedAt) / 1000))
 }
 
 function safeCount(read: () => number): number {
