@@ -774,6 +774,7 @@ test("the jobs API renders the stream instead of leaking raw pi JSON", async () 
     { type: "tool_execution_end", toolCallId: "c1", result: "hi\n" },
     { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "done" } },
     { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } },
+    { type: "agent_end", messages: [{ role: "system", content: "x".repeat(30_000) }] },
   ]
   await writeFile(path.join(dir, "out.log"), lines.map((line) => JSON.stringify(line)).join("\n"))
   const summary = jobSummary(

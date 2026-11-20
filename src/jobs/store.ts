@@ -247,6 +247,15 @@ export interface JobLog {
   truncated: boolean
 }
 
+export function readJobLogRaw(agentHome: string, id: string): string {
+  if (!isJobId(id)) return ""
+  try {
+    return readFileSync(jobPaths(agentHome, id).logPath, "utf8")
+  } catch {
+    return ""
+  }
+}
+
 export function readJobLog(
   agentHome: string,
   id: string,

@@ -7,6 +7,7 @@ import {
   listJobs,
   readJob,
   readJobLog,
+  readJobLogRaw,
   waitForJob,
 } from "./store.ts"
 import { renderStream } from "./stream.ts"

@@ -1,5 +1,5 @@
 import type { ServerResponse } from "node:http"
-import { DEFAULT_LIST_LIMIT, listJobs, readJobLog } from "../jobs/store.ts"
+import { DEFAULT_LIST_LIMIT, listJobs, readJobLogRaw } from "../jobs/store.ts"
 import { renderStream } from "../jobs/stream.ts"
 import type { JobView } from "../jobs/store.ts"
 import { sendJson } from "./http.ts"
@@ -27,8 +27,7 @@ export function jobSummary(job: JobView, agentHome?: string): Record<string, unk
   }
 
   if (agentHome !== undefined) {
-    const log = readJobLog(agentHome, job.id, { full: true })
-    const text = renderStream(log.text, { maxLines: 15 }).trimEnd()
+    const text = renderStream(readJobLogRaw(agentHome, job.id), { maxLines: 15 }).trimEnd()
     if (text !== "") summary.output = text.length > 3_000 ? `…${text.slice(-3_000)}` : text
   }
   return summary
