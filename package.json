@@ -1,0 +1,33 @@
+{
+  "name": "pi-ctrl",
+  "version": "0.0.1",
+  "private": true,
+  "description": "A durable agent console: conversation and memory stay local, execution runs on any machine herdr core can reach.",
+  "type": "module",
+  "license": "MIT",
+  "author": "zzjcool",
+  "bin": {
+    "ctrl": "./src/cli/index.ts"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/unit/*.test.ts",
+    "test:e2e": "node --experimental-strip-types --test tests/e2e/*.test.ts",
+    "test:all": "npm run typecheck && npm test && npm run test:e2e",
+    "ctrl": "node --experimental-strip-types src/cli/index.ts"
+  },
+  "keywords": [
+    "agent",
+    "durable",
+    "herdr",
+    "remote-execution",
+    "typescript"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,14 @@
+node_modules/
+.DS_Store
+*.log
+
+# ctrl runtime state (never commit; sessions live in ~/.pi-durable)
+.ctrl/
+ctrl.jsonl
+
+# legion / subagent run state
+.pi-subagents/
+
+# Core dumps are ignored by path, NOT by bare name: a rule of `core` would
+# silently swallow src/core/ (this bit pi-durable once).
+/core
