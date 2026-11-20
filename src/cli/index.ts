@@ -1,12 +1,26 @@
 #!/usr/bin/env node
-// ctrl [serve] — one process, one conversation log, one machine.
+// ctrl — one process, one named agent, one log, one machine.
 //
-//   node --experimental-strip-types src/cli/index.ts --machine hw-nj --workspace /srv/proj
+//   node --experimental-strip-types src/cli/index.ts --agent builder --machine hw-nj
+//   node --experimental-strip-types src/cli/index.ts agent new builder --model workbuddy/deepseek-v4.1-flash
+//   node --experimental-strip-types src/cli/index.ts agent list
 //
-// Flags are deliberately few: everything else is the page's business.
+// There is no `--home` and no session id anywhere: an agent is a directory
+// under `--root`, and that directory is the whole of its state.
 
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
+import {
+  DEFAULT_AGENT,
+  AgentError,
+  agentHome,
+  isAgentName,
+  listAgents,
+  logPath,
+  newAgent,
+  removeAgent,
+  resolveRoot,
+} from "../server/agents.ts"
 import {
   DEFAULT_HOST,
   DEFAULT_MAX_STEPS,
@@ -17,39 +31,63 @@ import {
   startServer,
 } from "../server/server.ts"
 
+export type Mode = "serve" | "agent-list" | "agent-new" | "agent-rm" | "help" | "version"
+
 interface Flags {
-  mode: "serve" | "help" | "version"
+  mode: Mode
+  /** The name an `agent` subcommand acts on. */
+  name?: string
   port: number
   host: string
   workspace?: string
-  home?: string
+  root?: string
+  agent: string
   machine: string
   allowBash: boolean
   maxSteps: number
-  model: string
-  reasoningEffort: string
+  /** Undefined means "let the server resolve": PI_DURABLE_MODEL, then the default. */
+  model?: string
+  reasoningEffort?: string
+  /** `agent list` / `agent new` output as JSON. */
+  json: boolean
+  /** `agent rm`: delete instead of archiving. */
+  purge: boolean
 }
 
-const USAGE = `ctrl — the conversation stays here, the hands work there.
+const AGENT_SUBCOMMANDS = ["list", "new", "rm"] as const
+
+const USAGE = `ctrl — one named agent, one log, one machine.
 
 Usage:
   ctrl [serve] [options]
+  ctrl agent list [--root <dir>] [--json]
+  ctrl agent new <name> [--model <id>] [--root <dir>] [--json]
+  ctrl agent rm <name> [--root <dir>] [--purge]
 
-Options:
-  --port <n>         port to listen on (default ${DEFAULT_PORT})
-  --host <addr>      address to bind (default ${DEFAULT_HOST})
-  --workspace <dir>  working directory for new sessions
-                     (default: current directory for --machine local, ~ for ssh)
-  --home <dir>       pi-durable home (default ~/.pi-durable)
+Serve options:
+  --agent <name>     the agent to serve (default ${DEFAULT_AGENT}); its directory
+                     is created on first start
+  --root <dir>       where agents live (default $CTRL_ROOT or ~/.ctrl)
   --machine <name>   "local" or an ssh Host alias from ~/.ssh/config (default local)
+  --workspace <dir>  working directory for the agent's hands
+                     (default: current directory for --machine local, ~ for ssh)
   --allow-bash       advertise the bash tool to the model (hidden otherwise)
   --max-steps <n>    tool-loop budget per turn (default ${DEFAULT_MAX_STEPS})
-  --model <id>       model for new sessions (default ${DEFAULT_MODEL})
+  --model <id>       model for a brand-new log (default workbuddy/deepseek-v4.1-flash,
+                     or $PI_DURABLE_MODEL); afterwards the log decides
   --reasoning-effort <level>
                      thinking budget: off|low|medium|high|max
                      (default ${DEFAULT_REASONING_EFFORT})
+  --port <n>         port to listen on (default ${DEFAULT_PORT})
+  --host <addr>      address to bind (default ${DEFAULT_HOST})
   --help             show this message
   --version          show the version
+
+Agent commands:
+  list               every agent under <root>/agents
+  new <name>         create <root>/agents/<name>/ and its empty log
+  rm <name>          move the directory to <root>/trash/<name>-<stamp>/
+                     (--purge deletes it for real)
 `
 
 export class UsageError extends Error {}
@@ -59,22 +97,39 @@ export function parseArgs(argv: string[]): Flags {
     mode: "serve",
     port: DEFAULT_PORT,
     host: DEFAULT_HOST,
+    agent: DEFAULT_AGENT,
     machine: "local",
     allowBash: false,
     maxSteps: DEFAULT_MAX_STEPS,
-    model: DEFAULT_MODEL,
-    reasoningEffort: DEFAULT_REASONING_EFFORT,
+    json: false,
+    purge: false,
   }
   const rest = [...argv]
-  // An optional `serve` subcommand, so `ctrl` and `ctrl serve` both work.
+
   const first = rest[0]
-  if (first !== undefined && !first.startsWith("-")) {
+  if (first === "agent") {
+    rest.shift()
+    const sub = rest.shift()
+    if (sub === undefined) {
+      throw new UsageError(`agent needs a subcommand: ${AGENT_SUBCOMMANDS.join(", ")}`)
+    }
+    if (!(AGENT_SUBCOMMANDS as readonly string[]).includes(sub)) {
+      throw new UsageError(`unknown agent subcommand: ${sub}`)
+    }
+    flags.mode = `agent-${sub}` as Mode
+  } else if (first !== undefined && !first.startsWith("-")) {
+    // An optional `serve` subcommand, so `ctrl` and `ctrl serve` both work.
     if (first !== "serve") throw new UsageError(`unknown command: ${first}`)
     rest.shift()
   }
 
+  const positional: string[] = []
   for (let index = 0; index < rest.length; index += 1) {
     const raw = rest[index] ?? ""
+    if (!raw.startsWith("-")) {
+      positional.push(raw)
+      continue
+    }
     const [name, inline] = raw.includes("=") ? [raw.slice(0, raw.indexOf("=")), raw.slice(raw.indexOf("=") + 1)] : [raw, undefined]
     const value = (): string => {
       if (inline !== undefined) return inline
@@ -101,8 +156,11 @@ export function parseArgs(argv: string[]): Flags {
       case "--workspace":
         flags.workspace = value()
         break
-      case "--home":
-        flags.home = value()
+      case "--root":
+        flags.root = value()
+        break
+      case "--agent":
+        flags.agent = agentNameFlag("--agent", value())
         break
       case "--machine":
         flags.machine = value()
@@ -117,20 +175,57 @@ export function parseArgs(argv: string[]): Flags {
         flags.reasoningEffort = effort(value())
         break
       case "--allow-bash":
-        if (inline !== undefined) throw new UsageError("--allow-bash takes no value")
+        noValue(name, inline)
         flags.allowBash = true
+        break
+      case "--json":
+        noValue(name, inline)
+        flags.json = true
+        break
+      case "--purge":
+        noValue(name, inline)
+        flags.purge = true
         break
       default:
         throw new UsageError(`unknown option: ${raw}`)
     }
   }
+
+  if (flags.mode === "agent-list" || flags.mode === "agent-new" || flags.mode === "agent-rm") {
+    if (positional.length > 1) throw new UsageError(`unexpected argument: ${positional[1]}`)
+    const name = positional[0]
+    if (flags.mode !== "agent-list") {
+      if (name === undefined) throw new UsageError(`ctrl agent ${flags.mode.slice("agent-".length)} needs a name`)
+      flags.name = name
+    } else if (name !== undefined) {
+      throw new UsageError(`agent list takes no arguments (got "${name}")`)
+    }
+    if (flags.json && flags.mode === "agent-rm") throw new UsageError("--json is not a thing for agent rm")
+    if (flags.purge && flags.mode !== "agent-rm") throw new UsageError("--purge is only for agent rm")
+  } else {
+    if (positional.length > 0) throw new UsageError(`unexpected argument: ${positional[0]}`)
+    if (flags.purge) throw new UsageError("--purge is only for agent rm")
+  }
   return flags
+}
+
+/** `--agent` is validated here so a typo is exit 2, not a directory named `Foo`. */
+function agentNameFlag(label: string, raw: string): string {
+  const trimmed = word(raw, label)
+  if (!isAgentName(trimmed)) {
+    throw new UsageError(`${label} must match ${/^[a-z0-9][a-z0-9_-]{0,31}$/.source}, got "${raw}"`)
+  }
+  return trimmed
 }
 
 function word(raw: string, label: string): string {
   const trimmed = raw.trim()
   if (trimmed === "") throw new UsageError(`${label} must not be empty`)
   return trimmed
+}
+
+function noValue(label: string, inline: string | undefined): void {
+  if (inline !== undefined) throw new UsageError(`${label} takes no value`)
 }
 
 const EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const
@@ -169,13 +264,126 @@ async function main(argv: string[]): Promise<number> {
     return 2
   }
 
-  if (flags.mode === "help") {
-    process.stdout.write(USAGE)
+  switch (flags.mode) {
+    case "help":
+      process.stdout.write(USAGE)
+      return 0
+    case "version":
+      process.stdout.write(`${version()}\n`)
+      return 0
+    case "agent-list":
+      return listCommand(flags)
+    case "agent-new":
+      return newCommand(flags)
+    case "agent-rm":
+      return removeCommand(flags)
+    case "serve":
+      return serveCommand(flags)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ctrl agent …
+// ---------------------------------------------------------------------------
+
+function rootOf(flags: Flags): string {
+  // Nothing is created here: `agent list` on a fresh machine must not mkdir.
+  return resolveRoot(flags.root)
+}
+
+function listCommand(flags: Flags): number {
+  const root = rootOf(flags)
+  const agents = listAgents(root)
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify({ root, agents }, null, 2)}\n`)
     return 0
   }
-  if (flags.mode === "version") {
-    process.stdout.write(`${version()}\n`)
+  if (agents.length === 0) {
+    process.stdout.write(`no agents in ${root}/agents\n`)
     return 0
+  }
+  const width = Math.max(...agents.map((agent) => agent.name.length))
+  for (const agent of agents) {
+    process.stdout.write(
+      `${agent.name.padEnd(width)}  ${agent.createdAt}  ${String(agent.events).padStart(4)} events  last ${agent.lastActivity}\n`,
+    )
+  }
+  return 0
+}
+
+function newCommand(flags: Flags): number {
+  const name = flags.name ?? ""
+  try {
+    const root = rootOf(flags)
+    const created = newAgent({
+      root,
+      name,
+      cwd: defaultWorkspace(flags),
+      model: resolveModel(flags),
+    })
+    if (flags.json) {
+      process.stdout.write(
+        `${JSON.stringify({ name: created.name, home: created.home, model: created.meta.model, createdAt: created.meta.createdAt }, null, 2)}\n`,
+      )
+      return 0
+    }
+    process.stdout.write(
+      `created agent ${created.name}\n` +
+        `  directory: ${created.home}\n` +
+        `  model: ${created.meta.model}\n` +
+        `  log: ${logPath(created.home)}\n` +
+        `start it with: ctrl --agent ${created.name}${flags.root !== undefined ? ` --root ${flags.root}` : ""}\n`,
+    )
+    return 0
+  } catch (error) {
+    return report(error)
+  }
+}
+
+function removeCommand(flags: Flags): number {
+  const name = flags.name ?? ""
+  try {
+    const root = rootOf(flags)
+    const removed = removeAgent({ root, name, purge: flags.purge })
+    process.stdout.write(
+      removed.purged
+        ? `purged agent ${removed.name} (${removed.from})\n`
+        : `archived agent ${removed.name}\n  ${removed.from}\n  → ${removed.to}\n`,
+    )
+    return 0
+  } catch (error) {
+    return report(error)
+  }
+}
+
+/** --model > PI_DURABLE_MODEL > DEFAULT_MODEL (CONTRACT §6). */
+function resolveModel(flags: Flags): string {
+  return flags.model?.trim() || process.env.PI_DURABLE_MODEL?.trim() || DEFAULT_MODEL
+}
+
+/** Where `agent new` puts the log: current directory locally, ~ on an ssh host. */
+function defaultWorkspace(flags: Flags): string {
+  return flags.workspace ?? (flags.machine === "local" ? process.cwd() : "~")
+}
+
+function report(error: unknown): number {
+  process.stderr.write(`ctrl: ${errorMessage(error)}\n`)
+  if (error instanceof AgentError) return error.kind === "invalid-name" ? 2 : 1
+  return 1
+}
+
+// ---------------------------------------------------------------------------
+// ctrl [serve]
+// ---------------------------------------------------------------------------
+
+async function serveCommand(flags: Flags): Promise<number> {
+  let root: string
+  try {
+    root = rootOf(flags)
+    // Fail before binding a port if the name could not be a directory.
+    agentHome(root, flags.agent)
+  } catch (error) {
+    return report(error)
   }
 
   const isLocal = flags.machine === "local"
@@ -191,17 +399,19 @@ async function main(argv: string[]): Promise<number> {
   let running
   try {
     running = await startServer({
-      ...(flags.home !== undefined ? { home: flags.home } : {}),
+      root,
+      agent: flags.agent,
       port: flags.port,
       host: flags.host,
       machine: flags.machine,
       workspace,
       allowBash: flags.allowBash,
       maxSteps: flags.maxSteps,
-      model: flags.model,
-      reasoningEffort: flags.reasoningEffort,
+      ...(flags.model !== undefined ? { model: flags.model } : {}),
+      ...(flags.reasoningEffort !== undefined ? { reasoningEffort: flags.reasoningEffort } : {}),
     })
   } catch (error) {
+    if (error instanceof AgentError) return report(error)
     if (isPortInUse(error)) {
       process.stderr.write(
         `ctrl: port ${flags.port} is already in use — another ctrl is probably running (try --port ${flags.port + 1})\n`,
@@ -212,12 +422,14 @@ async function main(argv: string[]): Promise<number> {
     return 1
   }
 
+  const summary = listAgents(root).find((agent) => agent.name === running.ctx.agent)
+  const model = running.ctx.defaultModel
   process.stdout.write(
     `ctrl ${version()} listening on ${running.url}\n` +
-      `  machine: ${flags.machine}${isLocal ? " (local)" : " (ssh)"}\n` +
+      `  agent: ${running.ctx.agent} (log ${summary?.events ?? 0} events) / machine: ${running.ctx.machine.name} / model: ${model}\n` +
+      `  directory: ${running.ctx.agentHome}\n` +
       `  workspace: ${workspace}\n` +
-      `  model: ${flags.model} (reasoning ${flags.reasoningEffort})\n` +
-        `  bash: ${flags.allowBash ? "advertised" : "hidden (--allow-bash to enable)"}\n`,
+      `  bash: ${flags.allowBash ? "advertised" : "hidden (--allow-bash to enable)"}\n`,
   )
 
   const shutdown = (signal: string) => {
