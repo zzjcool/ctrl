@@ -34,6 +34,7 @@
 - 后端：`local`、`ssh`
 - 工作区：**远端即工作目录**（不做同步、不做镜像）
 - 页面：对话 + 工具卡片 + 机器 chip + 会话列表
+- 模型：默认 `workbuddy/deepseek-v4.1-flash`（reasoning `max`），可用 `--model` / `--reasoning-effort` 覆盖
 
 ## 和兄弟项目的关系
 

@@ -42,6 +42,8 @@ export interface AppContext {
   workspace: string
   allowBash: boolean
   maxSteps: number
+  /** Model for new sessions when the request does not name one. */
+  defaultModel: string
   turns: TurnRegistry
   tools: ToolSpec[]
   env: NodeJS.ProcessEnv
@@ -116,7 +118,7 @@ export async function handleApiRequest(
           const body = await readJson(request)
           const cwd = stringOrUndefined(body.cwd) ?? ctx.workspace
           const model = stringOrUndefined(body.model)
-          const session = createSession({ ...(ctx.home !== undefined ? { home: ctx.home } : {}), cwd, ...(model ? { model } : {}) })
+          const session = createSession({ ...(ctx.home !== undefined ? { home: ctx.home } : {}), cwd, model: model ?? ctx.defaultModel })
           const meta = session.meta()
           const sidecar = writeSidecar(ctx.home, session.sessionId, {
             machine: ctx.machine.name,

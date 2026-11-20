@@ -173,6 +173,7 @@ not a recovery.
 | D4 | long tasks | `run_task` + `task_output` (10 s loop cap) |
 | D5 | engine | pi-durable, one import file, no modifications |
 | D6 | UI | one page, no panels |
+| D7 | model | `workbuddy/deepseek-v4.1-flash`, `reasoning_effort: max`, 8192 completion cap; `--model` / `--reasoning-effort` override, `PI_DURABLE_MODEL` still wins over the default |
 
 ## 13. Revisions
 
@@ -191,3 +192,8 @@ not a recovery.
      registry so the log never gets two errors for one cause.
   4. `abort` stops the model call, not a tool already executing; long work is
      `run_task`, and `task_output { kill: true }` is how it is stopped.
+- **R5** — default model is `workbuddy/deepseek-v4.1-flash` with
+  `reasoning_effort: max` and an 8192 completion cap. pi-durable gained two
+  additive client options (`reasoningEffort`, `maxTokens`) for this; ctrl still
+  talks to the engine through `src/engine/durable.ts` only. Reason for the cap:
+  reasoning tokens are billed inside `max_tokens`, and 2048 truncates tool calls.

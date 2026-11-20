@@ -21,6 +21,15 @@ import { TurnRegistry } from "./turns.ts"
 export const DEFAULT_PORT = 7333
 export const DEFAULT_HOST = "127.0.0.1"
 export const DEFAULT_MAX_STEPS = 12
+/**
+ * The model ctrl starts sessions with. pi-durable's own default (hy4) is a
+ * reasoning model that costs seconds on trivial turns; deepseek-flash with a
+ * max thinking budget is the daily driver here.
+ */
+export const DEFAULT_MODEL = "workbuddy/deepseek-v4.1-flash"
+export const DEFAULT_REASONING_EFFORT = "max"
+/** Reasoning tokens are billed inside `max_tokens`; 2048 truncates tool calls. */
+export const DEFAULT_MAX_TOKENS = 8192
 
 export interface ServerConfig {
   /** pi-durable home; defaults to ~/.pi-durable. */
@@ -33,6 +42,12 @@ export interface ServerConfig {
   workspace?: string
   allowBash?: boolean
   maxSteps?: number
+  /** Model id for new sessions; falls back to PI_DURABLE_MODEL, then DEFAULT_MODEL. */
+  model?: string
+  /** Sent as reasoning_effort; falls back to PI_DURABLE_REASONING_EFFORT, then "max". */
+  reasoningEffort?: string
+  /** Completion cap per model call. */
+  maxTokens?: number
   publicDir?: string
   env?: NodeJS.ProcessEnv
   /** Injected by tests; by default a real chat/completions client. */
@@ -56,6 +71,13 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     kind === "local"
       ? new LocalExecutor({ machine: "local", cwd: workspace })
       : new SshExecutor({ host: machineName, cwd: workspace })
+  const model = config.model?.trim() || env.PI_DURABLE_MODEL || DEFAULT_MODEL
+  const reasoningEffort =
+    config.reasoningEffort?.trim() || env.PI_DURABLE_REASONING_EFFORT || DEFAULT_REASONING_EFFORT
+  const maxTokens =
+    Number.isFinite(config.maxTokens) && (config.maxTokens ?? 0) > 0
+      ? Math.floor(config.maxTokens as number)
+      : DEFAULT_MAX_TOKENS
   const allowBash = config.allowBash === true
   const maxSteps = Number.isFinite(config.maxSteps) && (config.maxSteps ?? 0) > 0
     ? Math.floor(config.maxSteps as number)
@@ -68,12 +90,14 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     workspace,
     allowBash,
     maxSteps,
+    defaultModel: model,
     turns: new TurnRegistry(),
     tools: createTools(executor, { allowBash }),
     env,
     createLlm:
       config.createLlm ??
-      ((model: string) => createChatCompletionsClient({ model: model || env.PI_DURABLE_MODEL || DEFAULT_LLM_MODEL, env })),
+      ((requested: string) =>
+        createChatCompletionsClient({ model: requested || model, env, reasoningEffort, maxTokens })),
     machines: ["local", ...readSshHosts()],
   }
 }

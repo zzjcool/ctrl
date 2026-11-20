@@ -7,7 +7,15 @@
 
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
-import { DEFAULT_HOST, DEFAULT_MAX_STEPS, DEFAULT_PORT, readSshHosts, startServer } from "../server/server.ts"
+import {
+  DEFAULT_HOST,
+  DEFAULT_MAX_STEPS,
+  DEFAULT_MODEL,
+  DEFAULT_PORT,
+  DEFAULT_REASONING_EFFORT,
+  readSshHosts,
+  startServer,
+} from "../server/server.ts"
 
 interface Flags {
   mode: "serve" | "help" | "version"
@@ -18,6 +26,8 @@ interface Flags {
   machine: string
   allowBash: boolean
   maxSteps: number
+  model: string
+  reasoningEffort: string
 }
 
 const USAGE = `ctrl — the conversation stays here, the hands work there.
@@ -34,6 +44,10 @@ Options:
   --machine <name>   "local" or an ssh Host alias from ~/.ssh/config (default local)
   --allow-bash       advertise the bash tool to the model (hidden otherwise)
   --max-steps <n>    tool-loop budget per turn (default ${DEFAULT_MAX_STEPS})
+  --model <id>       model for new sessions (default ${DEFAULT_MODEL})
+  --reasoning-effort <level>
+                     thinking budget: off|low|medium|high|max
+                     (default ${DEFAULT_REASONING_EFFORT})
   --help             show this message
   --version          show the version
 `
@@ -48,6 +62,8 @@ export function parseArgs(argv: string[]): Flags {
     machine: "local",
     allowBash: false,
     maxSteps: DEFAULT_MAX_STEPS,
+    model: DEFAULT_MODEL,
+    reasoningEffort: DEFAULT_REASONING_EFFORT,
   }
   const rest = [...argv]
   // An optional `serve` subcommand, so `ctrl` and `ctrl serve` both work.
@@ -94,6 +110,12 @@ export function parseArgs(argv: string[]): Flags {
       case "--max-steps":
         flags.maxSteps = integer(value(), "--max-steps", 1, 200)
         break
+      case "--model":
+        flags.model = word(value(), "--model")
+        break
+      case "--reasoning-effort":
+        flags.reasoningEffort = effort(value())
+        break
       case "--allow-bash":
         if (inline !== undefined) throw new UsageError("--allow-bash takes no value")
         flags.allowBash = true
@@ -103,6 +125,22 @@ export function parseArgs(argv: string[]): Flags {
     }
   }
   return flags
+}
+
+function word(raw: string, label: string): string {
+  const trimmed = raw.trim()
+  if (trimmed === "") throw new UsageError(`${label} must not be empty`)
+  return trimmed
+}
+
+const EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const
+
+function effort(raw: string): string {
+  const level = raw.trim().toLowerCase()
+  if (!(EFFORTS as readonly string[]).includes(level)) {
+    throw new UsageError(`--reasoning-effort must be one of ${EFFORTS.join(", ")}, got "${raw}"`)
+  }
+  return level
 }
 
 function integer(raw: string, label: string, min: number, max: number): number {
@@ -160,6 +198,8 @@ async function main(argv: string[]): Promise<number> {
       workspace,
       allowBash: flags.allowBash,
       maxSteps: flags.maxSteps,
+      model: flags.model,
+      reasoningEffort: flags.reasoningEffort,
     })
   } catch (error) {
     if (isPortInUse(error)) {
@@ -176,7 +216,8 @@ async function main(argv: string[]): Promise<number> {
     `ctrl ${version()} listening on ${running.url}\n` +
       `  machine: ${flags.machine}${isLocal ? " (local)" : " (ssh)"}\n` +
       `  workspace: ${workspace}\n` +
-      `  bash: ${flags.allowBash ? "advertised" : "hidden (--allow-bash to enable)"}\n`,
+      `  model: ${flags.model} (reasoning ${flags.reasoningEffort})\n` +
+        `  bash: ${flags.allowBash ? "advertised" : "hidden (--allow-bash to enable)"}\n`,
   )
 
   const shutdown = (signal: string) => {
