@@ -358,11 +358,15 @@ test("GET /api/agent is exactly agent, session, resumePoint, turn, memory and co
     "model",
     "sessionId",
     "updatedAt",
+    "uptimeSeconds",
   ])
   assert.equal(reply.json.session.sessionId, "main")
   assert.equal(reply.json.session.cwd, fixture.workspace)
   assert.equal(reply.json.session.eventCount, 1)
   assert.equal(reply.json.session.lastSeq, 0)
+  assert.equal(typeof reply.json.session.uptimeSeconds, "number")
+  assert.ok(Number.isInteger(reply.json.session.uptimeSeconds), "uptimeSeconds is an integer")
+  assert.ok(reply.json.session.uptimeSeconds >= 0, "uptimeSeconds is never negative")
   assert.deepEqual(reply.json.resumePoint, { kind: "clean" })
   assert.deepEqual(reply.json.turn, { running: false })
   assert.deepEqual(Object.keys(reply.json.memory).sort(), ["focusOpen", "lastDreamAt", "memories"])
