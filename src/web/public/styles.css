@@ -1645,9 +1645,6 @@ body {
     max-height: 86vh;
   }
 
-  /* iOS Safari zooms the whole page when a focused field is smaller than 16px,
-     so narrow screens get 16px inputs instead of the desktop sizes above.
-     Never fix this with maximum-scale/user-scalable: that breaks pinch zoom. */
   .composer-input,
   .drawer-input,
   .focus-input,
