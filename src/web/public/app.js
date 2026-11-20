@@ -1817,15 +1817,26 @@ function autosize() {
   input.style.overflowY = (input.scrollHeight || 0) > MAX_INPUT_HEIGHT ? "auto" : "hidden"
 }
 
+const narrowViewport = window.matchMedia("(max-width: 620px)")
+
+narrowViewport.addEventListener("change", () => {
+  updateComposer()
+})
+
 function updateComposer() {
   const running = Boolean(state.turn && state.turn.running)
+  const narrow = narrowViewport.matches
   els.send.textContent = running ? "停止" : "发送"
   els.send.classList.toggle("is-stop", running)
   els.send.disabled = running ? state.aborting : state.sending
   els.send.title = running ? "停止这一轮" : "发送（Enter）"
   els.input.placeholder = running
-    ? "它在跑…（先点停止，Enter 不会开新的一轮）"
-    : "说点什么…（Enter 发送，Shift+Enter 换行）"
+    ? narrow
+      ? "它在跑…"
+      : "它在跑…（先点停止，Enter 不会开新的一轮）"
+    : narrow
+      ? "说点什么…"
+      : "说点什么…（Enter 发送，Shift+Enter 换行）"
   els.hint.textContent = running
     ? "运行中 · 停止不会中断已经在跑的工具"
     : "Enter 发送 · Shift+Enter 换行 · 粘图/拖图/选图"

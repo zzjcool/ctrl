@@ -1756,6 +1756,19 @@ body {
   .row {
     gap: 8px;
   }
+
+  .composer-row {
+    gap: 8px;
+  }
+
+  .btn-send {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  .composer-hint {
+    display: none;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url"
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const styles = readFileSync(path.join(repoRoot, "src/web/public/styles.css"), "utf8")
 const html = readFileSync(path.join(repoRoot, "src/web/public/index.html"), "utf8")
+const appJs = readFileSync(path.join(repoRoot, "src/web/public/app.js"), "utf8")
 
 type Block = { query: string; body: string }
 type Rule = { selectors: string[]; declarations: string }
@@ -250,6 +251,41 @@ test("tool cards still cannot be clipped at narrow widths", () => {
   const right = firstPx(rows, "padding-right")
   assert.ok(left !== undefined && right !== undefined, `narrow .rows must set both paddings, got: ${rows.join(" | ")}`)
   assert.equal(left, right, `narrow .rows padding is asymmetric: left ${left}px vs right ${right}px`)
+})
+
+test("the send button never wraps and the long hint is hidden on narrow screens", () => {
+  const button = narrowDeclarationsFor(".btn-send")
+  assert.ok(button.length > 0, ".btn-send has no narrow-screen override")
+  assert.ok(
+    hasDeclaration(button, "white-space", "nowrap"),
+    `narrow .btn-send must not wrap, got: ${button.join(" | ")}`,
+  )
+  assert.ok(
+    hasDeclaration(button, "flex-shrink", "0"),
+    `narrow .btn-send must not shrink, got: ${button.join(" | ")}`,
+  )
+
+  const hint = narrowDeclarationsFor(".composer-hint")
+  assert.ok(hint.length > 0, ".composer-hint has no narrow-screen override")
+  assert.ok(
+    hint.some((declaration) => hasDeclaration([declaration], "display", "none")),
+    `narrow .composer-hint must be hidden, got: ${hint.join(" | ")}`,
+  )
+})
+
+test("the narrow placeholder drops the keyboard hint and follows the media query", () => {
+  assert.match(
+    appJs,
+    /matchMedia\(\s*["']\(max-width:\s*620px\)["']\s*\)/,
+    "app.js must branch on a (max-width: 620px) media query",
+  )
+  assert.match(appJs, /["'`]说点什么…["'`]/, "narrow placeholder must be the bare 说点什么…")
+  assert.match(
+    appJs,
+    /说点什么…（Enter 发送，Shift\+Enter 换行）/,
+    "the wide placeholder must keep the full keyboard hint",
+  )
+  assert.match(appJs, /["']change["']/, "app.js must listen for media query changes")
 })
 
 test("narrow screens keep their 16px inputs", () => {
