@@ -999,6 +999,7 @@ body {
 
 .composer-box {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 7px;
 }
 
@@ -1030,10 +1031,12 @@ body {
 .composer-row {
   display: flex;
   align-items: center;
+  min-width: 0;
   gap: 12px;
 }
 
 .composer-hint {
+  flex: 1 1 auto;
   font-family: var(--font-mono);
   font-size: 10.5px;
   color: var(--fg-faint);
