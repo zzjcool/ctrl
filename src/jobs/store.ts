@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto"
-import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs"
+import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, statSync, writeFileSync } from "node:fs"
 import path from "node:path"
 
 export const JOBS_DIRNAME = "jobs"
@@ -250,9 +250,37 @@ export interface JobLog {
 export function readJobLogRaw(agentHome: string, id: string): string {
   if (!isJobId(id)) return ""
   try {
-    return readFileSync(jobPaths(agentHome, id).logPath, "utf8")
+    return readTailText(jobPaths(agentHome, id).logPath, MAX_OUTPUT_CHARS * 100).text
   } catch {
     return ""
+  }
+}
+
+const TAIL_CACHE_LIMIT = 64
+const tailCache = new Map<string, { key: string; text: string; truncated: boolean }>()
+
+function readTailText(file: string, maxBytes: number): { text: string; truncated: boolean } {
+  const stat = statSync(file)
+  const key = `${stat.size}:${stat.mtimeMs}:${maxBytes}`
+  const cached = tailCache.get(file)
+  if (cached !== undefined && cached.key === key) return { text: cached.text, truncated: cached.truncated }
+  const fd = openSync(file, "r")
+  try {
+    const size = stat.size
+    const start = size > maxBytes ? size - maxBytes : 0
+    const buffer = Buffer.alloc(size - start)
+    readSync(fd, buffer, 0, buffer.length, start)
+    const text = buffer.toString("utf8")
+    const newline = start === 0 ? -1 : text.indexOf("\n")
+    const result = { text: newline === -1 ? text : text.slice(newline + 1), truncated: start > 0 }
+    tailCache.set(file, { key, ...result })
+    if (tailCache.size > TAIL_CACHE_LIMIT) {
+      const oldest = tailCache.keys().next().value
+      if (oldest !== undefined) tailCache.delete(oldest)
+    }
+    return result
+  } finally {
+    closeSync(fd)
   }
 }
 
@@ -263,13 +291,16 @@ export function readJobLog(
 ): JobLog {
   if (!isJobId(id)) return { text: "", truncated: false }
   let raw: string
+  let fileTruncated = false
   try {
-    raw = readFileSync(jobPaths(agentHome, id).logPath, "utf8")
+    const tail = readTailText(jobPaths(agentHome, id).logPath, MAX_OUTPUT_CHARS * 100)
+    raw = tail.text
+    fileTruncated = tail.truncated
   } catch {
     return { text: "", truncated: false }
   }
   if (opts.full === true) {
-    if (raw.length <= MAX_OUTPUT_CHARS) return { text: raw, truncated: false }
+    if (raw.length <= MAX_OUTPUT_CHARS) return { text: raw, truncated: fileTruncated }
 
     return { text: raw.slice(raw.length - MAX_OUTPUT_CHARS), truncated: true }
   }

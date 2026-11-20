@@ -78,6 +78,7 @@ const state = {
   errors: 0,
   stickToBottom: true,
   lastTimelineScrollTop: 0,
+  pendingNewCount: 0,
 
   focus: [],
 
@@ -145,6 +146,8 @@ const els = {
   connText: document.getElementById("conn-text"),
   timeline: document.getElementById("timeline"),
   rows: document.getElementById("rows"),
+  jumpPill: document.getElementById("jump-pill"),
+  jumpPillCount: document.getElementById("jump-pill-count"),
   empty: document.getElementById("empty"),
   emptyLine: document.getElementById("empty-line"),
   loadWrap: document.getElementById("load-earlier-wrap"),
@@ -412,7 +415,7 @@ function updateHead() {
   els.name.textContent = state.name || "—"
   document.title = state.name ? `${state.name} · ctrl` : "ctrl"
 
-  els.events.textContent = String(Math.max(0, state.eventCount))
+  els.events.textContent = state.loaded ? String(Math.max(0, state.eventCount)) : "—"
 
   const workers = Math.max(0, state.workerCount)
   els.workers.textContent = String(workers)
@@ -987,6 +990,10 @@ function appendEvents(events) {
   els.rows.appendChild(fragment)
   for (const record of records) state.rows.push(record)
   if (state.pendingEl) els.rows.appendChild(state.pendingEl)
+  if (!state.stickToBottom) {
+    state.pendingNewCount += records.length
+    updateJumpPill()
+  }
   scheduleTaskMeasure()
   scheduleStickToBottom()
 }
@@ -1026,6 +1033,13 @@ function timelineGap() {
   return els.timeline.scrollHeight - els.timeline.clientHeight - els.timeline.scrollTop
 }
 
+function updateJumpPill() {
+  if (!els.jumpPill) return
+  const pending = state.pendingNewCount > 0 ? state.pendingNewCount : 0
+  els.jumpPill.hidden = state.stickToBottom
+  els.jumpPillCount.textContent = pending > 0 ? `${pending} 条新消息 · ` : ""
+}
+
 function scrollToBottom() {
   if (stickFrame) {
     window.cancelAnimationFrame(stickFrame)
@@ -1045,6 +1059,15 @@ function stopStickToBottom() {
     window.cancelAnimationFrame(stickFrame)
     stickFrame = 0
   }
+  updateJumpPill()
+}
+
+function jumpToLatest() {
+  state.pendingNewCount = 0
+  state.stickToBottom = true
+  scrollToBottom()
+  watchTimelineGrowth()
+  updateJumpPill()
 }
 
 function stickOnce() {
@@ -1066,7 +1089,9 @@ function noteTimelineScroll() {
     stopStickToBottom()
   } else if (!state.stickToBottom && timelineGap() < NEAR_BOTTOM_PX) {
     state.stickToBottom = true
+    state.pendingNewCount = 0
     watchTimelineGrowth()
+    updateJumpPill()
   }
   state.lastTimelineScrollTop = top
 }
@@ -2183,6 +2208,7 @@ async function tryLoadAgent() {
     lastAgentSnapshot = Date.now()
     setConnected(true)
     state.loaded = true
+    updateHead()
     if (state.eventCount > 0) await loadTail()
     await refreshJobs()
     await refreshProposals()
@@ -2396,6 +2422,8 @@ function bind() {
   })
 
   els.timeline.addEventListener("scroll", noteTimelineScroll, { passive: true })
+
+  els.jumpPill.addEventListener("click", jumpToLatest)
 
   els.rows.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null
