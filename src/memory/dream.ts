@@ -198,12 +198,30 @@ export const DREAM_INSTRUCTIONS =
   "- Before writing a memory, check the existing memories listed: if one says the same thing, do not repeat it; " +
   "if one is now wrong, put its id in `supersedes`.\n" +
   "- `focus` is what the agent is working on right now, at most 10 items: add what is new, pass the id of an item " +
-  "whose text or state changes, and `state: \"done\"` for what finished.\n" +
+  "whose text or state changes, and `state: \"done\"` for what finished. Each item's `after:` lines are the events " +
+  "that followed it — if they show it was completed, close it.\n" +
   "- `profileRewrite` only when a stable preference or habit changed; omit it otherwise.\n" +
   '- Reply `{}` when nothing is worth keeping.'
 
 /** Render the batch plus the existing memories into the user message. */
-export function buildDreamPrompt(batch: DreamBatch, existing: MemoryRow[], focus: FocusItem[] = []): string {
+export type FocusWithAfter = FocusItem & { after?: Array<{ seq: number; role: string; text: string }> }
+
+/** Attach the few events that followed each open item: what tells "done" apart from "still open". */
+export function focusWithAfter(
+  events: LogEvent[],
+  focus: FocusItem[],
+  perItem = 3,
+): FocusWithAfter[] {
+  return focus.map((item) => ({
+    ...item,
+    after: events
+      .filter((event) => item.seq !== undefined && event.seq > item.seq)
+      .slice(0, perItem)
+      .map((event) => ({ seq: event.seq, role: eventRole(event), text: eventText(event) ?? "" })),
+  }))
+}
+
+export function buildDreamPrompt(batch: DreamBatch, existing: MemoryRow[], focus: FocusWithAfter[] = []): string {
   const transcript = batch.events
     .filter((event) => event.text !== "")
     .map((event) => `[seq ${event.seq}] ${event.role}: ${event.text.replace(/\s+/g, " ").trim()}`)
@@ -224,7 +242,13 @@ export function buildDreamPrompt(batch: DreamBatch, existing: MemoryRow[], focus
     focus.length === 0
       ? "(no open items)"
       : focus
-          .map((item) => `- [${item.id}] (${item.state}) ${item.text.replace(/\s+/g, " ").trim()}`)
+          .map((item) => {
+            const line = `- [${item.id}] (${item.state}) ${item.text.replace(/\s+/g, " ").trim()}`
+            const after = (item.after ?? [])
+              .map((event) => `[seq ${event.seq}] ${event.role}: ${event.text.replace(/\s+/g, " ").trim().slice(0, 220)}`)
+              .join(" / ")
+            return after === "" ? line : `${line}\n  after: ${after}`
+          })
           .join("\n")
   return (
     `Current focus (open/doing):\n${focusBlock}\n\n` +
@@ -427,7 +451,7 @@ export async function runDream(ctx: DreamContext): Promise<DreamResult> {
     const response = await ctx.llm.complete({
       messages: [
         { role: "system", content: DREAM_INSTRUCTIONS },
-        { role: "user", content: buildDreamPrompt(batch, existing, listFocus(ctx.db, { limit: 10 })) },
+        { role: "user", content: buildDreamPrompt(batch, existing, focusWithAfter(ctx.events, listFocus(ctx.db, { limit: 10 }))) },
       ],
       maxTokens: ctx.maxTokens ?? DREAM_MAX_TOKENS,
       ...(ctx.signal !== undefined ? { signal: ctx.signal } : {}),
