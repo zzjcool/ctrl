@@ -19,7 +19,7 @@ import { openFocusCount, listFocus } from "../memory/focus.ts"
 import { createMemoryIndex } from "../memory/index.ts"
 import type { MemoryIndex } from "../memory/index.ts"
 import { MAX_PROPOSAL_LIMIT, listProposals } from "../memory/proposals.ts"
-import { createRecordingLlm, usageSummary } from "../memory/usage.ts"
+import { createRecordingLlm, todayTokensByKind, usageSummary } from "../memory/usage.ts"
 import type { UsageKind } from "../memory/usage.ts"
 import { DEFAULT_CONTEXT_BUDGET } from "../memory/window.ts"
 import { SelfEditGate } from "../selfedit/gate.ts"
@@ -253,10 +253,7 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     {
       now: () => Date.now(),
       usageToday: () => ({
-        tokens: withDb(memory, 0, (db) => {
-          const summary = usageSummary(db, { days: 1 })
-          return summary.today.promptTokens + summary.today.completionTokens
-        }),
+        tokens: withDb(memory, 0, (db) => todayTokensByKind(db, ["heartbeat"])),
       }),
       openFocus: () => withDb(memory, 0, (db) => openFocusCount(db)),
       focusTexts: () =>
@@ -272,7 +269,7 @@ export function buildContext(config: ServerConfig = {}): AppContext {
       turnRunning: () => ctx.turns.isRunning(LOG_ID),
       start: (text) => {
         const log = openSession(LOG_ID, { home: ensured.home })
-        const started = ctx.turns.start(LOG_ID, (signal) => runTurn(ctx, log, text, signal))
+        const started = ctx.turns.start(LOG_ID, (signal) => runTurn(ctx, log, text, signal, "heartbeat"))
         if (!started) throw new Error("a turn is already running for this agent")
       },
       readCounter: (date) =>

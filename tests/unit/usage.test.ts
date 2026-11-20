@@ -13,6 +13,7 @@ import {
   clampUsageDays,
   createRecordingLlm,
   recordUsage,
+  todayTokensByKind,
   usageSummary,
 } from "../../src/memory/usage.ts"
 
@@ -286,4 +287,18 @@ test("days is clamped to one through ninety buckets", async () => {
   const capped = usageSummary(db, { days: 365, now })
   assert.equal(capped.days.length, USAGE_MAX_DAYS)
   assert.equal(capped.days.at(-1)?.date, "2026-01-20")
+})
+
+test("the heartbeat budget counts only what heartbeats spent, not the user's own turns", async () => {
+  const db = openMemoryDb(":memory:")
+  try {
+    recordUsage(db, { kind: "turn", model: "m", promptTokens: 10_000, completionTokens: 1_000, ms: 5 })
+    recordUsage(db, { kind: "wake", model: "m", promptTokens: 5_000, completionTokens: 500, ms: 5 })
+    recordUsage(db, { kind: "heartbeat", model: "m", promptTokens: 2_000, completionTokens: 200, ms: 5 })
+    assert.equal(todayTokensByKind(db, ["heartbeat"]), 2_200)
+    assert.equal(todayTokensByKind(db, ["heartbeat", "wake"]), 7_700)
+    assert.equal(todayTokensByKind(db, []), 0)
+  } finally {
+    db.close()
+  }
 })

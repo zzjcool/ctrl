@@ -37,7 +37,7 @@ export function createWaker(ctx: AppContext): Waker {
         return
       }
       const text = wakeText(job)
-      const started = ctx.turns.start(LOG_ID, (signal) => runTurn(ctx, log, text, signal))
+      const started = ctx.turns.start(LOG_ID, (signal) => runTurn(ctx, log, text, signal, "wake"))
       if (!started) {
 
         warn(`job ${job.id} finished but a turn was already running — not waking twice`)

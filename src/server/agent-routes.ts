@@ -7,6 +7,7 @@ import {
   runAgent,
 } from "../engine/durable.ts"
 import type { LlmClient, Session } from "../engine/durable.ts"
+import type { UsageKind } from "../memory/usage.ts"
 import { lastDreamAt, readProfile } from "../memory/dream.ts"
 import { listFocus, openFocusCount } from "../memory/focus.ts"
 import { liveMemoryCount } from "../memory/memories.ts"
@@ -152,9 +153,15 @@ function safeMeta(read: () => string | undefined): string | undefined {
   }
 }
 
-export async function runTurn(ctx: AppContext, log: Session, text: string, signal: AbortSignal): Promise<void> {
+export async function runTurn(
+  ctx: AppContext,
+  log: Session,
+  text: string,
+  signal: AbortSignal,
+  origin: UsageKind = "turn",
+): Promise<void> {
   try {
-    await runTurnOnce(ctx, log, text, signal)
+    await runTurnOnce(ctx, log, text, signal, origin)
   } finally {
     importAfterTurn(ctx)
   }
@@ -168,14 +175,20 @@ function importAfterTurn(ctx: AppContext): void {
   }
 }
 
-async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: AbortSignal): Promise<void> {
+async function runTurnOnce(
+  ctx: AppContext,
+  log: Session,
+  text: string,
+  signal: AbortSignal,
+  origin: UsageKind,
+): Promise<void> {
   const meta = log.meta()
   const sidecar = readSidecar(ctx.agentHome, LOG_ID)
   const cwd = sidecar?.cwd ?? meta.cwd
 
   let base: LlmClient
   try {
-    base = ctx.createLlm(meta.model !== "" ? meta.model : ctx.defaultModel)
+    base = ctx.createLlm(meta.model !== "" ? meta.model : ctx.defaultModel, origin)
   } catch (error) {
     log.appendError({ message: `LLM unavailable: ${errorMessage(error)}`, fatal: true })
     throw error

@@ -6,7 +6,7 @@ export const USAGE_DEFAULT_DAYS = 7
 
 export const USAGE_MAX_DAYS = 90
 
-export type UsageKind = "turn" | "dream"
+export type UsageKind = "turn" | "dream" | "wake" | "heartbeat"
 
 export interface UsageEntry {
   kind: string
@@ -77,6 +77,19 @@ export function createRecordingLlm(client: LlmClient, opts: RecordingLlmOptions)
       return response
     },
   }
+}
+
+export function todayTokensByKind(db: DatabaseSync, kinds: UsageKind[], now: Date = new Date()): number {
+  if (kinds.length === 0) return 0
+  const start = startOfLocalDay(now)
+  const placeholders = kinds.map(() => "?").join(", ")
+  const row = db
+    .prepare(
+      `SELECT sum(prompt_tokens + completion_tokens) AS n FROM usage WHERE ts >= ? AND kind IN (${placeholders})`,
+    )
+    .get(start.toISOString(), ...kinds)
+  const value = row?.n
+  return typeof value === "number" ? value : 0
 }
 
 export function usageSummary(db: DatabaseSync, opts: { days?: number; now?: Date } = {}): UsageSummary {
