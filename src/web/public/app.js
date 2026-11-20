@@ -1,69 +1,78 @@
-// ctrl — 单页对话界面。
+// ctrl — 一个命名 agent 的页面：它的名字、它的一生（一条时间线）、一个输入框。
 //
-// 纯静态：无 import、无依赖、无构建、无 top-level await。
-// 只使用契约 §10 的接口：
-//   GET  /api/health                              GET  /api/machines
-//   GET  /api/sessions                            POST /api/sessions
-//   GET  /api/sessions/:id                        GET  /api/sessions/:id/events?since=N
-//   POST /api/sessions/:id/messages               POST /api/sessions/:id/abort
+// 纯静态 ES module：零 import、零依赖、零构建、无 top-level await。
+// 只使用契约 §7 的接口（v2 里没有"会话"这个概念，所以页面也不按会话拉数据）：
+//   GET  /api/agent
+//   GET  /api/agent/events?since=N | tail=T | before=S&tail=T
+//   POST /api/agent/messages   { text }
+//   POST /api/agent/abort
 //
-// 安全：所有来自服务端/模型/用户的文本都走 textContent 或 createElement，
-// 这里没有任何 innerHTML 赋值。
+// 安全：服务端 / 模型 / 用户的所有文本都走 textContent 或 createElement，
+// 这个文件里没有一处把字符串当 HTML 塞回 DOM。
 
-const API = "/api"
+const API = "/api/agent"
+/** 首屏和"加载更早"一次拿多少条（契约 §7：单次上限 200） */
+const TAIL = 100
 const POLL_RUNNING_MS = 700
 const POLL_IDLE_MS = 2500
-const NEAR_BOTTOM_PX = 96
-const MAX_INPUT_HEIGHT = 220
+/** 一次拉满 200 条说明后面还有，别等一个轮询间隔 */
+const POLL_CATCHUP_MS = 60
+const NEAR_BOTTOM_PX = 120
+const MAX_INPUT_HEIGHT = 200
 
 // ---------------------------------------------------------------------------
 // 状态
 // ---------------------------------------------------------------------------
 
 const state = {
-  sessions: [],
-  sessionId: null,
-  session: null,
-  resumePoint: null,
+  name: "",
+  machine: "",
   turn: { running: false },
-  /** 下一批事件的起始 seq（0-based dense） */
+  resumePoint: null,
+  eventCount: 0,
+  lastActivity: "",
+  /** 流式游标：下一次 since= 用（最后一条 seq + 1） */
   since: 0,
-  /** 事件总数，从流的 total 推进 */
-  total: 0,
-  machine: null,
-  machineDefault: null,
-  machines: [],
-  errors: 0,
-  pollTimer: 0,
-  pollGen: 0,
-  rendered: new Set(),
+  /** 已收到的最小 seq；> 0 就说明上面还有历史（null = 一条都没收到） */
+  oldest: null,
+  /** 收到过的所有 seq（含不渲染的 memory_*），用来去重 */
+  seen: new Set(),
+  /** 时间线上已有的行，按时间顺序：[{ seq, date, day, el }] */
+  rows: [],
+  /** callId → 工具卡片，用来把 tool_call 和 tool_result 合成一张 */
   tools: new Map(),
   pendingEl: null,
+  loaded: false,
+  exhausted: false,
+  loadingEarlier: false,
   sending: false,
   aborting: false,
-  creating: false,
-  hasContent: false,
-  nearBottom: true,
+  /** 刚发完消息的那一下：服务端的 running 可能还没翻过来，先信自己 */
+  optimisticUntil: 0,
   connected: null,
+  errors: 0,
+  nearBottom: true,
 }
 
 const els = {
-  log: document.getElementById("log"),
+  name: document.getElementById("agent-name"),
+  machine: document.getElementById("status-machine"),
+  events: document.getElementById("status-events"),
+  last: document.getElementById("status-last"),
+  resume: document.getElementById("status-resume"),
+  connDot: document.getElementById("conn-dot"),
+  connText: document.getElementById("conn-text"),
+  timeline: document.getElementById("timeline"),
+  rows: document.getElementById("rows"),
   empty: document.getElementById("empty"),
-  sessionList: document.getElementById("session-list"),
-  newSession: document.getElementById("new-session"),
+  emptyLine: document.getElementById("empty-line"),
+  loadWrap: document.getElementById("load-earlier-wrap"),
+  loadBtn: document.getElementById("load-earlier"),
   composer: document.getElementById("composer"),
   input: document.getElementById("input"),
   send: document.getElementById("send"),
-  machineSelect: document.getElementById("machine-select"),
+  hint: document.getElementById("composer-hint"),
   toast: document.getElementById("toast"),
-  statusModel: document.getElementById("status-model"),
-  statusMachine: document.getElementById("status-machine"),
-  statusEvents: document.getElementById("status-events"),
-  statusResume: document.getElementById("status-resume"),
-  statusCwd: document.getElementById("status-cwd"),
-  connDot: document.getElementById("conn-dot"),
-  connText: document.getElementById("conn-text"),
 }
 
 // ---------------------------------------------------------------------------
@@ -71,34 +80,76 @@ const els = {
 // ---------------------------------------------------------------------------
 
 /** 建一个元素。文本一律走 textContent。 */
-function node(tag, className, text) {
-  const el = document.createElement(tag)
-  if (className) el.className = className
-  if (text !== undefined && text !== null) el.textContent = String(text)
-  return el
+function el(tag, className, text) {
+  const node = document.createElement(tag)
+  if (className) node.className = className
+  if (text !== undefined && text !== null) node.textContent = String(text)
+  return node
 }
 
-function idOf(value) {
-  if (!value || typeof value !== "object") return null
-  const id = value.sessionId ?? value.id ?? value.session?.sessionId
-  return typeof id === "string" && id ? id : null
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
 function oneLine(text) {
   return String(text ?? "").replace(/\s+/g, " ").trim()
 }
 
-function timeAgo(iso) {
-  const t = Date.parse(String(iso ?? ""))
-  if (!Number.isFinite(t)) return ""
-  const diff = Date.now() - t
+function messageOf(error) {
+  if (error && typeof error.message === "string" && error.message) return error.message
+  return String(error)
+}
+
+function numberOf(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null
+}
+
+const pad2 = (n) => String(n).padStart(2, "0")
+
+function toDate(value) {
+  const ms = typeof value === "number" ? value : Date.parse(String(value ?? ""))
+  if (!Number.isFinite(ms)) return null
+  return new Date(ms)
+}
+
+function dayKey(date) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+}
+
+function dayLabel(date) {
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const day = new Date(date.getFullYear(), date.getMonth(), date.getDate())
+  const gap = Math.round((today.getTime() - day.getTime()) / 86_400_000)
+  if (gap === 0) return "今天"
+  if (gap === 1) return "昨天"
+  if (date.getFullYear() === today.getFullYear()) return `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+  return dayKey(date)
+}
+
+/** 今天只给 HH:MM；更早的日期在时间列里带上 MM-DD。 */
+function timeLabel(date) {
+  const hm = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`
+  return dayKey(date) === dayKey(new Date())
+    ? hm
+    : `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${hm}`
+}
+
+function timeAgo(value) {
+  const date = toDate(value)
+  if (!date) return ""
+  const diff = Date.now() - date.getTime()
+  if (diff < 0) return timeLabel(date)
   if (diff < 45_000) return "刚刚"
   if (diff < 3_600_000) return `${Math.max(1, Math.round(diff / 60_000))} 分钟前`
   if (diff < 86_400_000) return `${Math.max(1, Math.round(diff / 3_600_000))} 小时前`
-  const date = new Date(t)
-  const pad = (n) => String(n).padStart(2, "0")
-  const md = `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
-  return date.getFullYear() === new Date().getFullYear() ? md : `${date.getFullYear()}-${md}`
+  return timeLabel(date)
+}
+
+function absoluteTime(value) {
+  const date = toDate(value)
+  if (!date) return ""
+  return `${dayKey(date)} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
 }
 
 function formatDuration(ms) {
@@ -108,26 +159,20 @@ function formatDuration(ms) {
   if (ms < 60_000) return `${Math.round(ms / 1000)}s`
   const minutes = Math.floor(ms / 60_000)
   const seconds = Math.round((ms % 60_000) / 1000)
-  return `${minutes}m${String(seconds).padStart(2, "0")}s`
-}
-
-function errorMessage(data) {
-  if (!data || typeof data !== "object") return ""
-  const err = data.error
-  if (typeof err === "string") return err
-  if (err && typeof err === "object" && typeof err.message === "string") return err.message
-  if (typeof data.message === "string") return data.message
-  return ""
+  return `${minutes}m${pad2(seconds)}s`
 }
 
 async function api(path, options) {
-  const init = { method: (options && options.method) || "GET", headers: { accept: "application/json" } }
+  const init = {
+    method: (options && options.method) || "GET",
+    headers: { accept: "application/json" },
+  }
   if (options && options.body !== undefined) {
     init.headers["content-type"] = "application/json"
     init.body = JSON.stringify(options.body)
   }
-  const res = await fetch(API + path, init)
-  const raw = await res.text()
+  const response = await fetch(API + path, init)
+  const raw = await response.text()
   let data = null
   if (raw) {
     try {
@@ -136,19 +181,22 @@ async function api(path, options) {
       data = { raw }
     }
   }
-  if (!res.ok) {
-    const err = new Error(errorMessage(data) || `HTTP ${res.status}`)
-    err.status = res.status
-    err.data = data
-    throw err
+  if (!response.ok) {
+    const serverMessage =
+      data && typeof data === "object" && typeof data.error === "string" ? data.error : ""
+    const error = new Error(serverMessage || `HTTP ${response.status}`)
+    error.status = response.status
+    error.data = data
+    throw error
   }
   return data ?? {}
 }
 
-function setConnected(ok, label) {
-  if (state.connected !== ok) state.connected = ok
-  els.connDot.className = `dot ${ok ? "dot-ok" : "dot-fail"}`
-  els.connText.textContent = ok ? label || "已连接" : "连接断开"
+function setConnected(ok) {
+  state.connected = ok
+  els.connDot.className = ok ? "dot dot-ok" : "dot dot-fail"
+  els.connText.textContent = ok ? "已连接" : "连接断开"
+  els.connText.classList.toggle("is-fail", !ok)
 }
 
 let toastTimer = 0
@@ -160,184 +208,466 @@ function toast(message) {
   toastTimer = window.setTimeout(() => {
     els.toast.classList.remove("show")
     els.toast.hidden = true
-  }, 3200)
+  }, 3600)
 }
 
 // ---------------------------------------------------------------------------
-// 会话列表
+// 头部：名字 + 状态条
 // ---------------------------------------------------------------------------
 
-function extractSessions(data) {
-  if (Array.isArray(data)) return data
-  if (data && Array.isArray(data.sessions)) return data.sessions
-  if (data && Array.isArray(data.items)) return data.items
-  return []
-}
-
-function drawSessionList() {
-  els.sessionList.textContent = ""
-  if (!state.sessions.length) {
-    els.sessionList.appendChild(node("div", "session-empty", "还没有会话。点「＋ 新对话」开始。"))
-    return
+function pickName(data) {
+  if (typeof data?.agent === "string" && data.agent.trim()) return data.agent.trim()
+  const agent = data && typeof data.agent === "object" && data.agent ? data.agent : null
+  if (agent && typeof agent.name === "string" && agent.name.trim()) return agent.name.trim()
+  if (data?.session && typeof data.session.name === "string" && data.session.name.trim()) {
+    return data.session.name.trim()
   }
-  for (const session of state.sessions) {
-    const id = idOf(session)
-    if (!id) continue
-    const item = node("button", "session-item")
-    item.type = "button"
-    item.dataset.id = id
-    item.setAttribute("role", "listitem")
-    if (id === state.sessionId) item.classList.add("active")
+  return ""
+}
 
-    const title = typeof session.title === "string" && session.title.trim()
-      ? session.title.trim()
-      : `会话 ${id.slice(0, 6)}`
-    item.appendChild(node("div", "session-title", title))
-
-    const meta = node("div", "session-meta")
-    const when = session.updatedAt ?? session.createdAt
-    meta.appendChild(node("span", "session-time", timeAgo(when) || "—"))
-    if (typeof session.eventCount === "number") {
-      meta.appendChild(node("span", "session-sep", "·"))
-      meta.appendChild(node("span", "session-count", `${session.eventCount} 事件`))
+/** `/api/agent` 的 machine 可能是字符串，也可能是 `{ name }`；两种都认。 */
+function pickMachine(data) {
+  const candidates = [data?.machine, data?.session?.machine, data?.session?.machineName, data?.agent?.machine]
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim()
+    if (candidate && typeof candidate === "object" && typeof candidate.name === "string" && candidate.name.trim()) {
+      return candidate.name.trim()
     }
-    item.appendChild(meta)
-
-    item.addEventListener("click", () => {
-      if (state.sessionId === id) return
-      void openSession(id)
-    })
-    els.sessionList.appendChild(item)
   }
+  return ""
 }
 
-async function refreshSessions() {
-  try {
-    const data = await api("/sessions")
-    state.sessions = extractSessions(data)
-    drawSessionList()
-    return state.sessions
-  } catch {
-    // 会话列表不是关键路径：断线时保留上一次的列表。
-    return state.sessions
+function normalizeTurn(turn) {
+  if (!turn || typeof turn !== "object") return { running: false }
+  const running = turn.running === true
+  return {
+    running,
+    ...(typeof turn.startedAt === "string" ? { startedAt: turn.startedAt } : {}),
+    ...(typeof turn.error === "string" && turn.error ? { error: turn.error } : {}),
+    ...(turn.aborted === true ? { aborted: true } : {}),
   }
-}
-
-// ---------------------------------------------------------------------------
-// 机器 / 健康
-// ---------------------------------------------------------------------------
-
-function machineName(value) {
-  if (!value || typeof value !== "object") return null
-  const name = value.name ?? value.id ?? value.machine
-  return typeof name === "string" && name ? name : null
-}
-
-async function loadMachines() {
-  try {
-    const data = await api("/machines")
-    const list = Array.isArray(data?.machines) ? data.machines : Array.isArray(data) ? data : []
-    state.machines = list.filter((m) => m && typeof m === "object")
-    const current = state.machines.find((m) => m.current === true) || state.machines[0] || null
-    state.machineDefault = machineName(current)
-    els.machineSelect.textContent = ""
-    for (const m of state.machines) {
-      const name = machineName(m)
-      if (!name) continue
-      const option = document.createElement("option")
-      option.value = name
-      option.textContent = name
-      if (m.current === true) option.selected = true
-      els.machineSelect.appendChild(option)
-    }
-    if (!els.machineSelect.options.length) {
-      const option = document.createElement("option")
-      option.value = ""
-      option.textContent = state.machineDefault || "—"
-      els.machineSelect.appendChild(option)
-    }
-    // 机器在会话创建时绑定（契约 §7），这里只做展示，不让用户在已有会话里改。
-    els.machineSelect.disabled = true
-    updateMachineChip()
-    updateStatus()
-  } catch {
-    els.machineSelect.textContent = ""
-    const option = document.createElement("option")
-    option.value = ""
-    option.textContent = "—"
-    els.machineSelect.appendChild(option)
-    els.machineSelect.disabled = true
-  }
-}
-
-async function loadHealth() {
-  try {
-    const data = await api("/health")
-    const status = typeof data?.status === "string" ? data.status : "ok"
-    setConnected(true, status === "ok" ? "已连接" : status)
-    if (!state.machineDefault) {
-      const name = machineName({ machine: data?.machine, name: data?.machine })
-      if (name) {
-        state.machineDefault = name
-        updateMachineChip()
-        updateStatus()
-      }
-    }
-  } catch {
-    setConnected(false)
-  }
-}
-
-function updateMachineChip() {
-  const name = state.machine || state.machineDefault || ""
-  if (name) {
-    const exists = Array.from(els.machineSelect.options).some((o) => o.value === name)
-    if (!exists) {
-      const option = document.createElement("option")
-      option.value = name
-      option.textContent = name
-      els.machineSelect.appendChild(option)
-    }
-    els.machineSelect.value = name
-  }
-  els.machineSelect.disabled = true
-}
-
-// ---------------------------------------------------------------------------
-// 状态条
-// ---------------------------------------------------------------------------
-
-function resumeKind() {
-  const kind = state.resumePoint && typeof state.resumePoint.kind === "string" ? state.resumePoint.kind : null
-  if (!kind || kind === "clean") return null
-  // 新会话的 resumePoint 是 "empty"（0 条事件），那不是"恢复"。
-  if (state.total === 0) return null
-  return kind
 }
 
 const RESUME_TITLE = {
-  dangling_tool_call: "上次有一个工具调用没有结果，已按失败标记",
-  interrupted_turn: "上次的模型调用没有返回，已中断",
+  dangling_tool_call: "上次有一个工具调用没有结果，已经按失败标记",
+  interrupted_turn: "上次的模型调用没有返回，那一轮被中断了",
 }
 
-function updateStatus() {
-  const session = state.session
-  els.statusModel.textContent = (session && typeof session.model === "string" && session.model) || "—"
-  els.statusMachine.textContent = state.machine || state.machineDefault || "—"
-  els.statusEvents.textContent = String(state.total)
+/** 只有"不 clean 而且有历史"才配一个安静的"已恢复"。 */
+function resumeKind() {
+  const kind = state.resumePoint && typeof state.resumePoint.kind === "string" ? state.resumePoint.kind : ""
+  if (!kind || kind === "clean" || kind === "empty") return ""
+  if (state.eventCount <= 0) return ""
+  return kind
+}
+
+function applyAgent(data) {
+  const name = pickName(data)
+  if (name) state.name = name
+  const machine = pickMachine(data)
+  if (machine) state.machine = machine
+
+  const session = data && typeof data.session === "object" && data.session ? data.session : null
+  if (session) {
+    const count = numberOf(session.eventCount)
+    if (count !== null) state.eventCount = Math.max(state.eventCount, count)
+    const lastSeq = numberOf(session.lastSeq)
+    if (lastSeq !== null) state.since = Math.max(state.since, lastSeq + 1)
+    if (typeof session.updatedAt === "string" && session.updatedAt) {
+      const incoming = toDate(session.updatedAt)
+      const current = toDate(state.lastActivity)
+      if (incoming && (!current || incoming.getTime() > current.getTime())) state.lastActivity = session.updatedAt
+    }
+  }
+  if (data && data.resumePoint !== undefined) state.resumePoint = data.resumePoint ?? null
+  if (data && data.turn !== undefined) state.turn = normalizeTurn(data.turn)
+}
+
+function updateHead() {
+  els.name.textContent = state.name || "—"
+  document.title = state.name ? `${state.name} · ctrl` : "ctrl"
+
+  els.machine.textContent = state.machine || "—"
+  els.machine.title = state.machine ? `工具跑在 ${state.machine} 上（本次运行固定）` : ""
+
+  els.events.textContent = String(Math.max(0, state.eventCount))
+
+  const when = state.lastActivity
+  els.last.textContent = when ? timeAgo(when) : "—"
+  els.last.title = when ? absoluteTime(when) : ""
 
   const kind = resumeKind()
-  if (kind) {
-    els.statusResume.hidden = false
-    els.statusResume.title = RESUME_TITLE[kind] || `会话从上次中断处恢复（${kind}）`
-  } else {
-    els.statusResume.hidden = true
+  els.resume.hidden = !kind
+  els.resume.title = kind ? RESUME_TITLE[kind] || `从上次中断处恢复（${kind}）` : ""
+}
+
+function updateEmpty() {
+  const empty = state.loaded && state.eventCount === 0
+  els.empty.hidden = !empty
+  if (!empty) return
+  const name = state.name || "这个 agent"
+  const where = state.machine ? `工具跑在 ${state.machine} 上` : "工具跑在它自己的机器上"
+  els.emptyLine.textContent = `这是 ${name}：一个一直活着的 agent，${where}。`
+}
+
+// ---------------------------------------------------------------------------
+// 时间线：行
+// ---------------------------------------------------------------------------
+
+/** 一条日期分隔条；和行共用时间列，所以标签是右对齐的。 */
+function separator(date, day) {
+  const box = el("div", "sep")
+  box.dataset.sep = day
+  box.appendChild(el("span", "sep-label", dayLabel(date)))
+  box.appendChild(el("span", "sep-rule", ""))
+  return box
+}
+
+/** 把 ``` 围栏切成代码块，其余文本原样保留换行。 */
+function renderProse(container, rawText) {
+  const lines = String(rawText ?? "").split("\n")
+  let buffer = []
+  let fence = null
+
+  const flushText = () => {
+    if (!buffer.length) return
+    const block = buffer.join("\n").replace(/^\n+/, "").replace(/\s+$/, "")
+    buffer = []
+    if (!block) return
+    container.appendChild(el("p", "prose", block))
   }
 
-  const cwd = session && typeof session.cwd === "string" ? session.cwd : ""
-  els.statusCwd.textContent = cwd
-  els.statusCwd.title = cwd ? `工作目录：${cwd}` : ""
-  els.statusCwd.hidden = !cwd
+  const flushFence = (current) => {
+    const box = el("div", "fence")
+    if (current.lang) box.appendChild(el("div", "fence-lang", current.lang))
+    const pre = document.createElement("pre")
+    pre.appendChild(el("code", "fence-code", current.lines.join("\n")))
+    box.appendChild(pre)
+    container.appendChild(box)
+  }
+
+  for (const line of lines) {
+    const open = /^\s*```(.*)$/.exec(line)
+    if (fence) {
+      if (open) {
+        flushFence(fence)
+        fence = null
+      } else {
+        fence.lines.push(line)
+      }
+    } else if (open) {
+      flushText()
+      fence = { lang: open[1].trim(), lines: [] }
+    } else {
+      buffer.push(line)
+    }
+  }
+  if (fence) flushFence(fence)
+  flushText()
+}
+
+const ARG_PRIORITY = ["cmd", "command", "path", "query", "task", "pattern", "text", "id", "url", "name"]
+
+function rankKey(key) {
+  const index = ARG_PRIORITY.indexOf(key)
+  return index === -1 ? ARG_PRIORITY.length : index
+}
+
+function valueText(value) {
+  if (value === null || value === undefined) return ""
+  if (typeof value === "string") return value
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+/** `cmd: go build ./...  ·  cwd: /srv/app` — 先挑最像"这一行在干什么"的键。 */
+function argsLine(args) {
+  if (args === null || args === undefined) return ""
+  if (typeof args !== "object") return oneLine(valueText(args)).slice(0, 300)
+  const keys = Object.keys(args)
+  if (!keys.length) return ""
+  const ordered = keys.slice().sort((a, b) => rankKey(a) - rankKey(b) || a.localeCompare(b))
+  const parts = []
+  for (const key of ordered.slice(0, 5)) {
+    parts.push(`${key}: ${oneLine(valueText(args[key])).slice(0, 220)}`)
+  }
+  if (ordered.length > 5) parts.push(`+${ordered.length - 5}`)
+  return parts.join("  ·  ")
+}
+
+function createCard(name) {
+  const root = el("div", "tool")
+  root.dataset.state = "running"
+
+  const head = el("div", "tool-head")
+  const nameEl = el("span", "tool-name", String(name || "tool"))
+  head.appendChild(nameEl)
+  if (state.machine) head.appendChild(el("span", "tool-machine", state.machine))
+
+  const durEl = el("span", "tool-dur", "")
+  const stateEl = el("span", "tool-state", "…")
+  head.append(durEl, stateEl)
+
+  const argsEl = el("div", "tool-args")
+  argsEl.hidden = true
+
+  const details = document.createElement("details")
+  details.className = "tool-out"
+  details.hidden = true
+  const summary = document.createElement("summary")
+  summary.textContent = "输出"
+  const pre = el("pre", "tool-pre", "")
+  details.append(summary, pre)
+
+  root.append(head, argsEl, details)
+  return { root, nameEl, durEl, stateEl, argsEl, details, pre, callTs: null, resultTs: null }
+}
+
+/** call 和 result 是先后脚到的，谁后到谁负责把耗时补上（上翻分页时会反过来）。 */
+function updateDuration(card) {
+  if (card.callTs === null || card.resultTs === null) return
+  card.durEl.textContent = formatDuration(card.resultTs - card.callTs)
+}
+
+function fillCall(card, data, ts) {
+  if (data && typeof data.name === "string" && data.name) card.nameEl.textContent = data.name
+  const line = argsLine(data ? data.args : null)
+  if (line) {
+    card.argsEl.textContent = line
+    card.argsEl.hidden = false
+  }
+  const callDate = toDate(ts)
+  if (callDate) card.callTs = callDate.getTime()
+  updateDuration(card)
+}
+
+function finishCard(card, data, ts) {
+  const ok = !data || data.ok !== false
+  card.root.dataset.state = ok ? "ok" : "fail"
+  card.stateEl.textContent = ok ? "ok" : "fail"
+
+  const end = toDate(ts)
+  if (end) {
+    card.resultTs = end.getTime()
+    updateDuration(card)
+  }
+
+  const output = String((data && data.output) ?? "").replace(/\s+$/, "")
+  card.pre.textContent = output.trim() ? output : "（无输出）"
+  card.pre.classList.toggle("is-empty", !output.trim())
+  card.details.hidden = false
+}
+
+/** 一条事件 → 一行；返回 null 表示不渲染（memory_* / session_created / 已合并进卡片）。 */
+function buildRow(event) {
+  const date = toDate(event.ts) || new Date()
+  const type = String(event.type || "")
+  const data = event.data && typeof event.data === "object" ? event.data : {}
+
+  const row = el("div", "row")
+  row.dataset.type = type
+  const time = document.createElement("time")
+  time.className = "row-time"
+  time.dateTime = date.toISOString()
+  time.textContent = timeLabel(date)
+  const body = el("div", "row-body")
+  row.append(time, body)
+
+  switch (type) {
+    case "user_message": {
+      const text = String(data.text ?? "")
+      if (!text.trim()) return null
+      row.classList.add("row-user")
+      const line = el("p", "user-text")
+      line.appendChild(el("span", "user-mark", "›"))
+      line.appendChild(document.createTextNode(text))
+      body.appendChild(line)
+      break
+    }
+    case "assistant_message": {
+      const text = String(data.text ?? "")
+      if (!text.trim()) return null
+      row.classList.add("row-agent")
+      renderProse(body, text)
+      break
+    }
+    case "tool_call": {
+      const callId = String(data.callId ?? "")
+      const existing = callId ? state.tools.get(callId) : null
+      if (existing) {
+        // 上翻分页时先看到了 result、后看到 call：补上参数，不另起一行。
+        fillCall(existing, data, event.ts)
+        return null
+      }
+      const card = createCard(data.name)
+      fillCall(card, data, event.ts)
+      if (callId) state.tools.set(callId, card)
+      row.classList.add("row-tool")
+      body.appendChild(card.root)
+      break
+    }
+    case "tool_result": {
+      const callId = String(data.callId ?? "")
+      const existing = callId ? state.tools.get(callId) : null
+      if (existing) {
+        // 和上面那张卡片是同一件事：结果写进卡片，不再多一行。
+        finishCard(existing, data, event.ts)
+        return null
+      }
+      const card = createCard(data.name)
+      if (callId) state.tools.set(callId, card)
+      finishCard(card, data, event.ts)
+      row.classList.add("row-tool")
+      body.appendChild(card.root)
+      break
+    }
+    case "error": {
+      row.classList.add("row-error")
+      if (data.fatal === true) row.classList.add("is-fatal")
+      const line = el("div", "err-line")
+      line.appendChild(el("span", "err-mark", data.fatal === true ? "!" : "⚠"))
+      line.appendChild(el("span", "err-text", String(data.message ?? "")))
+      body.appendChild(line)
+      break
+    }
+    case "compaction": {
+      row.classList.add("row-note")
+      const kept = numberOf(data.firstKeptSeq)
+      const line = el("div", "note-line", kept === null ? "上下文已压缩" : `上下文已压缩 · 保留自 seq ${kept}`)
+      if (typeof data.summary === "string" && data.summary) line.title = data.summary
+      body.appendChild(line)
+      break
+    }
+    default:
+      // memory_write / memory_recall / session_created / assistant_pending：不渲染。
+      return null
+  }
+
+  return { seq: event.seq, date, day: dayKey(date), el: row }
+}
+
+/** 记下"这条 seq 见过了"，再交给 buildRow；重复的、坏掉的都直接丢。 */
+function recordOf(event) {
+  if (!event || typeof event !== "object") return null
+  const seq = numberOf(event.seq)
+  if (seq === null || state.seen.has(seq)) return null
+  state.seen.add(seq)
+  try {
+    return buildRow(event)
+  } catch {
+    // 一条坏事件不该把整条流卡死：跳过它，游标照常往前。
+    return null
+  }
+}
+
+/** 推进三个游标：since（往后）、oldest（往前）、最后活动时间。 */
+function noteCursors(events) {
+  for (const event of events) {
+    if (!event || typeof event !== "object") continue
+    const seq = numberOf(event.seq)
+    if (seq !== null) {
+      state.since = Math.max(state.since, seq + 1)
+      if (state.oldest === null || seq < state.oldest) state.oldest = seq
+    }
+    if (typeof event.ts === "string" && event.ts) {
+      const incoming = toDate(event.ts)
+      const current = toDate(state.lastActivity)
+      if (incoming && (!current || incoming.getTime() > current.getTime())) state.lastActivity = event.ts
+    }
+  }
+  if (state.oldest !== null) state.eventCount = Math.max(state.eventCount, state.since)
+}
+
+function appendEvents(events) {
+  const records = []
+  for (const event of events) {
+    const record = recordOf(event)
+    if (record) records.push(record)
+  }
+  noteCursors(events)
+  if (!records.length) return
+  const fragment = document.createDocumentFragment()
+  let prevDay = state.rows.length ? state.rows[state.rows.length - 1].day : null
+  for (const record of records) {
+    if (record.day !== prevDay) fragment.appendChild(separator(record.date, record.day))
+    fragment.appendChild(record.el)
+    prevDay = record.day
+  }
+  els.rows.appendChild(fragment)
+  for (const record of records) state.rows.push(record)
+  if (state.pendingEl) els.rows.appendChild(state.pendingEl)
+}
+
+function prependEvents(events) {
+  const records = []
+  for (const event of events) {
+    const record = recordOf(event)
+    if (record) records.push(record)
+  }
+  noteCursors(events)
+  if (!records.length) return
+
+  const fragment = document.createDocumentFragment()
+  let prevDay = null
+  for (const record of records) {
+    if (record.day !== prevDay) fragment.appendChild(separator(record.date, record.day))
+    fragment.appendChild(record.el)
+    prevDay = record.day
+  }
+  const first = state.rows.length ? state.rows[0] : null
+  if (first && prevDay !== first.day) fragment.appendChild(separator(first.date, first.day))
+  // 顶上原来那条分隔条要么被上面这条取代，要么本来就多余（同一天）。
+  while (els.rows.firstElementChild && els.rows.firstElementChild.classList.contains("sep")) {
+    els.rows.firstElementChild.remove()
+  }
+  els.rows.insertBefore(fragment, els.rows.firstElementChild)
+  state.rows = records.concat(state.rows)
+}
+
+// ---------------------------------------------------------------------------
+// 时间线：滚动、加载更早、"运行中"
+// ---------------------------------------------------------------------------
+
+function scrollToBottom() {
+  els.timeline.scrollTop = els.timeline.scrollHeight
+}
+
+function updateLoadEarlier() {
+  const more = state.loaded && state.oldest !== null && state.oldest > 0 && !state.exhausted
+  els.loadWrap.hidden = !more
+  els.loadBtn.disabled = state.loadingEarlier
+  els.loadBtn.textContent = state.loadingEarlier ? "加载中…" : "加载更早"
+}
+
+function buildPending() {
+  const row = el("div", "row row-pending")
+  const time = document.createElement("time")
+  time.className = "row-time"
+  time.textContent = timeLabel(new Date())
+  const body = el("div", "row-body")
+  const line = el("div", "pending")
+  line.appendChild(el("span", "spin", ""))
+  line.appendChild(el("span", "pending-text", "运行中…"))
+  body.appendChild(line)
+  row.append(time, body)
+  return row
+}
+
+function syncPending() {
+  const running = Boolean(state.turn && state.turn.running)
+  if (!running) {
+    if (state.pendingEl) {
+      state.pendingEl.remove()
+      state.pendingEl = null
+    }
+    return
+  }
+  if (!state.pendingEl) state.pendingEl = buildPending()
+  if (els.rows.lastElementChild !== state.pendingEl) els.rows.appendChild(state.pendingEl)
 }
 
 // ---------------------------------------------------------------------------
@@ -345,11 +675,11 @@ function updateStatus() {
 // ---------------------------------------------------------------------------
 
 function autosize() {
-  const ta = els.input
-  ta.style.height = "auto"
-  const next = Math.min(ta.scrollHeight || 0, MAX_INPUT_HEIGHT)
-  ta.style.height = `${next}px`
-  ta.style.overflowY = (ta.scrollHeight || 0) > MAX_INPUT_HEIGHT ? "auto" : "hidden"
+  const input = els.input
+  input.style.height = "auto"
+  const next = Math.min(input.scrollHeight || 0, MAX_INPUT_HEIGHT)
+  input.style.height = `${next}px`
+  input.style.overflowY = (input.scrollHeight || 0) > MAX_INPUT_HEIGHT ? "auto" : "hidden"
 }
 
 function updateComposer() {
@@ -357,523 +687,43 @@ function updateComposer() {
   els.send.textContent = running ? "停止" : "发送"
   els.send.classList.toggle("is-stop", running)
   els.send.disabled = running ? state.aborting : state.sending
-  els.send.title = running ? "停止这一轮（abort）" : "发送（Enter）"
-  els.input.placeholder = state.sessionId
-    ? "接着说…（Enter 发送，Shift+Enter 换行）"
-    : "让它在远端做点什么…（发送会在新会话里开始）"
-}
-
-function updateEmptyState() {
-  els.empty.hidden = state.hasContent
-}
-
-function bindPrompt(button) {
-  button.addEventListener("click", () => {
-    const prompt = button.dataset.prompt || button.textContent || ""
-    els.input.value = prompt
-    autosize()
-    els.input.focus()
-  })
-}
-
-function scrollToBottom() {
-  els.log.scrollTop = els.log.scrollHeight
-}
-
-/** 追加一条区块到对话流；仅当用户本来就在底部时才跟随。 */
-function appendBlock(el) {
-  if (!state.hasContent) {
-    state.hasContent = true
-    updateEmptyState()
-  }
-  els.log.appendChild(el)
-  // 转圈永远挂在流的末尾（它表示"下一步正在生成"）。
-  if (state.pendingEl) els.log.appendChild(state.pendingEl)
-  if (state.nearBottom) scrollToBottom()
-}
-
-// ---------------------------------------------------------------------------
-// 消息渲染
-// ---------------------------------------------------------------------------
-
-function showPending() {
-  if (state.pendingEl) {
-    if (els.log.lastElementChild !== state.pendingEl) els.log.appendChild(state.pendingEl)
-    return
-  }
-  const row = node("div", "row row-pending")
-  const inner = node("div", "pending")
-  inner.appendChild(node("span", "spinner", ""))
-  inner.appendChild(node("span", "pending-text", "正在生成…"))
-  row.appendChild(inner)
-  state.pendingEl = row
-  if (!state.hasContent) {
-    state.hasContent = true
-    updateEmptyState()
-  }
-  els.log.appendChild(row)
-  if (state.nearBottom) scrollToBottom()
-}
-
-function clearPending() {
-  if (!state.pendingEl) return
-  state.pendingEl.remove()
-  state.pendingEl = null
-}
-
-function syncPending() {
-  if (state.turn && state.turn.running) showPending()
-  else clearPending()
-}
-
-/** 把 ``` 代码块渲染成 <pre>，其余文本保留换行。 */
-function renderRichText(container, text) {
-  const src = String(text ?? "")
-  const lines = src.split("\n")
-  let buffer = []
-  let fence = null
-
-  const flushText = () => {
-    if (!buffer.length) return
-    // 代码块切开的边界会留下空行；块之间的间距交给 flex gap。
-    const block = buffer.join("\n").replace(/^\n+/, "").replace(/\s+$/, "")
-    buffer = []
-    if (!block) return
-    const div = node("div", "msg-text")
-    div.textContent = block
-    container.appendChild(div)
-  }
-
-  const flushCode = (current) => {
-    const wrap = node("div", "code-block")
-    if (current.lang) wrap.appendChild(node("div", "code-lang", current.lang))
-    const pre = node("pre", "code-pre")
-    const code = node("code", "code-body", current.lines.join("\n"))
-    pre.appendChild(code)
-    wrap.appendChild(pre)
-    container.appendChild(wrap)
-  }
-
-  for (const line of lines) {
-    const match = /^\s*```(.*)$/.exec(line)
-    if (fence) {
-      if (match) {
-        flushCode(fence)
-        fence = null
-      } else {
-        fence.lines.push(line)
-      }
-    } else if (match) {
-      flushText()
-      fence = { lang: match[1].trim(), lines: [] }
-    } else {
-      buffer.push(line)
-    }
-  }
-  if (fence) flushCode(fence)
-  flushText()
-}
-
-function renderUserMessage(data) {
-  clearPending()
-  const row = node("div", "row row-user")
-  const bubble = node("div", "bubble-user", String(data?.text ?? ""))
-  row.appendChild(bubble)
-  appendBlock(row)
-}
-
-function renderAssistantMessage(data) {
-  clearPending()
-  const text = String(data?.text ?? "")
-  if (!text.trim()) return
-  const row = node("div", "row row-assistant")
-  const body = node("div", "message-body")
-  renderRichText(body, text)
-  row.appendChild(body)
-  appendBlock(row)
-}
-
-function argsPreview(args) {
-  if (args === null || args === undefined) return null
-  if (typeof args === "string") return [{ key: null, value: oneLine(args).slice(0, 400) }]
-  if (typeof args !== "object") return [{ key: null, value: String(args) }]
-  const keys = Object.keys(args)
-  if (!keys.length) return null
-  const parts = []
-  for (const key of keys.slice(0, 4)) {
-    const value = args[key]
-    let text
-    if (typeof value === "string") text = value
-    else if (value === null || typeof value === "number" || typeof value === "boolean") text = String(value)
-    else {
-      try {
-        text = JSON.stringify(value)
-      } catch {
-        text = String(value)
-      }
-    }
-    parts.push({ key, value: oneLine(text).slice(0, 300) })
-  }
-  if (keys.length > 4) parts.push({ key: null, value: "…" })
-  return parts
-}
-
-function createToolCard(input) {
-  const card = node("div", "tool-card is-running")
-  const head = node("div", "tool-head")
-
-  head.appendChild(node("span", "tool-name", String(input.name || "tool")))
-  const machine = input.machine || state.machine || state.machineDefault
-  if (machine) head.appendChild(node("span", "tool-machine", String(machine)))
-
-  const status = node("span", "tool-status", "running")
-  const durationEl = node("span", "tool-duration", "")
-  head.append(status, durationEl)
-  card.appendChild(head)
-
-  const preview = argsPreview(input.args)
-  if (preview && preview.length) {
-    const argsRow = node("div", "tool-args")
-    for (const part of preview) {
-      if (part.key) argsRow.appendChild(node("span", "arg-key", `${part.key}:`))
-      argsRow.appendChild(node("span", "arg-val", part.value))
-    }
-    card.appendChild(argsRow)
-  }
-
-  const details = document.createElement("details")
-  details.className = "tool-output"
-  details.hidden = true
-  const summary = document.createElement("summary")
-  summary.className = "tool-output-summary"
-  summary.appendChild(node("span", "tool-output-label", "输出"))
-  const pre = node("pre", "tool-output-pre")
-  details.append(summary, pre)
-  card.appendChild(details)
-
-  const callTs = input.ts ? Date.parse(String(input.ts)) : NaN
-  return { el: card, status, durationEl, details, pre, callTs }
-}
-
-function finishToolCard(card, data, ts) {
-  const ok = data?.ok !== false
-  card.el.classList.remove("is-running")
-  card.el.classList.add(ok ? "is-ok" : "is-fail")
-  card.status.textContent = ok ? "ok" : "fail"
-  card.status.className = `tool-status ${ok ? "ok" : "fail"}`
-
-  const ended = ts ? Date.parse(String(ts)) : NaN
-  const elapsed = formatDuration(ended - card.callTs)
-  card.durationEl.textContent = elapsed
-
-  const output = String(data?.output ?? "")
-  card.pre.textContent = output.trim() ? output : "(无输出)"
-  card.pre.classList.toggle("is-empty", !output.trim())
-  card.details.hidden = false
-}
-
-function renderToolCall(data, ts) {
-  const callId = String(data?.callId ?? "")
-  const card = createToolCard({ name: data?.name, args: data?.args, ts, machine: state.machine })
-  if (callId) state.tools.set(callId, card)
-  appendBlock(card.el)
-}
-
-function renderToolResult(data, ts) {
-  const callId = String(data?.callId ?? "")
-  let card = callId ? state.tools.get(callId) : null
-  if (!card) {
-    // 重放或半截日志里可能只有 result：仍然给一张卡。
-    card = createToolCard({ name: data?.name, args: null, ts: null, machine: state.machine })
-    if (callId) state.tools.set(callId, card)
-    appendBlock(card.el)
-  }
-  finishToolCard(card, data, ts)
-}
-
-function renderError(data) {
-  clearPending()
-  const row = node("div", "row row-error")
-  const line = node("div", "error-line")
-  line.appendChild(node("span", "error-tag", data?.fatal ? "致命" : "错误"))
-  line.appendChild(node("span", "error-text", String(data?.message ?? "")))
-  row.appendChild(line)
-  appendBlock(row)
-}
-
-function renderCompaction(data) {
-  const row = node("div", "row row-compaction")
-  const line = node("div", "compaction-line")
-  const firstKept = typeof data?.firstKeptSeq === "number" ? ` · 保留自 seq ${data.firstKeptSeq}` : ""
-  line.textContent = `对话已压缩${firstKept}`
-  if (typeof data?.summary === "string" && data.summary) {
-    line.title = data.summary
-    line.classList.add("has-title")
-  }
-  row.appendChild(line)
-  appendBlock(row)
-}
-
-function renderEvent(event) {
-  if (!event || typeof event !== "object") return
-  const data = event.data
-  switch (event.type) {
-    case "user_message":
-      renderUserMessage(data)
-      break
-    case "assistant_message":
-      renderAssistantMessage(data)
-      break
-    case "assistant_pending":
-      showPending()
-      break
-    case "tool_call":
-      renderToolCall(data, event.ts)
-      break
-    case "tool_result":
-      renderToolResult(data, event.ts)
-      break
-    case "error":
-      renderError(data)
-      break
-    case "compaction":
-      renderCompaction(data)
-      break
-    // memory_write / memory_recall / session_created 不渲染。
-    default:
-      break
-  }
-}
-
-function renderEvents(events) {
-  if (!Array.isArray(events)) return
-  for (const event of events) {
-    if (!event || typeof event !== "object") continue
-    const seq = typeof event.seq === "number" && Number.isFinite(event.seq) ? event.seq : null
-    if (seq !== null) {
-      if (state.rendered.has(seq)) continue
-      state.rendered.add(seq)
-    }
-    renderEvent(event)
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 会话加载 / 全量重画
-// ---------------------------------------------------------------------------
-
-function countSince(events) {
-  let next = 0
-  for (const event of events) {
-    if (event && typeof event.seq === "number" && Number.isFinite(event.seq)) {
-      next = Math.max(next, event.seq + 1)
-    }
-  }
-  return Math.max(next, Array.isArray(events) ? events.length : 0)
-}
-
-function pickMachine(data) {
-  const candidates = [
-    data?.session?.machine,
-    data?.session?.machineName,
-    data?.machine,
-    data?.ctrl?.machine,
-    data?.sidecar?.machine,
-  ]
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate) return candidate
-  }
-  return null
-}
-
-function normalizeTurn(turn) {
-  if (!turn || typeof turn !== "object") return { running: false }
-  return turn
-}
-
-async function openSession(id) {
-  if (!id) return
-  state.pollGen += 1
-  window.clearTimeout(state.pollTimer)
-  state.pollTimer = 0
-
-  state.sessionId = id
-  state.session = null
-  state.resumePoint = null
-  state.turn = { running: false }
-  state.since = 0
-  state.total = 0
-  state.errors = 0
-  state.rendered.clear()
-  state.tools.clear()
-  state.pendingEl = null
-  state.hasContent = false
-
-  els.log.textContent = ""
-  els.log.appendChild(els.empty)
-  updateEmptyState()
-  drawSessionList()
-  updateStatus()
-  updateComposer()
-  await reloadSession()
-}
-
-/** GET /api/sessions/:id → 整盘重画（刷新、重连、切会话都走这里）。 */
-async function reloadSession() {
-  const id = state.sessionId
-  if (!id) return null
-  const gen = (state.pollGen += 1)
-  window.clearTimeout(state.pollTimer)
-  state.pollTimer = 0
-
-  let data
-  try {
-    data = await api(`/sessions/${encodeURIComponent(id)}`)
-    state.errors = 0
-    setConnected(true)
-  } catch (err) {
-    setConnected(false)
-    if (gen === state.pollGen) schedulePoll(Math.min(POLL_IDLE_MS * 2, 8000))
-    return null
-  }
-  if (gen !== state.pollGen || id !== state.sessionId) return null
-
-  state.session = data?.session && typeof data.session === "object" ? data.session : null
-  state.resumePoint = data?.resumePoint && typeof data.resumePoint === "object" ? data.resumePoint : null
-  state.turn = normalizeTurn(data?.turn)
-  state.machine = pickMachine(data) || state.machine || state.machineDefault
-  const events = Array.isArray(data?.events) ? data.events : []
-
-  state.rendered.clear()
-  state.tools.clear()
-  state.pendingEl = null
-  state.hasContent = false
-  els.log.textContent = ""
-  els.log.appendChild(els.empty)
-  updateEmptyState()
-
-  renderEvents(events)
-  state.since = countSince(events)
-  state.total = state.since
-  state.nearBottom = true
-  syncPending()
-  updateMachineChip()
-  updateStatus()
-  updateComposer()
-  drawSessionList()
-  scrollToBottom()
-
-  schedulePoll(state.turn && state.turn.running ? POLL_RUNNING_MS : POLL_IDLE_MS)
-  return data
-}
-
-// ---------------------------------------------------------------------------
-// 轮询
-// ---------------------------------------------------------------------------
-
-function schedulePoll(delay) {
-  const gen = state.pollGen
-  window.clearTimeout(state.pollTimer)
-  state.pollTimer = window.setTimeout(() => {
-    if (gen !== state.pollGen) return
-    void pollOnce()
-  }, delay)
-}
-
-async function pollOnce() {
-  const id = state.sessionId
-  if (!id) return
-  const gen = state.pollGen
-  const since = state.since
-  const wasRunning = Boolean(state.turn && state.turn.running)
-
-  let data
-  try {
-    data = await api(`/sessions/${encodeURIComponent(id)}/events?since=${since}`)
-  } catch (err) {
-    if (gen !== state.pollGen) return
-    setConnected(false)
-    state.errors += 1
-    if (state.errors >= 3) {
-      // 断得太久：重连时整盘重拉，避免局部状态漂移。
-      await reloadSession()
-      return
-    }
-    schedulePoll(Math.min(POLL_IDLE_MS, 1000 * state.errors))
-    return
-  }
-  if (gen !== state.pollGen || id !== state.sessionId) return
-
-  state.errors = 0
-  setConnected(true)
-
-  const events = Array.isArray(data?.events) ? data.events : []
-  renderEvents(events)
-
-  const nextSince = events.reduce((max, event) => {
-    return event && typeof event.seq === "number" && Number.isFinite(event.seq)
-      ? Math.max(max, event.seq + 1)
-      : max
-  }, since)
-  const total = typeof data?.total === "number" && Number.isFinite(data.total) ? data.total : null
-  state.since = Math.max(since, nextSince, total === null ? 0 : total)
-  state.total = total === null ? state.since : Math.max(total, state.since)
-
-  if (data && data.turn !== undefined) state.turn = normalizeTurn(data.turn)
-  syncPending()
-  updateStatus()
-  updateComposer()
-
-  const running = Boolean(state.turn && state.turn.running)
-  if (wasRunning && !running) {
-    // 一轮结束：刷新会话列表里的更新时间/事件数。
-    void refreshSessions()
-  }
-  schedulePoll(running ? POLL_RUNNING_MS : POLL_IDLE_MS)
-}
-
-// ---------------------------------------------------------------------------
-// 动作：发送 / 停止 / 新会话
-// ---------------------------------------------------------------------------
-
-async function ensureSession() {
-  if (state.sessionId) return state.sessionId
-  const data = await api("/sessions", { method: "POST", body: {} })
-  const id = idOf(data?.session) || idOf(data) || idOf(data?.session?.session)
-  if (!id) throw new Error("服务端没有返回会话 id")
-  await refreshSessions()
-  await openSession(id)
-  return id
+  els.send.title = running ? "停止这一轮" : "发送（Enter）"
+  els.input.placeholder = running
+    ? "它在跑…（先点停止，Enter 不会开新的一轮）"
+    : "说点什么…（Enter 发送，Shift+Enter 换行）"
+  els.hint.textContent = running ? "运行中 · 停止不会中断已经在跑的工具" : "Enter 发送 · Shift+Enter 换行"
 }
 
 async function sendMessage() {
   const text = els.input.value.trim()
   if (!text || state.sending) return
   if (state.turn && state.turn.running) {
-    toast("上一轮还在跑，等它结束或先点停止。")
+    toast("还在跑，等它结束或先点停止。")
     return
   }
   state.sending = true
   updateComposer()
   try {
-    const id = await ensureSession()
-    await api(`/sessions/${encodeURIComponent(id)}/messages`, { method: "POST", body: { text } })
+    await api("/messages", { method: "POST", body: { text } })
     els.input.value = ""
     autosize()
     state.turn = { running: true, startedAt: new Date().toISOString() }
+    state.optimisticUntil = Date.now() + 1500
+    state.nearBottom = true
     syncPending()
     updateComposer()
-    updateStatus()
-    state.nearBottom = true
+    updateHead()
     schedulePoll(0)
-  } catch (err) {
-    if (err && err.status === 409) {
-      toast("上一轮还在跑，等它结束或先点停止。")
-      state.turn = { ...(state.turn || {}), running: true }
+  } catch (error) {
+    if (error && error.status === 409) {
+      toast("还在跑，等它结束或先点停止。")
+      state.turn = normalizeTurn({ ...(state.turn || {}), running: true })
+      state.optimisticUntil = Date.now() + 1500
       syncPending()
+      updateComposer()
       schedulePoll(POLL_RUNNING_MS)
     } else {
-      toast(`发送失败：${(err && err.message) || "未知错误"}`)
+      toast(`发送失败：${messageOf(error)}`)
     }
   } finally {
     state.sending = false
@@ -882,15 +732,15 @@ async function sendMessage() {
 }
 
 async function abortTurn() {
-  if (!state.sessionId || state.aborting) return
+  if (state.aborting) return
   state.aborting = true
   updateComposer()
   try {
-    const data = await api(`/sessions/${encodeURIComponent(state.sessionId)}/abort`, { method: "POST", body: {} })
-    if (data && data.aborted === false) toast("现在没有正在跑的轮次")
+    const data = await api("/abort", { method: "POST", body: {} })
+    if (data && data.aborted === false) toast("现在没有正在跑的一轮")
     schedulePoll(0)
-  } catch (err) {
-    toast(`停止失败：${(err && err.message) || "未知错误"}`)
+  } catch (error) {
+    toast(`停止失败：${messageOf(error)}`)
     schedulePoll(POLL_RUNNING_MS)
   } finally {
     state.aborting = false
@@ -898,32 +748,153 @@ async function abortTurn() {
   }
 }
 
-async function createSession() {
-  if (state.creating) return
-  state.creating = true
-  els.newSession.disabled = true
+// ---------------------------------------------------------------------------
+// 数据：首屏 + 上翻 + 轮询
+// ---------------------------------------------------------------------------
+
+async function loadTail() {
   try {
-    const data = await api("/sessions", { method: "POST", body: {} })
-    const id = idOf(data?.session) || idOf(data)
-    if (!id) throw new Error("服务端没有返回会话 id")
-    await refreshSessions()
-    await openSession(id)
-    els.input.focus()
-  } catch (err) {
-    toast(`新建会话失败：${(err && err.message) || "未知错误"}`)
+    const data = await api(`/events?tail=${TAIL}`)
+    const total = numberOf(data && data.total)
+    if (total !== null) state.eventCount = Math.max(state.eventCount, total)
+    const events = Array.isArray(data && data.events) ? data.events : []
+    appendEvents(events)
+  } catch (error) {
+    toast(`历史加载失败：${messageOf(error)}`)
+  }
+  // 一条历史都没拿到（比如 tail 挂了）就别从 seq 0 开始追：那样会按顺序
+  // 把最老的一批当成新事件堆到底下。直接从日志末尾开始接。
+  if (state.oldest === null) state.since = Math.max(state.since, state.eventCount)
+}
+
+async function loadEarlier() {
+  if (state.loadingEarlier || state.oldest === null || state.oldest <= 0) return
+  const before = state.oldest
+  state.loadingEarlier = true
+  updateLoadEarlier()
+  const offset = els.timeline.scrollHeight - els.timeline.scrollTop
+  try {
+    const data = await api(`/events?before=${before}&tail=${TAIL}`)
+    const events = Array.isArray(data && data.events) ? data.events : []
+    const total = numberOf(data && data.total)
+    if (total !== null) state.eventCount = Math.max(state.eventCount, total)
+    if (!events.length) state.exhausted = true
+    else prependEvents(events)
+    if (state.oldest === null || state.oldest >= before) state.exhausted = true
+    // 往前插了一屏：把滚动位置钉住，视线里的那一行不许动。
+    els.timeline.scrollTop = els.timeline.scrollHeight - offset
+  } catch (error) {
+    toast(`加载更早失败：${messageOf(error)}`)
   } finally {
-    state.creating = false
-    els.newSession.disabled = false
+    state.loadingEarlier = false
+    updateLoadEarlier()
+    updateHead()
+  }
+}
+
+let pollTimer = 0
+let polling = false
+let surfacedTurnError = ""
+
+function schedulePoll(delay) {
+  window.clearTimeout(pollTimer)
+  pollTimer = window.setTimeout(() => {
+    void pollOnce()
+  }, Math.max(0, delay))
+}
+
+async function pollOnce() {
+  if (polling) return
+  polling = true
+  const since = state.since
+  const wasRunning = Boolean(state.turn && state.turn.running)
+  let next = POLL_IDLE_MS
+  try {
+    const data = await api(`/events?since=${since}`)
+    state.errors = 0
+    setConnected(true)
+
+    if (data && data.turn !== undefined) {
+      const incoming = normalizeTurn(data.turn)
+      // 刚按下发送时，一个更早发出的轮询可能带回旧的 running:false；
+      // 1.5 s 内不信它，否则按钮会在"停止/发送"之间闪一下。
+      const keepOptimistic = !incoming.running && Date.now() < state.optimisticUntil
+      if (incoming.running) state.optimisticUntil = 0
+      if (!keepOptimistic) state.turn = incoming
+    }
+    const events = Array.isArray(data && data.events) ? data.events : []
+    if (events.length) {
+      appendEvents(events)
+      if (state.nearBottom) scrollToBottom()
+    }
+    const total = numberOf(data && data.total)
+    if (total !== null) state.eventCount = Math.max(state.eventCount, total, state.since)
+
+    const running = Boolean(state.turn && state.turn.running)
+    const turnError = state.turn && typeof state.turn.error === "string" ? state.turn.error : ""
+    if (turnError && turnError !== surfacedTurnError) {
+      // 服务端把这一轮的失败记在 turn 上（日志里另有 error 事件）。只说一次。
+      surfacedTurnError = turnError
+      toast(`这一轮出错：${turnError}`)
+    }
+    next = events.length >= 200 ? POLL_CATCHUP_MS : running ? POLL_RUNNING_MS : POLL_IDLE_MS
+    if (wasRunning && !running) void refreshHead()
+
+    updateHead()
+    updateEmpty()
+    updateLoadEarlier()
+    syncPending()
+    updateComposer()
+  } catch {
+    state.errors += 1
+    setConnected(false)
+    next = Math.min(1000 * state.errors, 6000)
+  } finally {
+    polling = false
+    schedulePoll(next)
+  }
+}
+
+/** 一轮结束、或刚恢复连接时，把头部（事件数 / resumePoint / turn）重新拉一次。 */
+async function refreshHead() {
+  try {
+    const data = await api("")
+    applyAgent(data)
+    setConnected(true)
+    updateHead()
+    updateEmpty()
+    updateComposer()
+  } catch {
+    // 轮询会继续，头部保持旧值即可。
+  }
+}
+
+async function tryLoadAgent() {
+  try {
+    const data = await api("")
+    applyAgent(data)
+    setConnected(true)
+    state.loaded = true
+    if (state.eventCount > 0) await loadTail()
+    updateHead()
+    updateEmpty()
+    updateLoadEarlier()
+    syncPending()
+    updateComposer()
+    scrollToBottom()
+    state.nearBottom = true
+    return true
+  } catch {
+    setConnected(false)
+    return false
   }
 }
 
 // ---------------------------------------------------------------------------
-// 绑定
+// 绑定 + 启动（无 top-level await：所有异步都收在 boot 里）
 // ---------------------------------------------------------------------------
 
-function bindUI() {
-  for (const button of els.empty.querySelectorAll(".prompt")) bindPrompt(button)
-
+function bind() {
   els.composer.addEventListener("submit", (event) => {
     event.preventDefault()
     if (state.turn && state.turn.running) void abortTurn()
@@ -936,54 +907,60 @@ function bindUI() {
     if (event.metaKey || event.ctrlKey || event.altKey) return
     event.preventDefault()
     if (state.turn && state.turn.running) {
-      if (!state.sending) toast("上一轮还在跑，等它结束或先点停止。")
+      if (!state.sending) toast("还在跑，等它结束或先点停止。")
       return
     }
     void sendMessage()
   })
 
-  els.newSession.addEventListener("click", () => {
-    void createSession()
+  els.loadBtn.addEventListener("click", () => {
+    void loadEarlier()
   })
 
-  els.log.addEventListener("scroll", () => {
-    const gap = els.log.scrollHeight - els.log.scrollTop - els.log.clientHeight
-    state.nearBottom = gap < NEAR_BOTTOM_PX
-  })
+  els.timeline.addEventListener(
+    "scroll",
+    () => {
+      const gap = els.timeline.scrollHeight - els.timeline.scrollTop - els.timeline.clientHeight
+      state.nearBottom = gap < NEAR_BOTTOM_PX
+    },
+    { passive: true },
+  )
+
+  for (const button of document.querySelectorAll(".prompt")) {
+    button.addEventListener("click", () => {
+      els.input.value = button.dataset.prompt || button.textContent || ""
+      autosize()
+      els.input.focus()
+    })
+  }
 
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) return
-    if (state.sessionId) void reloadSession()
-    else void refreshSessions()
+    if (!document.hidden && state.loaded) schedulePoll(0)
   })
 
   window.addEventListener("focus", () => {
-    if (!state.sessionId) return
-    if (!(state.turn && state.turn.running)) schedulePoll(0)
+    if (state.loaded) schedulePoll(0)
   })
 }
 
-// ---------------------------------------------------------------------------
-// 启动（无 top-level await：所有异步都收在 boot 里）
-// ---------------------------------------------------------------------------
-
 async function boot() {
-  bindUI()
+  bind()
   autosize()
-  updateStatus()
+  updateHead()
+  updateEmpty()
+  updateLoadEarlier()
   updateComposer()
-  updateEmptyState()
 
-  await Promise.allSettled([loadHealth(), loadMachines(), refreshSessions()])
-
-  const first = state.sessions[0]
-  const firstId = idOf(first)
-  if (firstId) await openSession(firstId)
-  else {
-    setConnected(true)
-    updateStatus()
-    updateComposer()
+  let attempt = 0
+  while (!state.loaded) {
+    attempt += 1
+    const ok = await tryLoadAgent()
+    if (ok) break
+    if (attempt === 1) toast("连不上 ctrl，正在重试…")
+    await sleep(Math.min(1200 * attempt, 8000))
   }
+
+  schedulePoll(state.turn && state.turn.running ? POLL_RUNNING_MS : POLL_IDLE_MS)
 }
 
 void boot()

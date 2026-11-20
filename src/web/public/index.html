@@ -4,77 +4,85 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark light" />
+    <meta name="referrer" content="no-referrer" />
     <title>ctrl</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div class="app">
-      <aside class="rail" aria-label="会话列表">
-        <div class="rail-top">
-          <div class="brand">
-            <span class="brand-mark" aria-hidden="true">⌃</span>
-            <span class="brand-name">ctrl</span>
-          </div>
-          <button id="new-session" class="btn-new" type="button" title="新建会话">＋ 新对话</button>
-        </div>
-        <div id="session-list" class="session-list" role="list" aria-label="最近会话"></div>
-        <div class="rail-foot"><span class="rail-hint">最近 30 个会话</span></div>
-      </aside>
-
-      <main class="main">
-        <header class="status" aria-label="状态">
+    <div class="page">
+      <header class="head">
+        <h1 class="agent-name">
+          <span class="agent-mark" aria-hidden="true">⌃</span><span id="agent-name">…</span>
+        </h1>
+        <div class="status" aria-label="状态">
+          <span class="status-item" title="这次运行绑定的机器（只读）">
+            <span class="status-key">machine</span>
+            <span class="status-value is-mono" id="status-machine">—</span>
+          </span>
+          <span class="status-item" title="这条日志里的事件总数">
+            <span class="status-key">events</span>
+            <span class="status-value is-mono" id="status-events">0</span>
+          </span>
+          <span class="status-item">
+            <span class="status-key">最后活动</span>
+            <span class="status-value" id="status-last">—</span>
+          </span>
+          <span class="status-item status-resume" id="status-resume" hidden>已恢复</span>
+          <span class="status-spacer"></span>
           <span class="status-item status-conn">
             <span class="dot" id="conn-dot" aria-hidden="true"></span>
-            <span id="conn-text">连接中</span>
+            <span class="status-value" id="conn-text">连接中</span>
           </span>
-          <span class="status-item" title="模型"><span class="status-key">model</span><span id="status-model">—</span></span>
-          <span class="status-item" title="机器"><span class="status-key">machine</span><span id="status-machine">—</span></span>
-          <span class="status-item" title="事件总数"><span class="status-key">events</span><span id="status-events">0</span></span>
-          <span class="status-badge" id="status-resume" hidden title="会话从上次中断处恢复">已恢复</span>
-          <span class="status-spacer"></span>
-          <span class="status-item status-cwd" id="status-cwd" title="工作目录"></span>
-        </header>
+        </div>
+      </header>
 
-        <div id="log" class="conversation" role="log" aria-live="polite">
-          <section id="empty" class="empty">
-            <h1 class="empty-title">说一句，活在那头跑。</h1>
-            <p class="empty-sub">对话留在这台机器，命令落在你 ssh 能到的那台机器上。</p>
-            <div class="empty-prompts" aria-label="示例提示">
-              <button class="prompt" type="button" data-prompt="在远端跑 go build ./...，把失败的地方列出来">
-                在远端跑 <code>go build ./...</code>，把失败的地方列出来
-              </button>
-              <button class="prompt" type="button" data-prompt="看看当前工作目录里有什么，挑重点讲讲">
-                看看当前工作目录里有什么，挑重点讲讲
-              </button>
-              <button class="prompt" type="button" data-prompt="读一下 README.md，用三句话总结这个项目在做什么">
-                读一下 <code>README.md</code>，用三句话总结这个项目
-              </button>
-            </div>
-          </section>
+      <main class="timeline" id="timeline" role="log" aria-live="polite" aria-label="时间线">
+        <div class="load-earlier" id="load-earlier-wrap" hidden>
+          <button class="btn-load" id="load-earlier" type="button">加载更早</button>
         </div>
 
-        <form id="composer" class="composer" autocomplete="off">
-          <div class="composer-box">
-            <textarea
-              id="input"
-              class="composer-input"
-              rows="1"
-              placeholder="让它在远端做点什么…（Enter 发送，Shift+Enter 换行）"
-              spellcheck="false"
-              autocomplete="off"
-            ></textarea>
-            <div class="composer-row">
-              <label class="machine-chip" title="机器在会话创建时绑定，切换机器 = 新会话">
-                <span class="machine-chip-label">机器</span>
-                <select id="machine-select" class="machine-select" disabled aria-label="机器"></select>
-              </label>
-              <span class="composer-spacer"></span>
-              <button id="send" class="btn-send" type="submit" title="发送（Enter）">发送</button>
-            </div>
+        <section class="empty" id="empty" hidden aria-label="空状态">
+          <p class="empty-line" id="empty-line"></p>
+          <p class="empty-hint">日志就是它的一生：说过的话、跑过的命令，都在下面按时间排着。</p>
+          <div class="prompts" aria-label="示例">
+            <button
+              class="prompt"
+              type="button"
+              data-prompt="先看看当前工作目录里有什么，然后告诉我这个项目是干什么的"
+            >先看看当前工作目录里有什么，然后告诉我这个项目是干什么的</button>
+            <button
+              class="prompt"
+              type="button"
+              data-prompt="把测试跑一遍，失败的地方逐个说清楚"
+            >把测试跑一遍，失败的地方逐个说清楚</button>
+            <button
+              class="prompt"
+              type="button"
+              data-prompt="记住：这个项目的测试用 node:test，不要引入别的测试框架"
+            >记住：这个项目的测试用 node:test，不要引入别的测试框架</button>
           </div>
-          <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
-        </form>
+        </section>
+
+        <div class="rows" id="rows"></div>
       </main>
+
+      <form class="composer" id="composer" autocomplete="off">
+        <div class="composer-box">
+          <textarea
+            class="composer-input"
+            id="input"
+            rows="1"
+            placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"
+            spellcheck="false"
+            autocomplete="off"
+          ></textarea>
+          <div class="composer-row">
+            <span class="composer-hint" id="composer-hint">Enter 发送 · Shift+Enter 换行</span>
+            <button class="btn-send" id="send" type="submit">发送</button>
+          </div>
+        </div>
+        <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+      </form>
     </div>
     <script type="module" src="/app.js"></script>
   </body>
