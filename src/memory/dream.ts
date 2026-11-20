@@ -24,7 +24,7 @@ import { join } from "node:path"
 import type { DatabaseSync } from "node:sqlite"
 import { readMeta, writeMeta } from "./db.ts"
 import { clipChars, errorMessage, eventRole, eventText, isRecord, type LogEvent } from "./events.ts"
-import { upsertFocus } from "./focus.ts"
+import { listFocus, upsertFocus, type FocusItem } from "./focus.ts"
 import {
   addMemory,
   cleanKindHint,
@@ -203,7 +203,7 @@ export const DREAM_INSTRUCTIONS =
   '- Reply `{}` when nothing is worth keeping.'
 
 /** Render the batch plus the existing memories into the user message. */
-export function buildDreamPrompt(batch: DreamBatch, existing: MemoryRow[]): string {
+export function buildDreamPrompt(batch: DreamBatch, existing: MemoryRow[], focus: FocusItem[] = []): string {
   const transcript = batch.events
     .filter((event) => event.text !== "")
     .map((event) => `[seq ${event.seq}] ${event.role}: ${event.text.replace(/\s+/g, " ").trim()}`)
@@ -217,7 +217,17 @@ export function buildDreamPrompt(batch: DreamBatch, existing: MemoryRow[]): stri
               `- [${memory.id}] (${memory.kind}, importance ${memory.importance.toFixed(2)}) ${memory.text.replace(/\s+/g, " ").trim()}`,
           )
           .join("\n")
+  // Without the ids the model cannot close what finished: it sees only the new
+  // batch, so every stale item looks current. Showing them is what keeps the
+  // panel from filling up with work that was already done.
+  const focusBlock =
+    focus.length === 0
+      ? "(no open items)"
+      : focus
+          .map((item) => `- [${item.id}] (${item.state}) ${item.text.replace(/\s+/g, " ").trim()}`)
+          .join("\n")
   return (
+    `Current focus (open/doing):\n${focusBlock}\n\n` +
     `Existing memories:\n${memories}\n\n` +
     `New events (seq ${batch.fromSeq}..${batch.toSeq}):\n${transcript === "" ? "(no prose, only markers)" : transcript}`
   )
@@ -417,7 +427,7 @@ export async function runDream(ctx: DreamContext): Promise<DreamResult> {
     const response = await ctx.llm.complete({
       messages: [
         { role: "system", content: DREAM_INSTRUCTIONS },
-        { role: "user", content: buildDreamPrompt(batch, existing) },
+        { role: "user", content: buildDreamPrompt(batch, existing, listFocus(ctx.db, { limit: 10 })) },
       ],
       maxTokens: ctx.maxTokens ?? DREAM_MAX_TOKENS,
       ...(ctx.signal !== undefined ? { signal: ctx.signal } : {}),

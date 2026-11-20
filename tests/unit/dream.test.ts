@@ -458,6 +458,16 @@ test("the dream prompt carries the existing memories with their ids", async () =
   }
 })
 
+test("buildDreamPrompt hands the model the current focus ids, so it can close them", () => {
+  const batch = dreamBatch(CONVERSATION, -1)
+  const prompt = buildDreamPrompt(batch, [], [
+    { id: "foc-abc", text: "实现 M2 窗口", state: "doing", updatedAt: "2026-01-01T00:00:00.000Z", seq: 1, source: "dream" },
+  ])
+  assert.match(prompt, /Current focus \(open\/doing\):/)
+  assert.match(prompt, /\[foc-abc\] \(doing\) 实现 M2 窗口/)
+  assert.match(buildDreamPrompt(batch, [], []), /\(no open items\)/)
+})
+
 test("buildDreamPrompt says so when there are no existing memories", () => {
   const batch = dreamBatch(CONVERSATION, -1)
   const prompt = buildDreamPrompt(batch, [])
