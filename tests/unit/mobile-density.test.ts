@@ -201,6 +201,57 @@ test("the composer placeholder no longer repeats the keyboard hint", () => {
   assert.match(hint, /Enter 发送/, ".composer-hint must keep the full keyboard hint")
 })
 
+test("the composer row and hint can shrink so the page never scrolls sideways", () => {
+  const boxDeclarations = baseDeclarationsFor(".composer-box")
+  assert.ok(boxDeclarations.length > 0, ".composer-box has no base rule")
+  assert.ok(
+    hasDeclaration(boxDeclarations, "grid-template-columns", "minmax\\(0, 1fr\\)"),
+    `base .composer-box must use a shrinkable single column, got: ${boxDeclarations.join(" | ")}`,
+  )
+
+  const rowDeclarations = baseDeclarationsFor(".composer-row")
+  assert.ok(rowDeclarations.length > 0, ".composer-row has no base rule")
+  assert.ok(
+    hasDeclaration(rowDeclarations, "min-width", "0"),
+    `base .composer-row must be allowed to shrink below its min-content width, got: ${rowDeclarations.join(" | ")}`,
+  )
+
+  const hintDeclarations = baseDeclarationsFor(".composer-hint")
+  assert.ok(hintDeclarations.length > 0, ".composer-hint has no base rule")
+  assert.ok(
+    hasDeclaration(hintDeclarations, "overflow", "hidden"),
+    `base .composer-hint must clip overflow, got: ${hintDeclarations.join(" | ")}`,
+  )
+  assert.ok(
+    hasDeclaration(hintDeclarations, "text-overflow", "ellipsis"),
+    `base .composer-hint must ellipsize, got: ${hintDeclarations.join(" | ")}`,
+  )
+  assert.ok(
+    hasDeclaration(hintDeclarations, "white-space", "nowrap"),
+    `base .composer-hint must stay on one line, got: ${hintDeclarations.join(" | ")}`,
+  )
+})
+
+test("tool cards still cannot be clipped at narrow widths", () => {
+  const args = narrowDeclarationsFor(".tool-args")
+  assert.ok(args.length > 0, ".tool-args has no narrow-screen override")
+  assert.ok(
+    hasDeclaration(args, "white-space", "nowrap"),
+    `narrow .tool-args must not wrap, got: ${args.join(" | ")}`,
+  )
+  assert.ok(
+    hasDeclaration(args, "text-overflow", "ellipsis"),
+    `narrow .tool-args must ellipsize, got: ${args.join(" | ")}`,
+  )
+
+  const rows = narrowDeclarationsFor(".rows")
+  assert.ok(rows.length > 0, ".rows has no narrow-screen padding")
+  const left = firstPx(rows, "padding-left")
+  const right = firstPx(rows, "padding-right")
+  assert.ok(left !== undefined && right !== undefined, `narrow .rows must set both paddings, got: ${rows.join(" | ")}`)
+  assert.equal(left, right, `narrow .rows padding is asymmetric: left ${left}px vs right ${right}px`)
+})
+
 test("narrow screens keep their 16px inputs", () => {
   const fontSize = firstPx(narrowDeclarationsFor(".composer-input"), "font-size")
   assert.ok(fontSize !== undefined, ".composer-input has no narrow-screen font-size")
