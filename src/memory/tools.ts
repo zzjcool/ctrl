@@ -5,10 +5,16 @@
 // parse: one line per hit, timestamp + seq + kind, then the snippet. The seq is
 // in the line because it is the paging token — `before=<seq>` walks backwards.
 //
+// `focus_set` lives here too: it is the same kind of thing — a small, total
+// function from the model's arguments to the memory layer's tables.
+//
 // Tool discipline (same as src/jobs/tools.ts): it never throws. A broken index
 // is a sentence the model can act on, not a stack trace in the transcript.
 
+import type { DatabaseSync } from "node:sqlite"
 import type { JsonSchema, ToolResult, ToolSpec } from "../engine/durable.ts"
+import { errorMessage } from "./events.ts"
+import { FOCUS_STATES, isFocusState, upsertFocus, type FocusItem } from "./focus.ts"
 import { DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, type MemoryHit, type MemoryIndex } from "./index.ts"
 
 /** `2026-11-20T07:52:56.123Z` → `2026-11-20 07:52:56`; anything else is left alone. */
@@ -109,6 +115,78 @@ export function createSearchContextTool(opts: SearchContextOptions): ToolSpec {
       // ordering means the oldest hit is not the last one — take the minimum.
       if (hits.length >= limit) lines.push(pagingHint(Math.min(...hits.map((hit) => hit.seq))))
       return { ok: true, output: lines.join("\n") }
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// focus_set (MEMORY.md §6 §10.1)
+// ---------------------------------------------------------------------------
+
+/** One line the model can read back: `[doing] foc-abc 修 M2 窗口`. */
+export function renderFocus(item: FocusItem): string {
+  const seq = item.seq !== undefined ? ` seq ${item.seq}` : ""
+  return `[${item.state}] ${item.id}${seq} ${item.text.replace(/\s+/g, " ").trim()}`
+}
+
+export interface FocusToolOptions {
+  /** The open database (`MemoryIndex.handle()`); undefined when it is degraded. */
+  db: DatabaseSync | undefined
+}
+
+/**
+ * `focus_set` — the agent's own short list of what it is doing (MEMORY.md §6).
+ *
+ * `{ text, id?, state? }`: no id creates an item (open), an id edits the text
+ * or the state. Written for a model: a create and an edit answer in the same
+ * shape, so one call is enough to see what the list looks like now.
+ */
+export function createFocusSetTool(opts: FocusToolOptions): ToolSpec {
+  return {
+    name: "focus_set",
+    description:
+      "Keep your own focus list — what you are working on right now (at most a few items). " +
+      "Call it with `text` to add an item (state open), or with `id` (and optional `text`/`state`) to move an " +
+      "existing one. States: open, doing (working on it now), blocked, done (finished). " +
+      "It answers with the item it wrote, including its id.",
+    parameters: schema(
+      {
+        text: { type: "string", description: "The item's text. Required when creating a new item." },
+        id: { type: "string", description: "Id of an existing item to update (its id was returned when it was created)." },
+        state: {
+          type: "string",
+          enum: [...FOCUS_STATES],
+          description: "open | doing | blocked | done. Defaults to open when creating.",
+        },
+      },
+      [],
+    ),
+    async execute(args): Promise<ToolResult> {
+      const db = opts.db
+      if (db === undefined) {
+        // Degraded on purpose: the turn goes on without a focus list.
+        return { ok: true, output: "focus_set is unavailable: the memory database is not open" }
+      }
+      const text = typeof args.text === "string" ? args.text.trim() : undefined
+      const id = typeof args.id === "string" ? args.id.trim() : undefined
+      if ((text === undefined || text === "") && (id === undefined || id === "")) {
+        return { ok: true, output: "focus_set needs text (to add) or id (to update)" }
+      }
+      const rawState = typeof args.state === "string" ? args.state.trim() : undefined
+      if (rawState !== undefined && rawState !== "" && !isFocusState(rawState)) {
+        return { ok: true, output: `unknown state "${rawState}": use one of ${FOCUS_STATES.join(", ")}` }
+      }
+      try {
+        const item = upsertFocus(db, {
+          ...(id !== undefined && id !== "" ? { id } : {}),
+          ...(text !== undefined && text !== "" ? { text } : {}),
+          ...(rawState !== undefined && rawState !== "" ? { state: rawState } : {}),
+          source: "agent",
+        })
+        return { ok: true, output: renderFocus(item) }
+      } catch (error) {
+        return { ok: true, output: `focus_set failed: ${errorMessage(error)}` }
+      }
     },
   }
 }

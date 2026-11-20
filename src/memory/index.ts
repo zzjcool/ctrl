@@ -344,6 +344,16 @@ export class MemoryIndex {
     }
   }
 
+  /**
+   * The scratchpad's write path. The index owns the open handle, and a caller
+   * that needs the memories/focus/dream tables (M2–M4) goes through here instead
+   * of opening a second connection to the same file — one writer, one WAL.
+   * Undefined when the database could not be opened; callers degrade.
+   */
+  handle(): DatabaseSync | undefined {
+    return this.db
+  }
+
   close(): void {
     const db = this.db
     this.db = undefined
