@@ -78,8 +78,6 @@ function sendAgentEvents(response: ServerResponse, ctx: AppContext, url: URL, me
     tail: url.searchParams.get("tail"),
     before: url.searchParams.get("before"),
   })
-  // The session view asks for the conversation slice; the default page is the
-  // whole log, so the agent's own transcript and the audit trail stay readable.
   const events = url.searchParams.get("view") === "conversation" ? conversationEvents(page.events) : page.events
   sendJson(response, 200, { ...page, events, turn: ctx.turns.state(LOG_ID) })
 }
@@ -179,11 +177,6 @@ function importAfterTurn(ctx: AppContext): void {
   }
 }
 
-/**
- * The sink runAgent writes a wake turn through. Only the turn's user_message is
- * tagged as job lifecycle; every other append is the agent's own transcript and
- * goes to the log untouched.
- */
 function jobLifecycleSession(log: Session): SessionSink {
   return {
     sessionId: log.sessionId,
@@ -200,10 +193,6 @@ function jobLifecycleSession(log: Session): SessionSink {
   }
 }
 
-/**
- * The engine types a user_message as `{ text }`, but replay only insists that
- * `text` is a string, so the job marker rides along and old readers ignore it.
- */
 function taggedUserMessage(text: string): ReturnType<typeof makeUserMessage> {
   const draft = makeUserMessage(text)
   const tagged = draft as typeof draft & { data: { kind?: string } }
@@ -242,9 +231,6 @@ async function runTurnOnce(
   }
 
   const before = log.events().length
-  // A wake turn's only user_message is the job notification runAgent appends
-  // from `text`. Tag it so the conversation view can leave it out while the
-  // agent still reads it, and keeps being able to continue after a worker.
   const session = origin === "wake" ? jobLifecycleSession(log) : log
   try {
     await runAgent({

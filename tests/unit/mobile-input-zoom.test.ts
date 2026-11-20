@@ -86,7 +86,6 @@ test("narrow screens keep input font-size at 16px so iOS Safari does not zoom on
 })
 
 test("the fix does not disable page zoom", () => {
-  // comments may name the anti-pattern to warn against it; only declarations matter
   const rulesOnly = stripComments(styles)
   assert.doesNotMatch(rulesOnly, /user-scalable\s*=\s*no/i, "user-scalable=no breaks accessibility")
   assert.doesNotMatch(rulesOnly, /maximum-scale/i, "maximum-scale breaks accessibility")
