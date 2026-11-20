@@ -9,12 +9,22 @@
 //   POST /api/agent/abort
 //   GET  /api/jobs             { jobs: [{ id, state, task, startedAt, elapsedMs, code? }] }
 //
+// M4（MEMORY.md §10.1）右侧面板与记忆抽屉：
+//   GET  /api/focus            { items: [{ id, text, state, updatedAt, seq }] }
+//   POST /api/focus            { id?, text?, state? } → upsert
+//   GET  /api/memories?query=&limit=&all=   { memories, count }
+//   DELETE /api/memories/:id   写 tombstone（不是物理删）
+// 这四个口是可以不存在的：面板自己把错误吃掉，时间线照跑。
+//
 // 安全：服务端 / 模型 / 用户的所有文本都走 textContent 或 createElement，
 // 这个文件里没有一处把字符串当 HTML 塞回 DOM。
 
 const API = "/api/agent"
 /** 契约 §7：`GET /api/jobs` 不在 /api/agent 下面（worker 不是日志的一部分）。 */
 const JOBS_API = "/api/jobs"
+/** MEMORY.md §10.1：focus 面板与记忆审阅（M4）。旧后端上它们就是 404，面板自己兼。 */
+const FOCUS_API = "/api/focus"
+const MEMORIES_API = "/api/memories"
 /** 首屏和"加载更早"一次拿多少条（契约 §7：单次上限 200） */
 const TAIL = 100
 const POLL_RUNNING_MS = 700
@@ -23,6 +33,16 @@ const POLL_IDLE_MS = 2500
 const POLL_CATCHUP_MS = 60
 const NEAR_BOTTOM_PX = 120
 const MAX_INPUT_HEIGHT = 200
+/** MEMORY.md §8：focus 面板最多露 10 条 */
+const FOCUS_MAX = 10
+/** 面板上一条 worker 只露任务前 40 字 */
+const WORKER_TASK_CHARS = 40
+/** 抽屉一次拉多少条记忆（后端会把 limit 夹到 20：一次就是这么多，再多用搜索） */
+const MEMORY_LIMIT = 20
+/** 记忆搜索的防抖：打字时不要一个字一个请求 */
+const MEMORY_SEARCH_MS = 320
+/** `/api/agent` 只为了「记忆 N 条 / 窗口 N 字」，不用每拍都拉 */
+const AGENT_SNAPSHOT_MS = 5000
 
 // ---------------------------------------------------------------------------
 // 状态
@@ -61,6 +81,30 @@ const state = {
   connected: null,
   errors: 0,
   nearBottom: true,
+
+  // ---- 右侧面板（MEMORY.md §8）----
+  /** `/api/focus` 归一化后的条目，已按 doing → open → blocked 排好（done 不渲染） */
+  focus: [],
+  /** 至少成功拉过一次：没拉过就不说「没有 focus」 */
+  focusLoaded: false,
+  /** 面板拉取失败：只在面板里安静地说一声，不动时间线 */
+  focusError: false,
+  /** `/api/agent` 的 memory.*；null = 旧后端没有这个字段（状态条就不显示） */
+  memoryCount: null,
+  focusOpen: null,
+  lastDreamAt: "",
+  /** `/api/agent` 的 context.chars；null = 旧后端 */
+  windowChars: null,
+  windowStart: null,
+
+  // ---- 记忆抽屉 ----
+  drawerOpen: false,
+  drawerQuery: "",
+  /** 抽屉里是否把被 supersede 的也拉回来（它们灰显） */
+  drawerAll: true,
+  memories: [],
+  memoriesLoaded: false,
+  memoriesError: "",
 }
 
 const els = {
@@ -68,7 +112,13 @@ const els = {
   events: document.getElementById("status-events"),
   last: document.getElementById("status-last"),
   workers: document.getElementById("status-workers"),
+  memoryItem: document.getElementById("status-memory-item"),
+  memoryValue: document.getElementById("status-memory"),
+  windowItem: document.getElementById("status-window-item"),
+  windowValue: document.getElementById("status-window"),
   resume: document.getElementById("status-resume"),
+  panelToggle: document.getElementById("panel-toggle"),
+  panelBackdrop: document.getElementById("panel-backdrop"),
   connDot: document.getElementById("conn-dot"),
   connText: document.getElementById("conn-text"),
   timeline: document.getElementById("timeline"),
@@ -82,6 +132,28 @@ const els = {
   send: document.getElementById("send"),
   hint: document.getElementById("composer-hint"),
   toast: document.getElementById("toast"),
+  focusCount: document.getElementById("focus-count"),
+  focusForm: document.getElementById("focus-add"),
+  focusInput: document.getElementById("focus-input"),
+  focusList: document.getElementById("focus-list"),
+  focusMore: document.getElementById("focus-more"),
+  focusEmpty: document.getElementById("focus-empty"),
+  focusError: document.getElementById("focus-error"),
+  workerCount: document.getElementById("worker-count"),
+  workerList: document.getElementById("worker-list"),
+  workerEmpty: document.getElementById("worker-empty"),
+  dreamLine: document.getElementById("dream-line"),
+  memoryBtn: document.getElementById("open-memory"),
+  memoryBtnCount: document.getElementById("memory-btn-count"),
+  drawer: document.getElementById("drawer"),
+  drawerSum: document.getElementById("drawer-sum"),
+  drawerClose: document.getElementById("drawer-close"),
+  drawerForm: document.getElementById("drawer-search"),
+  drawerQuery: document.getElementById("drawer-query"),
+  drawerAll: document.getElementById("drawer-all"),
+  memoryList: document.getElementById("memory-list"),
+  memoryEmpty: document.getElementById("memory-empty"),
+  memoryError: document.getElementById("memory-error"),
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +352,45 @@ function applyAgent(data) {
     }
   }
   if (data && data.resumePoint !== undefined) state.resumePoint = data.resumePoint ?? null
-  if (data && data.turn !== undefined) state.turn = normalizeTurn(data.turn)
+  if (data && data.turn !== undefined) applyTurn(data.turn)
+  applyMemoryMeta(data)
+  applyContextMeta(data)
+}
+
+/**
+ * 刚按下发送时，服务端那个 running 可能还没翻过来：1.5 s 内不信 `running:false`，
+ * 否则按钮会在「停止/发送」之间闪一下。
+ */
+function applyTurn(turn) {
+  const incoming = normalizeTurn(turn)
+  const keepOptimistic = !incoming.running && Date.now() < state.optimisticUntil
+  if (incoming.running) state.optimisticUntil = 0
+  if (!keepOptimistic) state.turn = incoming
+}
+
+/**
+ * MEMORY.md §10.1：`/api/agent` 多了 `memory: { memories, focusOpen, lastDreamAt }`。
+ * 旧后端没有这个键（或只有一半）：不报错，也不把已经拿到的值清掉。
+ */
+function applyMemoryMeta(data) {
+  const memory = data && typeof data.memory === "object" && data.memory ? data.memory : null
+  if (!memory) return
+  const count = numberOf(memory.memories)
+  if (count !== null) state.memoryCount = Math.max(0, count)
+  const open = numberOf(memory.focusOpen)
+  if (open !== null) state.focusOpen = Math.max(0, open)
+  if (typeof memory.lastDreamAt === "string") state.lastDreamAt = memory.lastDreamAt
+  else if (memory.lastDreamAt === null) state.lastDreamAt = ""
+}
+
+/** `context: { windowStart, chars }`：同样是可以没有的。 */
+function applyContextMeta(data) {
+  const context = data && typeof data.context === "object" && data.context ? data.context : null
+  if (!context) return
+  const chars = numberOf(context.chars)
+  if (chars !== null) state.windowChars = Math.max(0, chars)
+  const windowStart = numberOf(context.windowStart)
+  if (windowStart !== null) state.windowStart = windowStart
 }
 
 function updateHead() {
@@ -300,6 +410,24 @@ function updateHead() {
   const kind = resumeKind()
   els.resume.hidden = !kind
   els.resume.title = kind ? RESUME_TITLE[kind] || `从上次中断处恢复（${kind}）` : ""
+
+  // 记忆 / 窗口：后端给了才显示（旧后端上这两个数字是空的，不是 0）。
+  const memories = state.memoryCount
+  els.memoryItem.hidden = memories === null
+  els.memoryValue.textContent = memories === null ? "" : String(memories)
+  els.memoryBtnCount.textContent = memories === null || memories === 0 ? "" : String(memories)
+  els.memoryBtn.title =
+    memories === null ? "看看它记住了什么" : `它记住了 ${memories} 条（点开可以搜 / 删）`
+
+  const chars = state.windowChars
+  els.windowItem.hidden = chars === null
+  els.windowValue.textContent = chars === null ? "" : String(chars)
+  els.windowItem.title =
+    chars === null
+      ? "本窗口内的字符数"
+      : state.windowStart !== null
+        ? `这个窗口从 seq ${state.windowStart} 开始，一共 ${chars} 字`
+        : `这个窗口里一共 ${chars} 字`
 }
 
 function updateEmpty() {
@@ -363,13 +491,19 @@ function applyJobs(data) {
   const jobs = readJobs(data)
   if (!jobs) return false
   let running = 0
+  const alive = []
   for (const job of jobs) {
-    if (job.state === "running") running += 1
+    if (job.state === "running") {
+      running += 1
+      alive.push(job)
+    }
     const cards = state.jobs.get(job.id)
     if (!cards) continue
     for (const card of cards) applyJobToCard(card, job)
   }
   state.workerCount = running
+  // 面板上的 worker 列表和状态条那个数字是同一份数据：一起刷新。
+  renderWorkers(alive)
   updateHead()
   return true
 }
@@ -954,6 +1088,351 @@ function syncPending() {
   if (els.rows.lastElementChild !== state.pendingEl) els.rows.appendChild(state.pendingEl)
 }
 
+/** 后端给的 state 只认这四个；缺字段的条目当 open，别让它从面板上消失。 */
+const FOCUS_RANK = { doing: 0, open: 1, blocked: 2, done: 3 }
+/** 点一下往下转一圈（MEMORY.md §8：「点一下标 done」；blocked 点一下 = 重新开干）。 */
+const FOCUS_NEXT = { open: "doing", doing: "done", blocked: "doing", done: "open" }
+
+function normalizeFocusState(value) {
+  const raw = typeof value === "string" ? value.trim().toLowerCase() : ""
+  return Object.hasOwn(FOCUS_RANK, raw) ? raw : "open"
+}
+
+function focusTime(item) {
+  const date = toDate(item.updatedAt)
+  return date ? date.getTime() : Number.NEGATIVE_INFINITY
+}
+
+/** doing 置顶、然后 open、blocked；同一状态里最近动过的先露。 */
+function compareFocus(a, b) {
+  const rank = FOCUS_RANK[a.state] - FOCUS_RANK[b.state]
+  if (rank !== 0) return rank
+  const at = focusTime(a)
+  const bt = focusTime(b)
+  if (at !== bt) return bt - at
+  return (b.seq ?? 0) - (a.seq ?? 0)
+}
+
+/** `{ items: [{ id, text, state, updatedAt, seq }] }` → 数组；形状不对当没拿到。 */
+function readFocus(data) {
+  const list = data && Array.isArray(data.items) ? data.items : null
+  if (!list) return null
+  const items = []
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") continue
+    const id = entry.id === undefined || entry.id === null ? "" : String(entry.id).trim()
+    const text = typeof entry.text === "string" ? entry.text.trim() : ""
+    if (!id || !text) continue
+    items.push({
+      id,
+      text,
+      state: normalizeFocusState(entry.state),
+      updatedAt: typeof entry.updatedAt === "string" ? entry.updatedAt : "",
+      seq: numberOf(entry.seq),
+    })
+  }
+  items.sort(compareFocus)
+  return items
+}
+
+/** 一条 focus：状态点 + 文字 + 状态名（状态名是给人看的小字，不是唯一的信号）。 */
+function focusItemEl(item) {
+  const row = el("li", "focus-item")
+  row.dataset.id = item.id
+  row.dataset.state = item.state
+  row.tabIndex = 0
+  row.setAttribute("role", "button")
+  row.title = `点一下：${item.state} → ${FOCUS_NEXT[item.state] || "doing"}`
+  const dot = el("span", "focus-dot")
+  dot.setAttribute("aria-hidden", "true")
+  row.append(dot, el("span", "focus-text", item.text), el("span", "focus-state", item.state))
+  return row
+}
+
+function renderFocus() {
+  const visible = state.focus.filter((item) => item.state !== "done")
+  const shown = visible.slice(0, FOCUS_MAX)
+  els.focusList.textContent = ""
+  for (const item of shown) els.focusList.appendChild(focusItemEl(item))
+
+  const rest = visible.length - shown.length
+  els.focusMore.hidden = rest <= 0
+  if (rest > 0) els.focusMore.textContent = `还有 ${rest} 条被挤在下面（面板最多 ${FOCUS_MAX} 条，做梦会收拾）`
+
+  els.focusEmpty.hidden = shown.length > 0 || state.focusError || !state.focusLoaded
+  els.focusError.hidden = !state.focusError
+  // 列表拉不到时还能拿 `/api/agent` 的 memory.focusOpen 当个数（它有就显示）。
+  const count = state.focusError && state.focusOpen !== null ? state.focusOpen : visible.length
+  els.focusCount.textContent = String(Math.max(0, count))
+}
+
+let focusBusy = false
+
+async function refreshFocus() {
+  if (focusBusy) return false
+  focusBusy = true
+  try {
+    const items = readFocus(await request(FOCUS_API))
+    if (!items) return false
+    state.focus = items
+    state.focusLoaded = true
+    state.focusError = false
+    renderFocus()
+    return true
+  } catch {
+    state.focusError = true
+    renderFocus()
+    return false
+  } finally {
+    focusBusy = false
+  }
+}
+
+/** 点一下条目：open → doing → done（blocked 点一下 = 回到 doing）。 */
+async function cycleFocus(id) {
+  const item = state.focus.find((entry) => entry.id === id)
+  if (!item) return
+  const previous = item.state
+  const next = FOCUS_NEXT[previous] || "doing"
+  // 先本地翻一下：点击反馈不用等一个往返；写失败再翻回来。
+  item.state = next
+  item.updatedAt = new Date().toISOString()
+  state.focus.sort(compareFocus)
+  renderFocus()
+  try {
+    await request(FOCUS_API, { method: "POST", body: { id, state: next } })
+    void refreshFocus()
+  } catch (error) {
+    item.state = previous
+    state.focus.sort(compareFocus)
+    renderFocus()
+    toast(`focus 没存上：${messageOf(error)}`)
+  }
+}
+
+async function addFocus(text) {
+  const clean = oneLine(text)
+  if (!clean) return
+  try {
+    await request(FOCUS_API, { method: "POST", body: { text: clean } })
+    els.focusInput.value = ""
+    await refreshFocus()
+  } catch (error) {
+    toast(`加不上 focus：${messageOf(error)}`)
+  }
+}
+
+// --- 面板上的 worker ----------------------------------------------------------
+
+/** `20240101T120000Z-abcd` → `abcd`（完整 id 放 title，够用了）。 */
+function shortJobId(id) {
+  const raw = String(id ?? "").trim()
+  const dash = raw.lastIndexOf("-")
+  const tail = dash >= 0 ? raw.slice(dash + 1) : raw
+  if (tail.length >= 3 && tail.length <= 12) return tail
+  return raw.length > 10 ? `${raw.slice(0, 9)}…` : raw
+}
+
+/** 任务前 40 字，一行。 */
+function shortTask(text) {
+  const line = oneLine(text)
+  if (!line) return "（没写任务）"
+  return line.length > WORKER_TASK_CHARS ? `${line.slice(0, WORKER_TASK_CHARS)}…` : line
+}
+
+/** 后端给了 elapsedMs 就用它；没给就用 startedAt 现算。 */
+function jobElapsed(job) {
+  if (job.elapsedMs !== null) return formatDuration(job.elapsedMs)
+  const started = toDate(job.startedAt)
+  return started ? formatDuration(Date.now() - started.getTime()) : ""
+}
+
+function workerItemEl(job) {
+  const row = el("li", "worker-item")
+  row.dataset.id = job.id
+  const idEl = el("span", "worker-id", shortJobId(job.id))
+  idEl.title = job.id
+  const taskEl = el("span", "worker-task", shortTask(job.task))
+  if (job.task) taskEl.title = oneLine(job.task)
+  row.append(idEl, taskEl, el("span", "worker-dur", jobElapsed(job)))
+  return row
+}
+
+function renderWorkers(jobs) {
+  const list = jobs || []
+  els.workerList.textContent = ""
+  for (const job of list) els.workerList.appendChild(workerItemEl(job))
+  els.workerEmpty.hidden = list.length > 0
+  els.workerCount.textContent = String(list.length)
+}
+
+/** 上次做梦：面板上就一行字（`/api/agent` 的 memory.lastDreamAt）。 */
+function renderDream() {
+  const when = state.lastDreamAt
+  els.dreamLine.textContent = when ? `上次做梦 ${timeAgo(when)}` : "还没做过梦"
+  els.dreamLine.title = when ? absoluteTime(when) : "空闲十分钟、又有新事件时它会自己整理一遍"
+}
+
+// --- 面板：数据 ----------------------------------------------------------------
+
+let lastAgentSnapshot = 0
+
+/**
+ * 面板的数据拍：focus 每次都拉（跟主轮询同频），`/api/agent` 里的计数慢一点没关系。
+ * 这里所有失败都在里面吃掉——面板拉不到，时间线照跑。
+ */
+function refreshPanel(force) {
+  void refreshFocus()
+  if (!force && Date.now() - lastAgentSnapshot < AGENT_SNAPSHOT_MS) return
+  lastAgentSnapshot = Date.now()
+  void (async () => {
+    try {
+      applyAgent(await api(""))
+      renderDream()
+      updateHead()
+      updateEmpty()
+      updateComposer()
+      syncPending()
+    } catch {
+      // 旧后端 / 一时连不上：面板保持上一次的样子。
+    }
+  })()
+}
+
+// --- 记忆抽屉 ------------------------------------------------------------------
+
+/** `{ memories: [{ id, kind, text, createdAt, supersededBy }] }` → 数组。
+ *  后端可能写成 camelCase 也可能写成表里的 snake_case，两种都读。 */
+function readMemories(data) {
+  const list = data && Array.isArray(data.memories) ? data.memories : null
+  if (!list) return null
+  const memories = []
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") continue
+    const id = entry.id === undefined || entry.id === null ? "" : String(entry.id).trim()
+    const text = typeof entry.text === "string" ? entry.text : ""
+    if (!id || !text.trim()) continue
+    const supersededBy = entry.supersededBy ?? entry.superseded_by ?? entry.superseded ?? null
+    memories.push({
+      id,
+      text: text.trim(),
+      kind: typeof entry.kind === "string" && entry.kind.trim() ? entry.kind.trim() : "note",
+      createdAt: typeof entry.createdAt === "string" ? entry.createdAt : String(entry.created_at ?? ""),
+      importance: numberOf(entry.importance),
+      superseded: Boolean(supersededBy),
+    })
+  }
+  return memories
+}
+
+function memoryItemEl(memory) {
+  const row = el("li", "memory-item")
+  row.dataset.id = memory.id
+  const superseded = memory.superseded
+  row.dataset.superseded = superseded ? "true" : "false"
+
+  const head = el("div", "memory-head")
+  head.appendChild(el("span", "memory-kind", memory.kind))
+  if (superseded) head.appendChild(el("span", "memory-flag", "已合并"))
+  const when = memory.createdAt
+  const time = el("span", "memory-time", when ? timeAgo(when) : "")
+  if (when) time.title = absoluteTime(when)
+  head.appendChild(time)
+  if (memory.importance !== null) head.appendChild(el("span", "memory-imp", memory.importance.toFixed(2)))
+
+  const del = el("button", "memory-del", "删除")
+  del.type = "button"
+  del.setAttribute("aria-label", `删除这条记忆：${oneLine(memory.text).slice(0, 40)}`)
+  head.appendChild(del)
+
+  row.append(head, el("p", "memory-text", memory.text))
+  return row
+}
+
+function renderMemories() {
+  const list = state.memories
+  els.memoryList.textContent = ""
+  for (const memory of list) els.memoryList.appendChild(memoryItemEl(memory))
+
+  const live = list.filter((memory) => !memory.superseded).length
+  const parts = []
+  if (state.memoriesLoaded) {
+    parts.push(list.length === live ? `${live} 条` : `${live} 条 · ${list.length - live} 条已合并`)
+    // 满页了就直说“这是上限”，不要让人以为库里就这么点。
+    if (list.length >= MEMORY_LIMIT) parts.push(`一次最多 ${MEMORY_LIMIT} 条，搜一下能找更多`)
+  }
+  els.drawerSum.textContent = parts.join(" · ")
+  els.memoryEmpty.hidden = !(state.memoriesLoaded && !state.memoriesError && list.length === 0)
+  els.memoryError.hidden = !state.memoriesError
+  if (state.memoriesError) els.memoryError.textContent = `拉不到记忆：${state.memoriesError}`
+}
+
+let memoriesBusy = false
+
+async function refreshMemories() {
+  if (memoriesBusy) return false
+  memoriesBusy = true
+  const params = new URLSearchParams()
+  const query = oneLine(state.drawerQuery)
+  if (query) params.set("query", query)
+  params.set("limit", String(MEMORY_LIMIT))
+  if (state.drawerAll) params.set("all", "1")
+  try {
+    const memories = readMemories(await request(`${MEMORIES_API}?${params}`))
+    if (!memories) throw new Error("返回里没有 memories")
+    state.memories = memories
+    state.memoriesLoaded = true
+    state.memoriesError = ""
+    renderMemories()
+    return true
+  } catch (error) {
+    state.memoriesError = messageOf(error)
+    renderMemories()
+    return false
+  } finally {
+    memoriesBusy = false
+  }
+}
+
+async function deleteMemory(id) {
+  const memory = state.memories.find((entry) => entry.id === id)
+  const preview = oneLine(memory ? memory.text : "").slice(0, 80) || id
+  if (!window.confirm(`删掉这条记忆？\n\n${preview}\n\n（不是物理删除：它会被标成已删除，不再被召回）`)) return
+  try {
+    await request(`${MEMORIES_API}/${encodeURIComponent(id)}`, { method: "DELETE" })
+    state.memories = state.memories.filter((entry) => entry.id !== id)
+    renderMemories()
+    void refreshMemories()
+    refreshPanel(true)
+  } catch (error) {
+    toast(`删除失败：${messageOf(error)}`)
+  }
+}
+
+function openDrawer() {
+  state.drawerOpen = true
+  els.drawer.hidden = false
+  els.drawerQuery.value = state.drawerQuery
+  void refreshMemories()
+  els.drawerQuery.focus()
+}
+
+function closeDrawer() {
+  state.drawerOpen = false
+  els.drawer.hidden = true
+}
+
+/** 窄屏下那一列折叠成一个按钮：面板靠 body 上的 class 滑出来。 */
+function setPanelOpen(open) {
+  document.body.classList.toggle("panel-open", Boolean(open))
+  els.panelToggle.setAttribute("aria-expanded", open ? "true" : "false")
+  if (!open && state.drawerOpen) closeDrawer()
+}
+
+function togglePanel() {
+  setPanelOpen(!document.body.classList.contains("panel-open"))
+}
+
 // ---------------------------------------------------------------------------
 // 输入区
 // ---------------------------------------------------------------------------
@@ -1102,14 +1581,7 @@ async function pollOnce() {
     state.errors = 0
     setConnected(true)
 
-    if (data && data.turn !== undefined) {
-      const incoming = normalizeTurn(data.turn)
-      // 刚按下发送时，一个更早发出的轮询可能带回旧的 running:false；
-      // 1.5 s 内不信它，否则按钮会在"停止/发送"之间闪一下。
-      const keepOptimistic = !incoming.running && Date.now() < state.optimisticUntil
-      if (incoming.running) state.optimisticUntil = 0
-      if (!keepOptimistic) state.turn = incoming
-    }
+    if (data && data.turn !== undefined) applyTurn(data.turn)
     const events = Array.isArray(data && data.events) ? data.events : []
     if (events.length) {
       appendEvents(events)
@@ -1120,6 +1592,10 @@ async function pollOnce() {
 
     // job 从列表里消失（超过最近 20 条）不动已渲染的卡片：保留最后一次已知状态。
     applyJobs(jobsData)
+
+    // 面板（focus / worker / 做梦时间）跟主轮询同频；它自己吞掉所有错误——
+    // 面板拉不到是不能把这条时间线带倒的。
+    refreshPanel()
 
     const running = Boolean(state.turn && state.turn.running)
     const turnError = state.turn && typeof state.turn.error === "string" ? state.turn.error : ""
@@ -1154,7 +1630,9 @@ async function refreshHead() {
     // 头部和 worker 列表一起拉：turn 结束后 workers 那个数字也得是新的。
     const [data] = await Promise.all([api(""), refreshJobs()])
     applyAgent(data)
+    lastAgentSnapshot = Date.now()
     setConnected(true)
+    renderDream()
     updateHead()
     updateEmpty()
     updateComposer()
@@ -1167,11 +1645,15 @@ async function tryLoadAgent() {
   try {
     const data = await api("")
     applyAgent(data)
+    lastAgentSnapshot = Date.now()
     setConnected(true)
     state.loaded = true
     if (state.eventCount > 0) await loadTail()
     // 卡片都上屏了再来一次：重开页面时 job 可能早跑完了，不能等到下个轮询拍。
     await refreshJobs()
+    // 面板不等轮询：首屏就把 focus 拉一次（失败只影响面板自己）。
+    void refreshFocus()
+    renderDream()
     updateHead()
     updateEmpty()
     updateLoadEarlier()
@@ -1211,6 +1693,105 @@ function bind() {
 
   els.loadBtn.addEventListener("click", () => {
     void loadEarlier()
+  })
+
+  // ---- 右侧面板 ----------------------------------------------------------
+
+  els.panelToggle.addEventListener("click", () => {
+    togglePanel()
+  })
+
+  els.panelBackdrop.addEventListener("click", () => {
+    setPanelOpen(false)
+  })
+
+  els.focusForm.addEventListener("submit", (event) => {
+    event.preventDefault()
+    void addFocus(els.focusInput.value)
+  })
+
+  // 表单里只有一个输入框，浏览器本来就会隐式提交；这里再明确接一手 Enter。
+  els.focusInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.isComposing) return
+    event.preventDefault()
+    void addFocus(els.focusInput.value)
+  })
+
+  // focus 条目是动态的：点一下 / Enter 都是「往下转一格」。
+  const activateFocus = (target) => {
+    const row = target.closest("li.focus-item")
+    if (!row || !row.dataset.id) return
+    // 选中文字了就是用户在建选区，别把状态翻了。
+    const selection = window.getSelection ? String(window.getSelection() || "") : ""
+    if (selection) return
+    void cycleFocus(row.dataset.id)
+  }
+
+  els.focusList.addEventListener("click", (event) => {
+    if (event.target instanceof Element) activateFocus(event.target)
+  })
+
+  els.focusList.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return
+    if (!(event.target instanceof Element)) return
+    event.preventDefault()
+    activateFocus(event.target)
+  })
+
+  // ---- 记忆抽屉 ----------------------------------------------------------
+
+  els.memoryBtn.addEventListener("click", () => {
+    openDrawer()
+  })
+
+  els.drawerClose.addEventListener("click", () => {
+    closeDrawer()
+  })
+
+  // 点抽屉的空白处（不是那张卡片）就关。
+  els.drawer.addEventListener("click", (event) => {
+    if (event.target === els.drawer) closeDrawer()
+  })
+
+  els.drawerForm.addEventListener("submit", (event) => {
+    event.preventDefault()
+    state.drawerQuery = els.drawerQuery.value
+    void refreshMemories()
+  })
+
+  els.drawerAll.addEventListener("change", () => {
+    state.drawerAll = els.drawerAll.checked
+    void refreshMemories()
+  })
+
+  // 一边打字一边搜：防抖一下，不要一个字一个请求。
+  let searchTimer = 0
+  els.drawerQuery.addEventListener("input", () => {
+    window.clearTimeout(searchTimer)
+    searchTimer = window.setTimeout(() => {
+      searchTimer = 0
+      state.drawerQuery = els.drawerQuery.value
+      void refreshMemories()
+    }, MEMORY_SEARCH_MS)
+  })
+
+  els.memoryList.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null
+    if (!target) return
+    if (!target.closest("button.memory-del")) return
+    const row = target.closest("li.memory-item")
+    if (!row || !row.dataset.id) return
+    void deleteMemory(row.dataset.id)
+  })
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return
+    if (state.drawerOpen) {
+      event.preventDefault()
+      closeDrawer()
+      return
+    }
+    if (document.body.classList.contains("panel-open")) setPanelOpen(false)
   })
 
   els.timeline.addEventListener(
@@ -1271,6 +1852,10 @@ function bind() {
 async function boot() {
   bind()
   autosize()
+  // 面板先把空状态画出来：数据到了再填，没数据也是“没有”。
+  renderFocus()
+  renderWorkers([])
+  renderDream()
   updateHead()
   updateEmpty()
   updateLoadEarlier()

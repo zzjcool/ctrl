@@ -27,8 +27,26 @@
             <span class="status-key">workers</span>
             <span class="status-value is-mono" id="status-workers">0</span>
           </span>
+          <span class="status-item" id="status-memory-item" hidden title="它记住的条数（/api/agent 的 memory.memories）">
+            <span class="status-key">记忆</span>
+            <span class="status-value is-mono" id="status-memory">0</span>
+            <span class="status-unit">条</span>
+          </span>
+          <span class="status-item" id="status-window-item" hidden title="这个窗口里的事件字符数（/api/agent 的 context.chars）">
+            <span class="status-key">窗口</span>
+            <span class="status-value is-mono" id="status-window">0</span>
+            <span class="status-unit">字</span>
+          </span>
           <span class="status-item status-resume" id="status-resume" hidden>已恢复</span>
           <span class="status-spacer"></span>
+          <button
+            class="panel-toggle"
+            id="panel-toggle"
+            type="button"
+            aria-controls="aside"
+            aria-expanded="false"
+            title="focus 面板"
+          >focus</button>
           <span class="status-item status-conn">
             <span class="dot" id="conn-dot" aria-hidden="true"></span>
             <span class="status-value" id="conn-text">连接中</span>
@@ -71,6 +89,52 @@
         <div class="rows" id="rows"></div>
       </main>
 
+      <aside class="aside" id="aside" aria-label="focus 面板">
+        <div class="aside-scroll">
+          <section class="panel-block">
+            <h2 class="panel-title">
+              <span>focus</span>
+              <span class="panel-count is-mono" id="focus-count">0</span>
+            </h2>
+            <form class="focus-add" id="focus-add" autocomplete="off">
+              <input
+                class="focus-input"
+                id="focus-input"
+                type="text"
+                maxlength="200"
+                placeholder="加一条 focus，Enter 保存"
+                aria-label="新建 focus"
+                autocomplete="off"
+              />
+            </form>
+            <ul class="focus-list" id="focus-list"></ul>
+            <p class="panel-note" id="focus-more" hidden></p>
+            <p class="panel-note" id="focus-empty" hidden>没有 focus。等它自己想起来，或者在上面写一条。</p>
+            <p class="panel-note is-fail" id="focus-error" hidden>focus 拉不到：后端可能还没接上。</p>
+          </section>
+
+          <section class="panel-block">
+            <h2 class="panel-title">
+              <span>worker</span>
+              <span class="panel-count is-mono" id="worker-count">0</span>
+            </h2>
+            <ul class="worker-list" id="worker-list"></ul>
+            <p class="panel-note" id="worker-empty" hidden>没有正在跑的 worker。</p>
+          </section>
+
+          <section class="panel-block">
+            <h2 class="panel-title"><span>memory</span></h2>
+            <p class="panel-note" id="dream-line">还没做过梦</p>
+          </section>
+        </div>
+        <div class="aside-foot">
+          <button class="btn-memory" id="open-memory" type="button" title="看看它记住了什么">
+            <span>记忆</span>
+            <span class="btn-memory-count is-mono" id="memory-btn-count"></span>
+          </button>
+        </div>
+      </aside>
+
       <form class="composer" id="composer" autocomplete="off">
         <div class="composer-box">
           <textarea
@@ -88,6 +152,35 @@
         </div>
         <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
       </form>
+
+      <div class="panel-backdrop" id="panel-backdrop"></div>
+
+      <div class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="记忆" hidden>
+        <div class="drawer-box">
+          <div class="drawer-head">
+            <span class="drawer-title">记忆</span>
+            <span class="drawer-sum is-mono" id="drawer-sum"></span>
+            <button class="drawer-close" id="drawer-close" type="button" aria-label="关闭">✕</button>
+          </div>
+          <form class="drawer-search" id="drawer-search" autocomplete="off">
+            <input
+              class="drawer-input"
+              id="drawer-query"
+              type="text"
+              placeholder="搜记忆…（Enter 搜索，留空 = 全部）"
+              aria-label="搜索记忆"
+              autocomplete="off"
+            />
+            <label class="drawer-all">
+              <input type="checkbox" id="drawer-all" checked />
+              <span>含已合并</span>
+            </label>
+          </form>
+          <ul class="memory-list" id="memory-list"></ul>
+          <p class="panel-note" id="memory-empty" hidden>没有记忆。</p>
+          <p class="panel-note is-fail" id="memory-error" hidden></p>
+        </div>
+      </div>
     </div>
     <script type="module" src="/app.js"></script>
   </body>
