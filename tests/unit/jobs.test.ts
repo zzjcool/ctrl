@@ -23,6 +23,7 @@ import {
 } from "../../src/jobs/store.ts"
 import type { JobMeta, JobView } from "../../src/jobs/store.ts"
 import { createJobTools } from "../../src/jobs/tools.ts"
+import { jobSummary } from "../../src/server/job-routes.ts"
 
 const FAKE_PI_SOURCE = `#!/bin/sh
 printf 'args: %s\\n' "$*"
@@ -751,4 +752,36 @@ test("job_status tells the model to stop polling after three checks", async () =
   const fourth = await status?.execute({ id, wait: 0 }, toolContext(work))
   assert.match(fourth?.output ?? "", /Stop polling/)
   await runner.stop(id)
+})
+
+test("the jobs API renders the stream instead of leaking raw pi JSON", async () => {
+  const id = "20260101T000000Z-abc123"
+  const dir = path.join(agentHome, "jobs", id)
+  await mkdir(dir, { recursive: true })
+  const lines = [
+    { type: "session", id: "s" },
+    { type: "tool_execution_start", toolCallId: "c1", toolName: "bash", args: { command: "echo hi" } },
+    { type: "tool_execution_end", toolCallId: "c1", result: "hi\n" },
+    { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "done" } },
+    { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } },
+  ]
+  await writeFile(path.join(dir, "out.log"), lines.map((line) => JSON.stringify(line)).join("\n"))
+  const summary = jobSummary(
+    {
+      id,
+      state: "exited",
+      task: "t",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      elapsedMs: 1000,
+      cwd: "/w",
+      model: "m",
+      thinking: "low",
+      pid: 1,
+    },
+    agentHome,
+  )
+  const output = String(summary.output ?? "")
+  assert.doesNotMatch(output, /\{"type":/)
+  assert.match(output, /→ bash: echo hi/)
+  assert.match(output, /assistant: done/)
 })
