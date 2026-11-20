@@ -857,8 +857,6 @@ function buildRow(event) {
 
   switch (type) {
     case "user_message": {
-      // Job lifecycle belongs to the jobs panel; /api/agent/events?view=conversation
-      // already drops it, this keeps a stale/unfiltered payload from leaking in.
       if (data.kind === "job") return null
       const text = String(data.text ?? "")
       if (!text.trim()) return null
