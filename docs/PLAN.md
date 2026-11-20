@@ -1,115 +1,113 @@
-# 实施方案 v2 — 去掉"会话"
+# 实施方案 v3 — ctrl 说话，pi 干活
 
-> 契约见 [CONTRACT.md](CONTRACT.md)（v2）。本文件是这次改造的施工单。
+> 契约见 [CONTRACT.md](CONTRACT.md)（v3）。这是这次改造的施工单。
 
 ## 0. 验收
 
-1. `npm run typecheck && npm test && npm run test:e2e` 通过。
-2. `ctrl agent new builder --model ...` → `ctrl --agent builder` → 页面标题就是
-   `builder`，没有侧栏、没有"新对话"。
-3. 说一句话 → 时间线追加用户行 + 工具卡片 + 回复；刷新后还在。
-4. 重启 ctrl：同一个 agent 的日志、记忆、机器、cwd 全部还在，接着说话。
-5. `ctrl agent rm builder` → `~/.ctrl/trash/builder-<stamp>/`；再 `ctrl agent new
-   builder` 是空的（新记忆、新日志）。
+1. `npm run typecheck && npm test && npm run test:e2e` 全绿。
+2. `ctrl --agent scout` → 页面上说「让 pi 统计一下仓库里有多少个 .ts 文件」：
+   agent 调 `delegate` → 卡片出现 `job <id> running` → 过一会儿变 `exited 0`，
+   卡片里能看到 worker 的输出，agent 把结论复述给你。
+3. 关掉标签页再打开：对话、记忆、那个 job 的最终状态都还在。
+4. ctrl 进程里**没有**任何 read/bash/edit 工具，也没有 ssh/机器概念。
 
 ## 1. 改动清单
 
-| 区域 | v1 | v2 |
-| --- | --- | --- |
-| 身份 | 会话 id（时间戳随机） | **agent 名**（用户起），日志 id 固定 `main` |
-| 存储 | `--home` 指向 pi-durable home | `--root ~/.ctrl` + `agents/<name>/` |
-| API | `/api/sessions/:id/*` | `/api/agent/*` |
-| 页面 | 侧栏 + 会话切换 + 气泡 | 单时间线 + 名字 + 上翻分页 |
-| 机器 | `--machine` 进程级 | 不变（v1 阉割掉切换） |
-| 删除 | 无 | `agent rm` → `trash/`，`--purge` 真删 |
+| 动作 | 路径 |
+| --- | --- |
+| **删除** | `src/exec/**`（local + ssh + types）、`src/tools/execution.ts`、`tests/unit/local-exec.test.ts`、`tests/unit/ssh-quote.test.ts` |
+| **新增** | `src/jobs/store.ts`（目录、meta、状态）、`src/jobs/runner.ts`（spawn pi / 停止）、`src/jobs/tools.ts`（3 个工具） |
+| **重写** | `src/tools/index.ts`（jobs + remember/recall） |
+| **修改** | `src/server/server.ts`（去 machine/executor，加 jobs 配置）、`src/server/routes.ts`（+`/api/jobs`，system prompt，去 machine）、`src/server/sidecar.ts`（只剩 cwd）、`src/cli/index.ts`（去 `--machine`，加 `--pi-bin` `--max-workers`） |
+| **改测试** | 删 exec 两组；新增 `tests/unit/jobs.test.ts`（用假 pi 脚本）；改 `tests/e2e/agent.test.ts` 的工具断言 |
+
+页面只改 `src/web/public/*`（W2）。
 
 ## 2. 文件所有权
 
-| 路径 | 谁 |
+| 谁 | 拥有 |
 | --- | --- |
-| `src/server/**`、`src/cli/**`、`tests/**` | **W1 backend** |
-| `src/web/public/{index.html,app.js,styles.css}` | **W2 ui** |
-| `src/engine/**`、`src/exec/**`、`src/tools/**`、`docs/**` | 不动 |
-
-W1 不改 exec/tools，只改 server + cli（tools 与 executor 的装配从 `buildContext`
-里保留）。W2 只按 §3.3 的 API 写。
+| **W1 backend** | `src/jobs/**`、`src/tools/**`、`src/server/**`、`src/cli/**`、`tests/**`；删除 `src/exec/**` |
+| **W2 ui** | `src/web/public/{index.html,app.js,styles.css}` |
+| 父会话 | `docs/**`、`README.md`、`package.json` |
 
 ## 3. 关键实现
 
-### 3.1 agent 目录
-
-```ts
-// 新增 src/server/agents.ts（W1 自己定文件名）
-root = flags.root ?? process.env.CTRL_ROOT ?? join(homedir(), ".ctrl")
-agentHome = join(root, "agents", name)
-agentFile = join(agentHome, "agent.json")   // { name, model, createdAt }
-```
-
-- 名字校验 `^[a-z0-9][a-z0-9_-]{0,31}$`，非法直接退出码 2。
-- `--agent` 默认 `main`；目录不存在就创建（写 `agent.json` + 建空日志）。
-- 日志 id 固定 `"main"`：`createSession({ sessionId: "main", home: agentHome, cwd, model })`。
-- 已存在 → `openSession("main", { home: agentHome })`。
-- `resolvePaths(agentHome)` 给 pi-durable 的所有路径；`ctrl.json` 仍写在
-  `<agentHome>/sessions/main/ctrl.json`。
-
-### 3.2 CLI
+### 3.1 job 目录
 
 ```
-ctrl [serve] [--agent <name>] [--root <dir>] [--machine <host>]
-             [--model <id>] [--reasoning-effort <level>]
-             [--workspace <dir>] [--allow-bash] [--port] [--host] [--max-steps]
-ctrl agent list
-ctrl agent new <name> [--model <id>] [--json]
-ctrl agent rm <name> [--purge]
+<agentHome>/jobs/<id>/
+  meta.json   { id, task, cwd, model, thinking, startedAt, pid, exitedAt?, code?, signal? }
+  out.log     worker 的 stdout+stderr
+  pi/         --session-dir，worker 自己的会话
 ```
 
-- `agent list`：扫描 `<root>/agents/*`，输出 `name  created  events  last活动`。
-- `new`：创建目录 + 日志（需要 cwd，默认取当前目录；ssh 机器取 `~`）。
-- `rm`：整目录 move 到 `<root>/trash/<name>-<YYYYMMDDHHMMSS>/`；`--purge` 直接删。
-  不存在 → 退出码 1 + 明确信息。
-- `serve` 启动横幅：`agent: <name> (log 3 events) / machine: ... / model: ...`
+- `id` = `YYYYMMDDTHHMMSSZ-<6 位随机>`。
+- 状态**只从磁盘读**：`meta.exitedAt` 有值即结束；否则 `kill(pid, 0)` 探活，
+  探不到且没有 exitedAt → 标 `lost`（ctrl 崩过），不要假装还在跑。
+- `elapsedMs` = `(exitedAt ?? now) - startedAt`。
 
-### 3.3 路由（契约 §7 的落地细节）
+### 3.2 启动 worker
 
-- `GET /api/agent` → 读 `agent.json` + `openSession` 的 meta + `detectResumePoint` +
-  `turns.state` + sidecar，一次返回。
-- `GET /api/agent/events` 三种模式，优先级 `before` > `tail` > `since`：
-  ```
-  since=N        → events.filter(e => e.seq >= N).slice(0, 200)
-  tail=T         → events.slice(-T)
-  before=S&tail=T→ events.filter(e => e.seq < S).slice(-T)
-  ```
-  响应统一 `{ events, total, since, turn }`，`since` = 返回的第一条的 seq（无事件则 0/不变）。
-- 其余：`POST /api/agent/messages`、`POST /api/agent/abort`、`GET /api/machines`、
-  健康检查、memory 三件套。**删掉所有 `/api/sessions*` 路由**。
-- `runTurn` 传 `systemPrompt`（契约 §6），agent 名 + machine + cwd 每次进 prompt。
+```
+pi -p <task>
+   --provider <provider> --model <model> --thinking <thinking>
+   --session-dir <job>/pi --session-id <id>
+```
 
-### 3.4 删除语义
+- `spawn(..., { detached: true, cwd: job.cwd, stdio: ["ignore", out, out] })`，
+  `unref()`；pid 写 meta。
+- 默认取 ctrl 自己的 `--provider/--model/--reasoning-effort`（provider 允许空，
+  空就不传——本机 pi 的默认 provider 可能歧义，所以默认传 `any-endpoint`，
+  可用 `--pi-provider` 覆盖）。
+- 退出时由父进程 `on("exit")` 或轮询写 `exitedAt/code`；两种都做（重启后靠磁盘）。
+- 并发上限默认 3（`--max-workers`）；超了 `delegate` 返回
+  `{ ok:false, output:"3 workers already running; poll them with job_status" }`。
 
-`agent rm` 用 `renameSync` 到 trash；trash 里同名的再删就带后缀。**不要** rm -rf，
-除非 `--purge`。
+### 3.3 工具
+
+| 工具 | 参数 | 返回 |
+| --- | --- | --- |
+| `delegate` | `{ task, cwd?, model?, thinking? }` | `started job <id> — poll with job_status` |
+| `job_status` | `{ id?, lines=40, full? }` | 单个：`state/elapsed/exit` + 输出尾部；无 id：列出最近 10 个 job |
+| `job_stop` | `{ id }` | `stopped <id>` / 错误 |
+
+- 全部返回 `{ ok, output }`，不抛异常。
+- `full` 时整份日志，但截到 20 000 字符并注明截断。
+- `job_status` 无 id 时输出一行一个：`<id> <state> <elapsed> <task 前 60 字>`。
+
+### 3.4 `/api/jobs`
+
+`GET /api/jobs` → `{ jobs: [{ id, state, task, startedAt, elapsedMs, code? }] }`，
+按 startedAt 倒序，最近 20 个。页面用它更新 delegate 卡片和状态条的 worker 计数。
+
+### 3.5 system prompt 与 system 事件
+
+- prompt 按契约 §6 那句，`<cwd>` 用 sidecar 里的 workspace。
+- `delegate` 的结果只是工具卡片；**不要**往日志里补自定义事件。
 
 ## 4. 测试
 
 | 文件 | 测什么 |
 | --- | --- |
-| `tests/unit/agents.test.ts` | 名字校验、目录创建、list 排序、rm 归档、purge |
-| `tests/unit/events-page.test.ts` | since / tail / before 三种模式的边界 |
-| `tests/e2e/agent.test.ts` | 假 LLM：`--root` 临时目录 → 建 agent → 发消息 → 事件增长 → 重启后仍在 |
-| 旧测试 | 删除或改写到新 API（`tests/e2e/chat.test.ts` 里的 sessions 断言） |
+| `tests/unit/jobs.test.ts` | 假 pi（临时 `.sh` 脚本：echo + sleep + exit 7）→ 状态 running→exited 7、输出尾部、并发上限、stop、磁盘状态（删进程后仍能读） |
+| `tests/e2e/agent.test.ts` | 假 LLM 脚本化：第一轮调 delegate（用假 pi），第二轮 job_status，断言 tool_call/tool_result 里出现 job id 与 `exited 0` |
+| 其余 | 保持通过；删掉 exec 相关 |
+
+假 pi 通过 `--pi-bin /tmp/xxx.sh` 注入，不要真的调 pi。
 
 ## 5. 坑
 
-- pi-durable 的 `createSession` 接受 `sessionId`，固定 `"main"` 即可；不要自己写 jsonl。
-- `openSession` 会 replay 整个日志：单一永恒日志会越来越慢。v1 先接受（几千条毫秒级），
-  以后加派生索引（契约 M6 提过）。
-- 时间线首屏要 `tail=100`，不要一上来 `since=0` 全量。
-- 页面上"已经更多历史"用 `before` 判断：`since > 0` 就还有。
-- `agent.json` 的 model 只在建日志时用；之后以 `session_created` 里记的为准。
-- 不要给页面加 agent 切换器：一个进程一个 agent，契约 §2。
+- `pi -p` 在模型歧义时会报错退出：默认要带 `--provider any-endpoint`。
+- `spawn` 的 `detached` + `unref` 才能让 job 活过这一轮；stdout 必须落文件。
+- 探活用 `process.kill(pid, 0)`，`EPERM` 视为活着。
+- `job_status` 读日志要处理文件不存在（刚 spawn 还没写）。
+- 删 `src/exec` 后 `package.json` 的 test 脚本别引用不存在的目录。
+- 页面的 delegate 卡片要在 turn 结束后继续更新（轮询 `/api/jobs`，按 job id 合并）。
 
 ## 6. 派发边界
 
-- W1：§2 表里 backend 的全部，自己跑三条验收命令；不碰 `src/web/public`。
-- W2：三个静态文件，按 §3.3 的字段渲染；`node --check app.js` 必须过。
-- 父会话：合并后跑 typecheck + 手工起服务，确认页面首屏 `tail` 与时间线都对。
+- W1：§2 表里 backend 的全部 + 三条验收命令；删除 exec 时连带删它的测试；
+  不要碰 `src/web/public`。
+- W2：只改三个静态文件；接口用契约 §7（含 `/api/jobs`）；`node --check` 必过。
+- 父会话：合并后跑全套 + 用真 pi 跑一次 `delegate` 验收。

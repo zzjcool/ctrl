@@ -68,7 +68,7 @@ Serve options:
   --agent <name>     the agent to serve (default ${DEFAULT_AGENT}); its directory
                      is created on first start
   --root <dir>       where agents live (default $CTRL_ROOT or ~/.ctrl)
-  --machine <name>   "local" or an ssh Host alias from ~/.ssh/config (default local)
+  --machine <name>   local only for now (remote machines are parked)
   --workspace <dir>  working directory for the agent's hands
                      (default: current directory for --machine local, ~ for ssh)
   --allow-bash       advertise the bash tool to the model (hidden otherwise)
@@ -162,9 +162,16 @@ export function parseArgs(argv: string[]): Flags {
       case "--agent":
         flags.agent = agentNameFlag("--agent", value())
         break
-      case "--machine":
-        flags.machine = value()
+      case "--machine": {
+        // The ssh executor exists in the tree, but remote machines are parked:
+        // one local agent is the whole v1. Reopening this is a two-line change.
+        const machine = word(value(), "--machine")
+        if (machine !== "local") {
+          throw new UsageError(`remote machines are parked for now: v1 is local-only (got "${machine}")`)
+        }
+        flags.machine = machine
         break
+      }
       case "--max-steps":
         flags.maxSteps = integer(value(), "--max-steps", 1, 200)
         break
