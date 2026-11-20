@@ -109,8 +109,6 @@ export class JobRunner {
       nonEmpty(input.thinking) ?? this.thinking,
       "--session-dir",
       piDir,
-      "--session-id",
-      input.id,
     ]
   }
 
@@ -206,6 +204,15 @@ export class JobRunner {
 
         this.finalize(id, { code: null, signal: "SIGTERM" })
         return { ok: true, output: `stopped ${id}` }
+      }
+      await sleep(STOP_POLL_MS)
+    }
+    signalGroup(job.pid, "SIGKILL")
+    const hardDeadline = Date.now() + 2_000
+    while (Date.now() < hardDeadline) {
+      if (!isProcessAlive(job.pid)) {
+        this.finalize(id, { code: null, signal: "SIGKILL" })
+        return { ok: true, output: `stopped ${id} (SIGKILL)` }
       }
       await sleep(STOP_POLL_MS)
     }

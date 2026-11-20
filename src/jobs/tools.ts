@@ -90,8 +90,11 @@ export function renderJobStatus(
   return `${header.join("\n")}\n\n${body}${truncation}`
 }
 
+export const POLL_LIMIT = 3
+
 export function createJobTools(opts: JobToolsOptions): ToolSpec[] {
   const { runner, agentHome } = opts
+  const polls = new Map<string, { count: number; at: number }>()
 
   return [
     {
@@ -174,7 +177,22 @@ export function createJobTools(opts: JobToolsOptions): ToolSpec[] {
           }
           const job = await waitForJob(agentHome, id, waitMs(args.wait))
           if (job === undefined) return { ok: false, output: `no such job: ${id}` }
-          return { ok: true, output: renderJobStatus(agentHome, job, { ...(lines !== undefined ? { lines } : {}), full }) }
+          const text = renderJobStatus(agentHome, job, { ...(lines !== undefined ? { lines } : {}), full })
+          if (job.state !== "running") {
+            polls.delete(id)
+            return { ok: true, output: text }
+          }
+          const now = Date.now()
+          const seen = polls.get(id)
+          const count = seen !== undefined && now - seen.at < 120_000 ? seen.count + 1 : 1
+          polls.set(id, { count, at: now })
+          if (count < POLL_LIMIT) return { ok: true, output: text }
+          return {
+            ok: true,
+            output:
+              `${text}\n\nYou have checked this job ${count} times and it is still running. ` +
+              "Stop polling: end your turn and tell the user it is still running, or call job_stop.",
+          }
         })
       },
     },

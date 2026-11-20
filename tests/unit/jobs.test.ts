@@ -31,6 +31,10 @@ while [ "$i" -lt "\${FAKE_PI_LINES:-0}" ]; do
   printf 'line %s\\n' "$i"
   i=$((i+1))
 done
+if [ -n "$FAKE_PI_IGNORE_TERM" ]; then
+  trap '' TERM
+  while :; do sleep 1; done
+fi
 if [ -n "$FAKE_PI_BIG" ]; then
   j=0
   while [ "$j" -lt "$FAKE_PI_BIG" ]; do
@@ -42,7 +46,7 @@ printf 'done\\n'
 exit "\${FAKE_PI_EXIT:-0}"
 `
 
-const ENV_KEYS = ["FAKE_PI_EXIT", "FAKE_PI_SLEEP", "FAKE_PI_LINES", "FAKE_PI_BIG", "FAKE_PI_STDERR"] as const
+const ENV_KEYS = ["FAKE_PI_EXIT", "FAKE_PI_SLEEP", "FAKE_PI_LINES", "FAKE_PI_BIG", "FAKE_PI_STDERR", "FAKE_PI_IGNORE_TERM"] as const
 type EnvKey = (typeof ENV_KEYS)[number]
 
 const savedEnv = new Map<EnvKey, string | undefined>(ENV_KEYS.map((key) => [key, process.env[key]]))
@@ -183,8 +187,6 @@ test("the worker command line is the frozen one (CONTRACT §5.1)", () => {
     "max",
     "--session-dir",
     "/tmp/x/pi",
-    "--session-id",
-    "20261120T080102Z-a1b2c3",
   ])
   assert.deepEqual(
     runner.workerArgv({ id: "20261120T080102Z-a1b2c3", task: "t", model: "other/model", thinking: "low" }, "/p").slice(4, 8),
@@ -225,7 +227,7 @@ test("delegate starts a detached pi worker, writes the job dir, and returns at o
 
     const log = await waitForLog(id, "args: -p say hi --provider any-endpoint")
     assert.match(log, new RegExp(`--session-dir ${paths.piDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`))
-    assert.match(log, new RegExp(`--session-id ${id}`))
+    assert.doesNotMatch(log, /--session-id/, "pi picks its own session id; a fixed one only warns")
 
     assert.equal(readJob(agentHome, id)?.state, "running")
     assert.equal(countRunning(agentHome), 1)
@@ -588,4 +590,33 @@ test("job_status waits for a running worker instead of returning immediately", a
   const waited = await status?.execute({ id, wait: 5000 }, toolContext(work))
   assert.match(waited?.output ?? "", /state: exited/)
   assert.match(waited?.output ?? "", /exit: 0/)
+})
+
+test("a worker that ignores SIGTERM is still stopped, with SIGKILL", async () => {
+  setEnv({ FAKE_PI_IGNORE_TERM: "1" })
+  const runner = makeRunner()
+  const work = await scratchDir("ctrl-jobs-work-")
+  const reply = runner.delegate({ task: "stubborn" }, work)
+  const id = reply.id as string
+  await waitForLog(id, "args: -p stubborn")
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  const stopped = await runner.stop(id)
+  assert.equal(stopped.ok, true, stopped.output)
+  assert.match(stopped.output, /SIGKILL/)
+  assert.equal(readJob(agentHome, id)?.state, "killed")
+})
+
+test("job_status tells the model to stop polling after three checks", async () => {
+  setEnv({ FAKE_PI_SLEEP: "30" })
+  const runner = makeRunner()
+  const work = await scratchDir("ctrl-jobs-work-")
+  const tools = createJobTools({ runner, agentHome })
+  const delegate = tools.find((tool) => tool.name === "delegate")
+  const status = tools.find((tool) => tool.name === "job_status")
+  const started = await delegate?.execute({ task: "long", wait: 0 }, toolContext(work))
+  const id = /job (\S+)/.exec(started?.output ?? "")?.[1] as string
+  for (let i = 0; i < 3; i += 1) await status?.execute({ id, wait: 0 }, toolContext(work))
+  const fourth = await status?.execute({ id, wait: 0 }, toolContext(work))
+  assert.match(fourth?.output ?? "", /Stop polling/)
+  await runner.stop(id)
 })
