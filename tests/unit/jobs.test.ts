@@ -393,13 +393,13 @@ test("a worker past the job timeout is killed by the sweep, and its log says why
   const runner = makeRunner()
   const work = await scratchDir("ctrl-jobs-work-")
   try {
-    assert.equal(runner.jobTimeoutMinutes, 30)
+    assert.equal(runner.jobTimeoutMinutes, 15)
     const reply = runner.delegate({ task: "never finishes" }, work)
     const id = idOf(reply.output)
     const pid = readJobMeta(agentHome, id)?.pid ?? 0
     assert.equal(isProcessAlive(pid), true)
 
-    const stopped = await runner.sweepTimeouts(Date.now() + 31 * 60_000)
+    const stopped = await runner.sweepTimeouts(Date.now() + 16 * 60_000)
     assert.deepEqual(stopped, [id])
 
     const job = readJob(agentHome, id)
@@ -408,13 +408,13 @@ test("a worker past the job timeout is killed by the sweep, and its log says why
     assert.equal(isProcessAlive(pid), false, "the worker's process group is gone")
 
     const log = readJobLog(agentHome, id, { full: true }).text
-    assert.match(log, /ctrl: job exceeded 30m — stopped/)
+    assert.match(log, /ctrl: job exceeded 15m — stopped/)
     const status = jobTool(runner, "job_status")
     const shown = await status.execute({ id }, toolContext(work))
     assert.match(shown.output, /state: killed/)
-    assert.match(shown.output, /ctrl: job exceeded 30m — stopped/)
+    assert.match(shown.output, /ctrl: job exceeded 15m — stopped/)
 
-    assert.deepEqual(await runner.sweepTimeouts(Date.now() + 31 * 60_000), [])
+    assert.deepEqual(await runner.sweepTimeouts(Date.now() + 16 * 60_000), [])
   } finally {
     setEnv({})
   }
@@ -434,7 +434,7 @@ test("the sweep leaves a worker alone until it is actually past the timeout", as
     const id = idOf(reply.output)
 
     const startedAt = Date.parse(readJobMeta(agentHome, id)?.startedAt ?? "")
-    assert.deepEqual(await runner.sweepTimeouts(startedAt + 30 * 60_000), [], "elapsed == timeout is not over")
+    assert.deepEqual(await runner.sweepTimeouts(startedAt + 15 * 60_000), [], "elapsed == timeout is not over")
     assert.deepEqual(await runner.sweepTimeouts(), [])
     assert.equal(readJob(agentHome, id)?.state, "running")
 
