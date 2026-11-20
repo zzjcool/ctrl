@@ -1,7 +1,13 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import type { SessionEvent } from "../../src/engine/durable.ts"
-import { MAX_EVENTS_PER_CALL, pageEvents } from "../../src/server/routes.ts"
+import {
+  conversationEvents,
+  isJobLifecycleMessage,
+  JOB_MESSAGE_KIND,
+  MAX_EVENTS_PER_CALL,
+  pageEvents,
+} from "../../src/server/routes.ts"
 
 function events(count: number): SessionEvent[] {
   return Array.from({ length: count }, (_, index) => ({
@@ -133,4 +139,34 @@ test("an empty log is not an error in any mode", () => {
   for (const query of [{}, { since: "0" }, { tail: "10" }, { before: "5", tail: "10" }]) {
     assert.deepEqual(pageEvents([], query), { events: [], total: 0, since: 0 }, JSON.stringify(query))
   }
+})
+
+function jobWake(seq: number, kind: string | undefined): SessionEvent {
+  return {
+    id: `e${seq}`,
+    seq,
+    ts: new Date(1_700_000_000_000 + seq).toISOString(),
+    type: "user_message",
+    data: {
+      text: `[ctrl] worker job-${seq} finished (exited, 1.2s) — report the result to the user.`,
+      ...(kind === undefined ? {} : { kind }),
+    },
+  } as SessionEvent
+}
+
+test("the conversation view hides tagged job lifecycle messages, not the history it already had", () => {
+  const log: SessionEvent[] = [
+    events(1)[0] as SessionEvent,
+    jobWake(1, JOB_MESSAGE_KIND),
+    jobWake(2, undefined),
+    { id: "e3", seq: 3, ts: new Date(1_700_000_000_003).toISOString(), type: "assistant_message", data: { text: "done" } } as SessionEvent,
+  ]
+
+  assert.equal(isJobLifecycleMessage(log[1] as SessionEvent), true)
+  assert.equal(isJobLifecycleMessage(log[2] as SessionEvent), false, "an untagged wake from before the marker existed keeps its old rendering")
+  assert.equal(isJobLifecycleMessage(log[3] as SessionEvent), false, "only user_messages can be job lifecycle")
+
+  assert.deepEqual(conversationEvents(log).map((event) => event.seq), [0, 2, 3])
+  assert.equal(log.length, 4, "filtering is a view, it does not drop the stored log")
+  assert.equal(conversationEvents(events(3)).length, 3, "an ordinary log is passed through")
 })

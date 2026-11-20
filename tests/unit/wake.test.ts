@@ -237,6 +237,13 @@ test("a worker that outlives its turn wakes the agent, once", async () => {
   )
   assert.match(wakeText, shape)
 
+  const wakeEvent = woken.events.find((event) => event.seq === wakeSeq)
+  assert.equal(
+    (wakeEvent?.data as { kind?: unknown } | undefined)?.kind,
+    "job",
+    "the wake is tagged as job lifecycle on the way into the log",
+  )
+
   const answered = await waitFor(
     () => events(fixture),
     (snapshot) =>
@@ -249,6 +256,18 @@ test("a worker that outlives its turn wakes the agent, once", async () => {
       event.type === "assistant_message" && event.seq > wakeSeq,
   )
   assert.equal(reply?.data.text, "the worker finished and printed the thing")
+
+  const raw = await events(fixture)
+  const conversation = await api(fixture, "GET", "/api/agent/events?since=0&view=conversation")
+  assert.equal(conversation.status, 200, JSON.stringify(conversation.json))
+  const view = conversation.json as Stream
+  assert.deepEqual(wakeLines(view), [], "job lifecycle is not part of the conversation view")
+  assert.ok(
+    !view.events.some((event) => event.type === "user_message" && (event.data as { kind?: unknown }).kind === "job"),
+    "no tagged job message reaches the session view",
+  )
+  assert.equal(view.total, raw.total, "the conversation view hides the entry, it does not delete the log")
+  assert.equal(await jobState(fixture, id), "exited", "the job is still readable from /api/jobs")
 
   answered.events.forEach((event, index) => assert.equal(event.seq, index))
 

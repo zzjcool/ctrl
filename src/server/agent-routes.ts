@@ -2,11 +2,12 @@ import type { IncomingMessage, ServerResponse } from "node:http"
 import type { DatabaseSync } from "node:sqlite"
 import {
   detectResumePoint,
+  makeUserMessage,
   openSession,
   repairSession,
   runAgent,
 } from "../engine/durable.ts"
-import type { LlmClient, Session } from "../engine/durable.ts"
+import type { LlmClient, Session, SessionSink } from "../engine/durable.ts"
 import type { UsageKind } from "../memory/usage.ts"
 import { lastDreamAt, readProfile } from "../memory/dream.ts"
 import { listFocus, openFocusCount } from "../memory/focus.ts"
@@ -14,7 +15,7 @@ import { liveMemoryCount } from "../memory/memories.ts"
 import { compressWindow, windowInfo } from "../memory/window.ts"
 import { LOG_ID } from "./agents.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
-import { errorMessage, methodNotAllowed, notFound, pageEvents } from "./routes.ts"
+import { conversationEvents, errorMessage, JOB_MESSAGE_KIND, methodNotAllowed, notFound, pageEvents } from "./routes.ts"
 import type { AppContext } from "./routes.ts"
 import { createAbortableLlm } from "./turns.ts"
 import { readSidecar } from "./sidecar.ts"
@@ -77,7 +78,10 @@ function sendAgentEvents(response: ServerResponse, ctx: AppContext, url: URL, me
     tail: url.searchParams.get("tail"),
     before: url.searchParams.get("before"),
   })
-  sendJson(response, 200, { ...page, turn: ctx.turns.state(LOG_ID) })
+  // The session view asks for the conversation slice; the default page is the
+  // whole log, so the agent's own transcript and the audit trail stay readable.
+  const events = url.searchParams.get("view") === "conversation" ? conversationEvents(page.events) : page.events
+  sendJson(response, 200, { ...page, events, turn: ctx.turns.state(LOG_ID) })
 }
 
 async function acceptMessage(
@@ -175,6 +179,38 @@ function importAfterTurn(ctx: AppContext): void {
   }
 }
 
+/**
+ * The sink runAgent writes a wake turn through. Only the turn's user_message is
+ * tagged as job lifecycle; every other append is the agent's own transcript and
+ * goes to the log untouched.
+ */
+function jobLifecycleSession(log: Session): SessionSink {
+  return {
+    sessionId: log.sessionId,
+    events: () => log.events(),
+    appendUserMessage: (text) => log.append(taggedUserMessage(text)),
+    appendAssistantMessage: (input) => log.appendAssistantMessage(input),
+    appendAssistantPending: (input) => log.appendAssistantPending(input),
+    appendToolCall: (input) => log.appendToolCall(input),
+    appendToolResult: (input) => log.appendToolResult(input),
+    appendMemoryWrite: (input) => log.appendMemoryWrite(input),
+    appendMemoryRecall: (input) => log.appendMemoryRecall(input),
+    appendCompaction: (input) => log.appendCompaction(input),
+    appendError: (input) => log.appendError(input),
+  }
+}
+
+/**
+ * The engine types a user_message as `{ text }`, but replay only insists that
+ * `text` is a string, so the job marker rides along and old readers ignore it.
+ */
+function taggedUserMessage(text: string): ReturnType<typeof makeUserMessage> {
+  const draft = makeUserMessage(text)
+  const tagged = draft as typeof draft & { data: { kind?: string } }
+  tagged.data.kind = JOB_MESSAGE_KIND
+  return draft
+}
+
 async function runTurnOnce(
   ctx: AppContext,
   log: Session,
@@ -206,11 +242,15 @@ async function runTurnOnce(
   }
 
   const before = log.events().length
+  // A wake turn's only user_message is the job notification runAgent appends
+  // from `text`. Tag it so the conversation view can leave it out while the
+  // agent still reads it, and keeps being able to continue after a worker.
+  const session = origin === "wake" ? jobLifecycleSession(log) : log
   try {
     await runAgent({
       sessionId: LOG_ID,
       input: text,
-      session: log,
+      session,
       llm: createAbortableLlm(base, signal),
       memory: ctx.agentMemory,
       tools: ctx.tools,
