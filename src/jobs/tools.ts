@@ -16,7 +16,15 @@ import {
   listJobs,
   readJob,
   readJobLog,
+  waitForJob,
 } from "./store.ts"
+
+/**
+ * How long a tool waits for a worker inside one call. The engine kills a tool
+ * at 10 s, so this leaves room for the disk reads around it. It exists because
+ * a model that polls every second burns its whole step budget on a 40 s job.
+ */
+export const DEFAULT_WAIT_MS = 8_000
 import type { JobState, JobView } from "./store.ts"
 
 export interface JobToolsOptions {
@@ -57,6 +65,12 @@ export function formatExit(job: JobView): string | undefined {
   if (typeof job.signal === "string" && job.signal !== "") return `exit: signal ${job.signal}`
   if (job.state === "killed") return "exit: signal"
   return undefined
+}
+
+/** Clamp the model's `wait` argument into the window the engine allows. */
+function waitMs(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_WAIT_MS
+  return Math.max(0, Math.min(8_500, Math.floor(value)))
 }
 
 function oneLine(text: string, max: number): string {
@@ -118,8 +132,8 @@ export function createJobTools(opts: JobToolsOptions): ToolSpec[] {
         ["task"],
       ),
       async execute(args, ctx) {
-        return await guard(() =>
-          runner.delegate(
+        return await guard(async () => {
+          const reply = runner.delegate(
             {
               task: typeof args.task === "string" ? args.task : "",
               ...(typeof args.cwd === "string" ? { cwd: args.cwd } : {}),
@@ -127,8 +141,17 @@ export function createJobTools(opts: JobToolsOptions): ToolSpec[] {
               ...(typeof args.thinking === "string" ? { thinking: args.thinking } : {}),
             },
             ctx.cwd,
-          ),
-        )
+          )
+          if (!reply.ok || reply.id === undefined) return reply
+          // Fast tasks finish inside the same call; the model gets the answer
+          // instead of an id it has to chase.
+          const wait = waitMs(args.wait)
+          const job = await waitForJob(agentHome, reply.id, wait)
+          if (job === undefined || job.state === "running") {
+            return { ok: true, output: `started job ${reply.id} — poll with job_status` }
+          }
+          return { ok: true, output: renderJobStatus(agentHome, job) }
+        })
       },
     },
     {
@@ -145,9 +168,15 @@ export function createJobTools(opts: JobToolsOptions): ToolSpec[] {
           description: `How many trailing output lines to return. Default ${DEFAULT_TAIL_LINES}.`,
         },
         full: { type: "boolean", description: `Return the whole log instead of the tail (capped at ${MAX_OUTPUT_CHARS} characters).` },
+        wait: {
+          type: "integer",
+          minimum: 0,
+          maximum: 8500,
+          description: `Wait this many milliseconds for a running job to finish before returning. Default ${DEFAULT_WAIT_MS}.`,
+        },
       }),
       async execute(args) {
-        return await guard(() => {
+        return await guard(async () => {
           const lines =
             typeof args.lines === "number" && Number.isFinite(args.lines) ? Math.floor(args.lines) : undefined
           const full = args.full === true
@@ -162,7 +191,7 @@ export function createJobTools(opts: JobToolsOptions): ToolSpec[] {
                 .join("\n"),
             }
           }
-          const job = readJob(agentHome, id)
+          const job = await waitForJob(agentHome, id, waitMs(args.wait))
           if (job === undefined) return { ok: false, output: `no such job: ${id}` }
           return { ok: true, output: renderJobStatus(agentHome, job, { ...(lines !== undefined ? { lines } : {}), full }) }
         })

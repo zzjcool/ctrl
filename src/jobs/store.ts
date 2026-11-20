@@ -220,6 +220,25 @@ export function elapsedMs(meta: JobMeta, now: number = Date.now()): number {
 }
 
 /** One job as the rest of the code sees it; undefined when it is not there. */
+/**
+ * Read a job, waiting up to `waitMs` for a running worker to finish. The
+ * engine caps a tool call at 10 s, so callers keep this well under that; the
+ * point is to spend one tool call on "wait for it" instead of ten on polling.
+ */
+export async function waitForJob(
+  agentHome: string,
+  id: string,
+  waitMs: number,
+): Promise<JobView | undefined> {
+  const deadline = Date.now() + Math.max(0, waitMs)
+  let job = readJob(agentHome, id)
+  while (job !== undefined && job.state === "running" && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    job = readJob(agentHome, id)
+  }
+  return job
+}
+
 export function readJob(agentHome: string, id: string, now: number = Date.now()): JobView | undefined {
   const meta = readJobMeta(agentHome, id)
   if (meta === undefined) return undefined

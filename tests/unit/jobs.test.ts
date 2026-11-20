@@ -544,3 +544,36 @@ test("a missing pi binary is refused up front, not turned into a ghost job", asy
   const onPath = makeRunner({ piBin: "ctrl-no-such-pi-binary" })
   assert.match(onPath.delegate({ task: "not on PATH" }, work).output, /pi binary not found/)
 })
+
+// ---------------------------------------------------------------------------
+// The tool layer waits (so the model does not burn its step budget polling)
+// ---------------------------------------------------------------------------
+
+test("the delegate tool waits out a fast worker and returns the finished job", async () => {
+  setEnv({ FAKE_PI_SLEEP: "0.2", FAKE_PI_LINES: "1" })
+  const runner = makeRunner()
+  const work = await scratchDir("ctrl-jobs-work-")
+  const delegate = createJobTools({ runner, agentHome }).find((tool) => tool.name === "delegate")
+
+  const reply = await delegate?.execute({ task: "quick" }, toolContext(work))
+  assert.equal(reply?.ok, true, reply?.output)
+  assert.match(reply?.output ?? "", /state: exited/)
+  assert.match(reply?.output ?? "", /exit: 0/)
+})
+
+test("job_status waits for a running worker instead of returning immediately", async () => {
+  setEnv({ FAKE_PI_SLEEP: "1.5" })
+  const runner = makeRunner()
+  const work = await scratchDir("ctrl-jobs-work-")
+  const tools = createJobTools({ runner, agentHome })
+  const delegate = tools.find((tool) => tool.name === "delegate")
+  const status = tools.find((tool) => tool.name === "job_status")
+
+  const started = await delegate?.execute({ task: "slowish", wait: 100 }, toolContext(work))
+  assert.match(started?.output ?? "", /started job/)
+  const id = /job (\S+)/.exec(started?.output ?? "")?.[1] as string
+
+  const waited = await status?.execute({ id, wait: 5000 }, toolContext(work))
+  assert.match(waited?.output ?? "", /state: exited/)
+  assert.match(waited?.output ?? "", /exit: 0/)
+})

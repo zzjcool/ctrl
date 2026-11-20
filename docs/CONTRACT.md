@@ -69,14 +69,15 @@ new name, you get a new agent with its own log and its own memory.
 
 | Tool | Behaviour |
 | --- | --- |
-| `delegate` | `{ task, cwd?, model?, thinking? }` → starts a detached `pi -p` worker, returns `job <id>` immediately |
-| `job_status` | `{ id?, lines?, full? }` → state, elapsed, exit code, tail of the worker's output; no `id` lists every job |
+| `delegate` | `{ task, cwd?, model?, thinking?, wait? }` → starts a detached `pi -p` worker; waits up to `wait` (default 8 s) and returns the finished job if it is done, otherwise `started job <id>` |
+| `job_status` | `{ id?, lines?, full?, wait? }` → state, elapsed, exit code, tail of the worker's output; waits up to 8 s for a running job; no `id` lists every job |
 | `job_stop` | `{ id }` → SIGTERM the worker's process group |
 | `remember` / `recall` | pi-durable, unchanged |
 
-`delegate` never waits: the engine caps each tool call at 10 s and a real task
-takes minutes. The model is told to poll with `job_status` and to summarise,
-not to paste a whole log.
+Both `delegate` and `job_status` **wait up to 8 s** — under the engine's 10 s
+tool cap — and return as soon as the worker exits. Without that, a model polls
+once per step and burns its whole budget on a 40 s job (observed: 11 steps of
+`job_status` and no answer). The model still summarises; it never pastes a log.
 
 ## 5.1 A worker job on disk (frozen)
 

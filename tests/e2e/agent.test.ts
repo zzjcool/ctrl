@@ -364,8 +364,12 @@ test("a turn delegates to a pi worker and the log carries the job id", async () 
   assert.deepEqual(results.map((event) => event.data.ok), [true])
   assert.equal(results[0]?.data.callId, calls[0]?.data.callId)
 
-  const match = /^started job (\S+) — poll with job_status$/.exec(results[0]?.data.output ?? "")
-  assert.ok(match, `unexpected delegate output: ${results[0]?.data.output}`)
+  // delegate waits a few seconds, so a fast fake worker comes back already
+  // finished; either shape must still carry the id.
+  const delegateOutput = results[0]?.data.output ?? ""
+  const match = /job (\d{8}T\d{6}Z-[a-z0-9]{6})/.exec(delegateOutput)
+  assert.ok(match, `unexpected delegate output: ${delegateOutput}`)
+  assert.match(delegateOutput, /state: (running|exited)/)
   const id = match[1] as string
   delegatedJob = id
 
