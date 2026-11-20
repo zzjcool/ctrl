@@ -18,6 +18,9 @@ const POLL_IDLE_MS = 2500
 
 const POLL_CATCHUP_MS = 60
 const NEAR_BOTTOM_PX = 120
+const STICK_WINDOW_MS = 2000
+const STICK_POLL_MS = 100
+const STICK_UP_PX = 2
 const MAX_INPUT_HEIGHT = 200
 
 const FOCUS_MAX = 10
@@ -75,6 +78,8 @@ const state = {
   connected: null,
   errors: 0,
   nearBottom: true,
+  stickToBottom: true,
+  lastTimelineScrollTop: 0,
 
   focus: [],
 
@@ -121,6 +126,10 @@ const state = {
 
   proposalNote: "",
 }
+
+try {
+  if ("scrollRestoration" in history) history.scrollRestoration = "manual"
+} catch {}
 
 const els = {
   name: document.getElementById("agent-name"),
@@ -1008,8 +1017,84 @@ function prependEvents(events) {
   scheduleTaskMeasure()
 }
 
+let stickObserver = null
+let stickStopTimer = 0
+let stickPoll = 0
+let stickFrame = 0
+
 function scrollToBottom() {
   els.timeline.scrollTop = els.timeline.scrollHeight
+  state.lastTimelineScrollTop = els.timeline.scrollTop
+}
+
+function stopStickToBottom() {
+  state.stickToBottom = false
+  if (stickObserver) {
+    stickObserver.disconnect()
+    stickObserver = null
+  }
+  if (stickStopTimer) {
+    window.clearTimeout(stickStopTimer)
+    stickStopTimer = 0
+  }
+  if (stickPoll) {
+    window.clearInterval(stickPoll)
+    stickPoll = 0
+  }
+  if (stickFrame) {
+    window.cancelAnimationFrame(stickFrame)
+    stickFrame = 0
+  }
+}
+
+function stickOnce() {
+  if (!state.stickToBottom) return
+  scrollToBottom()
+}
+
+function noteTimelineScroll() {
+  const top = els.timeline.scrollTop
+  if (state.stickToBottom && top < state.lastTimelineScrollTop - STICK_UP_PX) stopStickToBottom()
+  state.lastTimelineScrollTop = top
+}
+
+function watchTimelineGrowth() {
+  if (!state.stickToBottom) return
+  if (stickStopTimer) window.clearTimeout(stickStopTimer)
+  if (typeof ResizeObserver === "function") {
+    if (stickObserver) stickObserver.disconnect()
+    stickObserver = new ResizeObserver(() => {
+      if (!state.stickToBottom || stickFrame) return
+      stickFrame = window.requestAnimationFrame(() => {
+        stickFrame = 0
+        stickOnce()
+      })
+    })
+    stickObserver.observe(els.rows)
+  } else if (!stickPoll) {
+    stickPoll = window.setInterval(stickOnce, STICK_POLL_MS)
+  }
+  stickStopTimer = window.setTimeout(() => {
+    stickStopTimer = 0
+    if (stickObserver) {
+      stickObserver.disconnect()
+      stickObserver = null
+    }
+    if (stickPoll) {
+      window.clearInterval(stickPoll)
+      stickPoll = 0
+    }
+  }, STICK_WINDOW_MS)
+}
+
+function scheduleStickToBottom() {
+  scrollToBottom()
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      stickOnce()
+      watchTimelineGrowth()
+    })
+  })
 }
 
 function updateLoadEarlier() {
@@ -2119,8 +2204,9 @@ async function tryLoadAgent() {
     updateLoadEarlier()
     syncPending()
     updateComposer()
-    scrollToBottom()
     state.nearBottom = true
+    state.stickToBottom = true
+    scheduleStickToBottom()
     return true
   } catch {
     setConnected(false)
@@ -2323,6 +2409,7 @@ function bind() {
   els.timeline.addEventListener(
     "scroll",
     () => {
+      noteTimelineScroll()
       const gap = els.timeline.scrollHeight - els.timeline.scrollTop - els.timeline.clientHeight
       state.nearBottom = gap < NEAR_BOTTOM_PX
     },
