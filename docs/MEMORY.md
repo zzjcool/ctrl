@@ -143,6 +143,51 @@ messages= 最近 K 轮原文（按字符预算，默认 ~40k）
 - 压缩通过写 `compaction` 事件实现，不改引擎。
 - 老 agent 目录第一次升级时自动建库并回填全量事件（一次性迁移，可重复执行）。
 
+## 10.1 冻结接口（M2/M3/M4）
+
+### 工具
+| 工具 | 参数 | 说明 |
+| --- | --- | --- |
+| `focus_set` | `{ text, id?, state? }` | 无 id 新建（open）；有 id 改文字/状态 |
+| `search_context` | 已有 | 不变 |
+
+### HTTP
+| 方法 + 路径 | 行为 |
+| --- | --- |
+| `GET /api/focus` | `{ items: [{ id, text, state, updatedAt, seq }] }` |
+| `POST /api/focus` | `{ id?, text?, state? }` → upsert，返回 `{ item }` |
+| `DELETE /api/focus/:id` | 标记 done（软删） |
+| `GET /api/memories?query=&limit=&all=` | `{ memories, count }`，默认只返回未 supersede 的 |
+| `POST /api/memories` | `{ text, kind?, tags?, importance? }` → `{ memory }` |
+| `DELETE /api/memories/:id` | 写 tombstone（`superseded_by = "deleted:<id>"`），不物理删 |
+| `GET /api/dreams?limit=` | `{ runs: [{ id, startedAt, endedAt, fromSeq, toSeq, added, merged, superseded, error? }] }` |
+| `POST /api/dream` | 202 `{ started: true }`；已在跑 → 409 |
+| `GET /api/agent` | 追加 `memory: { memories, focusOpen, lastDreamAt }`、`context: { windowStart, chars }` |
+
+### M2 窗口（每次回合前）
+- 预算 `--context-budget`，默认 **40 000 字符**。
+- `transcript = events where seq >= 最近一次 compaction.firstKeptSeq`。
+- 超预算：从最老处切掉大约一半字符（保留最近 ≥ 预算/2），用**当轮的 llm client** 摘要（上限 2 000 字符），
+  然后 `session.appendCompaction({ summary, firstKeptSeq })`，并往 `summaries(level='window')` 写一行。
+- 至少保留最近 6 条事件；只剩一条 user_message 时不做压缩。
+- 关闭引擎自带压缩：`runAgent({ compactThreshold: Number.MAX_SAFE_INTEGER })`。
+- 摘要失败 → 跳过压缩照常跑回合（不能因为省 token 把回合搞挂）。
+
+### M3 做梦（`src/memory/dream.ts`）
+- 触发：空闲 **10 分钟**（每 60 s 检查一次）且 `lastIndexedSeq > lastDreamSeq`；`POST /api/dream`；`ctrl dream` 手动。
+- 批：最多 40 条事件或 12 000 字符。
+- 抽取：一次模型调用，要求 JSON：
+  `{ memories: [{kind, text, tags, importance, sourceSeqs, supersedes?}], focus: [{text, state, id?}], profileRewrite?: string }`
+- 传入现有相关记忆（对批内关键词 search_context 取 top 8，附 id）供模型判断 supersede。
+- 写入：文本归一化去重；`supersedes` → 旧行 `superseded_by`；focus 按 id/text upsert；profileRewrite 非空时写 `profile.md`（旧版存 `profile.history/<ts>.md`）。
+- 记录：`dream_runs` + `meta.last_dream_seq`（成功才前进）；失败只记错误、不前进。
+- 模型：同一 client，`maxTokens: 1500`。
+
+### M4 页面
+- 右侧面板 320 px（窄屏折叠成按钮）：focus（doing → open → blocked，最多 10 条）、运行中的 worker、上次做梦时间。
+- 记忆抽屉：搜索框 + 列表 + 删除；编辑文字/重要度可后置。
+- 时间线保持不动。
+
 ## 11. 落地顺序
 
 | 阶段 | 内容 | 验收 |
