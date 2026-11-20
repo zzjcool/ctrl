@@ -247,10 +247,10 @@ export interface JobLog {
   truncated: boolean
 }
 
-export function readJobLogRaw(agentHome: string, id: string): string {
+export function readJobLogRaw(agentHome: string, id: string, maxBytes: number = MAX_OUTPUT_CHARS * 100): string {
   if (!isJobId(id)) return ""
   try {
-    return readTailText(jobPaths(agentHome, id).logPath, MAX_OUTPUT_CHARS * 100).text
+    return readTailText(jobPaths(agentHome, id).logPath, maxBytes).text
   } catch {
     return ""
   }

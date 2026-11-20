@@ -27,7 +27,7 @@ export function jobSummary(job: JobView, agentHome?: string): Record<string, unk
   }
 
   if (agentHome !== undefined) {
-    const text = renderStream(readJobLogRaw(agentHome, job.id), { maxLines: 15 }).trimEnd()
+    const text = renderStream(readJobLogRaw(agentHome, job.id, 64 * 1024), { maxLines: 15 }).trimEnd()
     if (text !== "") summary.output = text.length > 3_000 ? `…${text.slice(-3_000)}` : text
   }
   return summary
