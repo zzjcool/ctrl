@@ -9,6 +9,7 @@ import { lastIndexedSeq } from "../memory/db.ts"
 import { DREAM_IDLE_MS, DREAM_TICK_MS, DreamController, lastDreamSeq } from "../memory/dream.ts"
 import { createMemoryIndex } from "../memory/index.ts"
 import { DEFAULT_CONTEXT_BUDGET } from "../memory/window.ts"
+import { SelfEditGate } from "../selfedit/gate.ts"
 import { createTools } from "../tools/index.ts"
 import { DEFAULT_AGENT, LOG_ID, ensureAgent, logPath, resolveRoot } from "./agents.ts"
 import { sendJson, serveStatic } from "./http.ts"
@@ -63,9 +64,18 @@ export interface ServerConfig {
 
   sweepIntervalMs?: number
   publicDir?: string
+  selfEdit?: SelfEditConfig
   env?: NodeJS.ProcessEnv
 
   createLlm?: (model: string) => LlmClient
+}
+
+export interface SelfEditConfig {
+  repoRoot?: string
+  verifyCommands?: string[]
+  verifyTimeoutMs?: number
+  baseBranch?: string
+  restart?: () => void
 }
 
 export interface RunningServer {
@@ -146,13 +156,28 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     }),
 
     dreams: undefined as unknown as DreamController,
-    tools: createTools({ agentHome: ensured.home, runner, memory }),
+    selfEdit: undefined as unknown as SelfEditGate,
+    tools: [],
     env,
     createLlm:
       config.createLlm ??
       ((requested: string) =>
         createChatCompletionsClient({ model: requested || model, env, reasoningEffort, maxTokens })),
   }
+
+  ctx.selfEdit = new SelfEditGate({
+    repoRoot: config.selfEdit?.repoRoot ?? defaultRepoRoot(),
+    runner,
+    db: memory.handle(),
+    agentHome: ensured.home,
+    ...(config.selfEdit?.verifyCommands !== undefined ? { verifyCommands: config.selfEdit.verifyCommands } : {}),
+    ...(config.selfEdit?.verifyTimeoutMs !== undefined ? { verifyTimeoutMs: config.selfEdit.verifyTimeoutMs } : {}),
+    ...(config.selfEdit?.baseBranch !== undefined ? { baseBranch: config.selfEdit.baseBranch } : {}),
+    ...(config.selfEdit?.restart !== undefined ? { restart: config.selfEdit.restart } : {}),
+    warn: (message) => process.stderr.write(`ctrl: ${message}\n`),
+  })
+
+  ctx.tools = createTools({ agentHome: ensured.home, runner, memory, selfEdit: ctx.selfEdit })
 
   ctx.dreams = new DreamController({
     run: () => dreamOnce(ctx),
@@ -179,7 +204,10 @@ export function buildContext(config: ServerConfig = {}): AppContext {
   })
 
   ctx.wake = createWaker(ctx)
-  runner.onExit = (job) => ctx.wake.notify(job)
+  runner.onExit = (job) => {
+    ctx.wake.notify(job)
+    return ctx.selfEdit.handleExit(job)
+  }
   return ctx
 }
 
@@ -197,6 +225,10 @@ function lastActivityMs(agentHome: string): number | undefined {
 
 export function defaultPublicDir(): string {
   return fileURLToPath(new URL("../web/public", import.meta.url))
+}
+
+export function defaultRepoRoot(): string {
+  return fileURLToPath(new URL("../..", import.meta.url))
 }
 
 function sweepJobs(ctx: AppContext): void {

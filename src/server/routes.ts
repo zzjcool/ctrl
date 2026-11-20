@@ -4,10 +4,12 @@ import type { AgentMemory, LlmClient, MemoryKind, SessionEvent, ToolSpec } from 
 import type { JobRunner } from "../jobs/runner.ts"
 import type { DreamController } from "../memory/dream.ts"
 import type { MemoryIndex } from "../memory/index.ts"
+import type { SelfEditGate } from "../selfedit/gate.ts"
 import { handleAgentRoutes } from "./agent-routes.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
 import { handleJobsRoute } from "./job-routes.ts"
 import { handleMemoryRoutes, isMemoryPath } from "./memory-routes.ts"
+import { handleProposalRoutes, isProposalPath } from "./proposal-routes.ts"
 import type { TurnRegistry } from "./turns.ts"
 import type { Waker } from "./wake.ts"
 
@@ -30,6 +32,7 @@ export interface AppContext {
   contextBudget: number
   dreams: DreamController
   agentMemory: AgentMemory
+  selfEdit: SelfEditGate
   tools: ToolSpec[]
   env: NodeJS.ProcessEnv
   createLlm: (model: string) => LlmClient
@@ -126,6 +129,11 @@ export async function handleApiRequest(
 
     if (isMemoryPath(url.pathname, segments)) {
       await handleMemoryRoutes(request, response, ctx, url, method, segments)
+      return true
+    }
+
+    if (isProposalPath(url.pathname, segments)) {
+      await handleProposalRoutes(response, ctx, method, segments)
       return true
     }
 

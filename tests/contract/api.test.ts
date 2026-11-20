@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { createServer, request as httpRequest } from "node:http"
 import type { IncomingMessage, ServerResponse } from "node:http"
 import type { AddressInfo } from "node:net"
@@ -7,6 +7,10 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { after, before, test } from "node:test"
 import type { SessionEvent } from "../../src/engine/durable.ts"
+import { memoryDbPath, openMemoryDb } from "../../src/memory/db.ts"
+import { createProposal } from "../../src/memory/proposals.ts"
+import type { ProposalStatus, ProposalTests } from "../../src/memory/proposals.ts"
+import { git } from "../../src/selfedit/git.ts"
 import { startServer, type RunningServer } from "../../src/server/server.ts"
 
 interface FakeToolCall {
@@ -170,11 +174,20 @@ interface Fixture {
   workspace: string
   binDir: string
   piBin: string
+  repo: string
+  restarts: number[]
 }
 
 let fixture: Fixture
 
-async function startCtrl(opts: { baseUrl: string; root: string; workspace: string; piBin: string }): Promise<RunningServer> {
+async function startCtrl(opts: {
+  baseUrl: string
+  root: string
+  workspace: string
+  piBin: string
+  repo: string
+  restarts: number[]
+}): Promise<RunningServer> {
   return await startServer({
     root: opts.root,
     agent: AGENT,
@@ -186,6 +199,13 @@ async function startCtrl(opts: { baseUrl: string; root: string; workspace: strin
     piBin: opts.piBin,
     piProvider: "any-endpoint",
     maxWorkers: 3,
+    selfEdit: {
+      repoRoot: opts.repo,
+      verifyCommands: ["true"],
+      restart: () => {
+        opts.restarts.push(Date.now())
+      },
+    },
     env: {
       ...process.env,
       PI_DURABLE_API_KEY: "{{SECRET_contract_key}}",
@@ -195,6 +215,47 @@ async function startCtrl(opts: { baseUrl: string; root: string; workspace: strin
   })
 }
 
+async function mustGit(repo: string, args: string[]): Promise<string> {
+  const result = await git(repo, args)
+  assert.equal(result.ok, true, `git ${args.join(" ")} failed: ${result.stderr}`)
+  return result.stdout
+}
+
+async function makeRepo(): Promise<string> {
+  const repo = await mkdtemp(path.join(tmpdir(), "ctrl-contract-repo-"))
+  await mustGit(repo, ["init", "-q", "-b", "main"])
+  await mustGit(repo, ["config", "user.email", "contract@example.com"])
+  await mustGit(repo, ["config", "user.name", "contract"])
+  await mustGit(repo, ["config", "commit.gpgsign", "false"])
+  await writeFile(path.join(repo, "README.md"), "# contract\n", "utf8")
+  await mustGit(repo, ["add", "-A"])
+  await mustGit(repo, ["commit", "-q", "-m", "init"])
+  return repo
+}
+
+async function seedProposal(opts: {
+  id: string
+  branch: string
+  tests?: ProposalTests
+  status?: ProposalStatus
+  createdAt?: string
+}): Promise<void> {
+  const db = openMemoryDb(memoryDbPath(fixture.running.ctx.agentHome))
+  try {
+    createProposal(db, {
+      id: opts.id,
+      branch: opts.branch,
+      base: "main",
+      task: `contract ${opts.id}`,
+      status: opts.status ?? "open",
+      createdAt: opts.createdAt ?? new Date().toISOString(),
+      ...(opts.tests !== undefined ? { tests: opts.tests } : {}),
+    })
+  } finally {
+    db.close()
+  }
+}
+
 before(async () => {
   const fake = await startFakeLlm()
   const root = await mkdtemp(path.join(tmpdir(), "ctrl-contract-root-"))
@@ -202,8 +263,10 @@ before(async () => {
   const binDir = await mkdtemp(path.join(tmpdir(), "ctrl-contract-bin-"))
   const piBin = path.join(binDir, "pi")
   await writeFile(piBin, FAKE_PI_SOURCE, { mode: 0o755 })
-  const running = await startCtrl({ baseUrl: fake.url, root, workspace, piBin })
-  fixture = { running, fake, root, workspace, binDir, piBin }
+  const repo = await makeRepo()
+  const restarts: number[] = []
+  const running = await startCtrl({ baseUrl: fake.url, root, workspace, piBin, repo, restarts })
+  fixture = { running, fake, root, workspace, binDir, piBin, repo, restarts }
 })
 
 after(async () => {
@@ -212,6 +275,7 @@ after(async () => {
   await rm(fixture.root, { recursive: true, force: true })
   await rm(fixture.workspace, { recursive: true, force: true })
   await rm(fixture.binDir, { recursive: true, force: true })
+  await rm(fixture.repo, { recursive: true, force: true })
 })
 
 function api(method: string, requestPath: string, body?: unknown): Promise<Reply> {
@@ -358,7 +422,7 @@ test("a message is accepted once with 202, refused with 409 while a turn runs an
   assert.equal((await api("GET", "/api/agent/messages")).status, 405)
 })
 
-test("the model is offered exactly seven tools under fixed names", async () => {
+test("the model is offered exactly eight tools under fixed names", async () => {
   fixture.fake.reset()
   fixture.fake.push({ content: "no tool needed" })
   assert.equal((await send("which tools do you have?")).status, 202)
@@ -367,7 +431,7 @@ test("the model is offered exactly seven tools under fixed names", async () => {
   const body = fixture.fake.bodies.at(-1)
   assert.ok(body, "the fake model saw a request")
   const names = (body.tools ?? []).map((tool) => tool.function.name)
-  assert.equal(names.length, 7)
+  assert.equal(names.length, 8)
   assert.deepEqual(names.slice().sort(), [
     "delegate",
     "focus_set",
@@ -376,6 +440,7 @@ test("the model is offered exactly seven tools under fixed names", async () => {
     "recall",
     "remember",
     "search_context",
+    "self_edit",
   ])
 })
 
@@ -458,4 +523,116 @@ test("event paging caps at 200, since returns the first seq and before outranks 
   const empty = await eventsStream("?before=0")
   assert.deepEqual(empty.events, [])
   assert.equal(empty.since, 0)
+})
+
+test("GET /api/proposals answers an empty shape and unknown ids 404", async () => {
+  const empty = await api("GET", "/api/proposals")
+  assert.equal(empty.status, 200, empty.text)
+  assert.deepEqual(empty.json, { proposals: [] })
+
+  assert.equal((await api("GET", "/api/proposals/nope")).status, 404)
+  assert.equal((await api("POST", "/api/proposals/nope/apply")).status, 404)
+  assert.equal((await api("POST", "/api/proposals/nope/discard")).status, 404)
+  assert.equal((await api("POST", "/api/proposals")).status, 405)
+})
+
+test("GET /api/proposals lists newest first with the fixed proposal shape", async () => {
+  await seedProposal({
+    id: "older",
+    branch: "self/older",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    tests: { typecheck: { ok: true } },
+  })
+  await seedProposal({
+    id: "newer",
+    branch: "self/newer",
+    createdAt: "2026-02-01T00:00:00.000Z",
+    tests: { typecheck: { ok: true } },
+  })
+
+  const reply = await api("GET", "/api/proposals")
+  assert.equal(reply.status, 200, reply.text)
+  const proposals = reply.json.proposals as Array<Record<string, any>>
+  assert.deepEqual(proposals.map((proposal) => proposal.id), ["newer", "older"])
+  const first = proposals[0] as Record<string, any>
+  assert.deepEqual(Object.keys(first).sort(), ["base", "branch", "createdAt", "id", "status", "task", "tests"])
+  assert.equal(first.status, "open")
+  assert.equal(first.base, "main")
+  assert.equal(first.branch, "self/newer")
+  assert.deepEqual(first.tests, { typecheck: { ok: true } })
+})
+
+test("applying a proposal with red tests answers 409 and keeps it open", async () => {
+  await seedProposal({
+    id: "red",
+    branch: "self/red",
+    tests: { typecheck: { ok: false, output: "boom" } },
+  })
+
+  const reply = await api("POST", "/api/proposals/red/apply")
+  assert.equal(reply.status, 409, reply.text)
+  assert.match(reply.json.error, /typecheck/)
+
+  const detail = await api("GET", "/api/proposals/red")
+  assert.equal(detail.status, 200, detail.text)
+  assert.equal(detail.json.proposal.status, "open")
+  assert.equal(detail.json.diff, "")
+})
+
+test("applying a green proposal merges its branch and schedules a restart", async () => {
+  const branch = "self/green"
+  await mustGit(fixture.repo, ["checkout", "-q", "-b", branch])
+  await writeFile(path.join(fixture.repo, "green.txt"), "green\n", "utf8")
+  await mustGit(fixture.repo, ["add", "-A"])
+  await mustGit(fixture.repo, ["commit", "-q", "-m", "green"])
+  await mustGit(fixture.repo, ["checkout", "-q", "main"])
+  await seedProposal({
+    id: "green",
+    branch,
+    tests: { typecheck: { ok: true }, unit: { ok: true } },
+  })
+
+  const restarts = fixture.restarts.length
+  const preApply = await api("GET", "/api/proposals/green")
+  assert.equal(preApply.status, 200, preApply.text)
+  assert.match(preApply.json.diff, /\+green/)
+
+  const reply = await api("POST", "/api/proposals/green/apply")
+  assert.equal(reply.status, 200, reply.text)
+  assert.deepEqual(reply.json, { applied: true, restarting: true })
+  assert.equal((await readFile(path.join(fixture.repo, "green.txt"), "utf8")).trim(), "green")
+
+  const detail = await api("GET", "/api/proposals/green")
+  assert.equal(detail.status, 200, detail.text)
+  assert.equal(detail.json.proposal.status, "applied")
+  assert.equal(detail.json.diff, "")
+
+  const deadline = Date.now() + 3_000
+  while (fixture.restarts.length === restarts && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.equal(fixture.restarts.length, restarts + 1)
+})
+
+test("discarding a proposal deletes its branch and marks it discarded", async () => {
+  const branch = "self/red"
+  await mustGit(fixture.repo, ["checkout", "-q", "-b", branch])
+  await writeFile(path.join(fixture.repo, "red.txt"), "red\n", "utf8")
+  await mustGit(fixture.repo, ["add", "-A"])
+  await mustGit(fixture.repo, ["commit", "-q", "-m", "red"])
+  await mustGit(fixture.repo, ["checkout", "-q", "main"])
+
+  const reply = await api("POST", "/api/proposals/red/discard")
+  assert.equal(reply.status, 200, reply.text)
+  assert.equal(reply.json.discarded, true)
+  assert.equal(reply.json.proposal.status, "discarded")
+
+  const gone = await git(fixture.repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`])
+  assert.equal(gone.ok, false)
+
+  const listed = await api("GET", "/api/proposals")
+  const red = (listed.json.proposals as Array<Record<string, any>>).find((proposal) => proposal.id === "red")
+  assert.equal(red?.status, "discarded")
+
+  assert.equal((await api("POST", "/api/proposals/green/discard")).status, 409)
 })

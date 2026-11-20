@@ -4,6 +4,8 @@ import { createJobTools } from "../jobs/tools.ts"
 import type { JobRunner } from "../jobs/runner.ts"
 import type { MemoryIndex } from "../memory/index.ts"
 import { createFocusSetTool, createSearchContextTool } from "../memory/tools.ts"
+import type { SelfEditGate } from "../selfedit/gate.ts"
+import { createSelfEditTool } from "../selfedit/tool.ts"
 
 export interface CreateToolsOptions {
 
@@ -11,6 +13,8 @@ export interface CreateToolsOptions {
   runner: JobRunner
 
   memory: MemoryIndex
+
+  selfEdit?: SelfEditGate
 }
 
 export function memoryTools(): ToolSpec[] {
@@ -20,6 +24,7 @@ export function memoryTools(): ToolSpec[] {
 export function createTools(opts: CreateToolsOptions): ToolSpec[] {
   return [
     ...createJobTools({ agentHome: opts.agentHome, runner: opts.runner }),
+    ...(opts.selfEdit !== undefined ? createSelfEditTool({ gate: opts.selfEdit }) : []),
 
     createSearchContextTool({ index: opts.memory, db: opts.memory.handle() }),
     createFocusSetTool({ db: opts.memory.handle() }),
