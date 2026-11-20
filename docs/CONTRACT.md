@@ -132,6 +132,17 @@ Mapping:
 Errors carry `data.kind` — surface as `ToolResult { ok: false, output }`, never
 throw through the agent loop.
 
+### 4.1 Hard limits found in the engine (facts, not choices)
+
+| Fact | Consequence |
+| --- | --- |
+| `agent.ts` gives every tool call **10 s** (`TOOL_TIMEOUT_MS`), not configurable | any command that can exceed 10 s must go through `spawn` (`run_task`), never `exec` |
+| `machine.exec` caps at **600 s**, `input`/`file.write` at **8 MB base64** | chunk big transfers; long builds are terminals, not execs |
+| `runAgent()` has no token streaming and no `signal` parameter; `llm.complete()` *does* take `signal` | the log is the stream (§0.1); abort = wrap the client, no engine change |
+| event `seq` is dense and 0-based after replay | `?since=` is an index, not a timestamp — cheap tail |
+| `detectResumePoint()` returns `empty` / `clean` / `dangling_tool_call` / `interrupted_turn` | the UI badge maps directly onto these four |
+| `machine.exec` takes argv, **no shell** | the `bash` tool must send `["sh","-c",command]` explicitly |
+
 ## 5. Workspace model (D2 🔴, D3)
 
 Principle: **local disk is the source of truth**; the remote tree is a build
@@ -247,7 +258,7 @@ visible in the chat, not with a library.
 | # | Deliverable | Acceptance (visible in the page) |
 | --- | --- | --- |
 | **M1** | ctrl chat page: pi-durable loop behind it, local executor, log-tail streaming, tool cards | 打开页面聊一轮：消息逐条出现，工具卡片即时出现，刷新不丢 |
-| **M2** | herdr executor + machine chip + machine badge on every tool card | 选择 `hw-nj`，让它 `go build`，卡片上写着“hw-nj · 42s · exit 0” |
+| **M2** | herdr executor + `run_task` (spawn) + machine chip + machine badge on every tool card | 选择 `hw-nj`，让它 `go build`，卡片上写着“hw-nj · 42s · exit 0”。`run_task` 必须在 M2：agent 循环把单个工具卡在 10 s（§4.1） |
 | **M3** | write-through + manifest delta + lazy pull | 改一个文件只推一个；远端生成的 `go.sum` 本地能读到 |
 | **M4** | `run_task` long tasks + live tail + stop | 10 分钟构建有实时输出，可停止；关掉浏览器仍在跑 |
 | **M5** | crash resume + terminal reattach + cross-session memory | `kill -9` 后重开页面，对话完整，活终端能接上，死终端诚实报丢 |
