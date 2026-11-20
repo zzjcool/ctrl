@@ -159,12 +159,20 @@ export function listMemories(db: DatabaseSync, opts: ListMemoriesOptions = {}): 
   return matchRows(rows, query, opts.now ?? new Date()).slice(0, limit)
 }
 
-export function searchMemories(db: DatabaseSync, query: string, opts: ListMemoriesOptions = {}): MemoryRow[] {
+export function searchMemoriesScored(
+  db: DatabaseSync,
+  query: string,
+  opts: ListMemoriesOptions = {},
+): Array<{ row: MemoryRow; score: number }> {
   const limit = clampLimit(opts.limit)
   const trimmed = query.trim()
   const now = opts.now ?? new Date()
   const includeSuperseded = opts.includeSuperseded === true
-  if (trimmed === "") return sortByWeight(selectRows(db, includeSuperseded), now).slice(0, limit)
+  if (trimmed === "") {
+    return sortByWeight(selectRows(db, includeSuperseded), now)
+      .slice(0, limit)
+      .map((row) => ({ row, score: weight(row, now) }))
+  }
 
   const terms = searchTerms(trimmed)
   if (terms.length === 0) return []
@@ -172,7 +180,11 @@ export function searchMemories(db: DatabaseSync, query: string, opts: ListMemori
   const indexed = ensureMemoryIndex(db)
 
   const candidates = candidateRows(db, terms, includeSuperseded, indexed)
-  return rank(candidates, terms, now).slice(0, limit)
+  return rankScored(candidates, terms, now).slice(0, limit)
+}
+
+export function searchMemories(db: DatabaseSync, query: string, opts: ListMemoriesOptions = {}): MemoryRow[] {
+  return searchMemoriesScored(db, query, opts).map((entry) => entry.row)
 }
 
 export function memoryScore(row: MemoryRow, now: Date = new Date()): number {
@@ -244,7 +256,7 @@ function findDuplicate(db: DatabaseSync, text: string): MemoryRow | undefined {
   return undefined
 }
 
-function rank(rows: MemoryRow[], terms: string[], now: Date): MemoryRow[] {
+function rankScored(rows: MemoryRow[], terms: string[], now: Date): Array<{ row: MemoryRow; score: number }> {
   const scored: Array<{ row: MemoryRow; score: number }> = []
   for (const row of rows) {
     const haystack = haystackOf(row)
@@ -256,12 +268,12 @@ function rank(rows: MemoryRow[], terms: string[], now: Date): MemoryRow[] {
     scored.push({ row, score: hits * weight(row, now) })
   }
   scored.sort((a, b) => b.score - a.score || b.row.importance - a.row.importance || b.row.updatedAt.localeCompare(a.row.updatedAt))
-  return scored.map((entry) => entry.row)
+  return scored
 }
 
 function matchRows(rows: MemoryRow[], query: string, now: Date): MemoryRow[] {
   const terms = searchTerms(query)
-  return terms.length === 0 ? [] : rank(rows, terms, now)
+  return terms.length === 0 ? [] : rankScored(rows, terms, now).map((entry) => entry.row)
 }
 
 function haystackOf(row: MemoryRow): string {

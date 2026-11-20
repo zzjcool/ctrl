@@ -99,6 +99,19 @@ test("remember writes the table and recall reads it back", async () => {
   }
 })
 
+test("a lesson's boost does not outrank a memory that actually matches the question", async () => {
+  const db = openMemoryDb(":memory:")
+  try {
+    const memory = createSqliteAgentMemory({ db })
+    const fact = addMemory(db, { kind: "fact", text: "the memory database is a SQLite FTS5 index over events" }).memory
+    addMemory(db, { kind: "lesson", text: "always run the full test suite before proposing a change" })
+    const hits = memory.recall({ text: "sqlite fts5 index", limit: 5 })
+    assert.equal(hits[0]?.entry.id, fact.id, "relevance comes first; the boost only breaks ties")
+  } finally {
+    db.close()
+  }
+})
+
 test("the kinds the engine does not know are reported as fact, not dropped", async () => {
   const db = openMemoryDb(":memory:")
   try {

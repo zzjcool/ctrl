@@ -5,8 +5,7 @@ import {
   LESSON_KIND,
   addMemory,
   isMemoryKind,
-  memoryScore,
-  searchMemories,
+  searchMemoriesScored,
   type MemoryRow,
 } from "./memories.ts"
 
@@ -64,16 +63,18 @@ export function createSqliteAgentMemory(opts: SqliteAgentMemoryOptions): AgentMe
       }
       const at = now()
       const limit = Math.max(1, Math.min(query.limit ?? defaultLimit, 100))
-      const rows = searchMemories(db, query.text, {
-
+      const scored = searchMemoriesScored(db, query.text, {
         limit: limit * 3,
         ...(query.includeSuperseded === true ? { includeSuperseded: true } : {}),
         now: at,
       })
       const kinds = query.kinds === undefined ? undefined : new Set(query.kinds.filter(isEngineKind))
-      return rows
-        .filter((row) => kinds === undefined || kinds.has(engineKind(row.kind)))
-        .map((row) => ({ row, score: memoryScore(row, at) * (row.kind === LESSON_KIND ? LESSON_RECALL_BOOST : 1) }))
+      return scored
+        .filter((entry) => kinds === undefined || kinds.has(engineKind(entry.row.kind)))
+        .map((entry) => ({
+          row: entry.row,
+          score: entry.score * (entry.row.kind === LESSON_KIND ? LESSON_RECALL_BOOST : 1),
+        }))
         .sort((a, b) => b.score - a.score)
         .slice(0, limit)
         .map((hit) => ({ entry: toEntry(hit.row), score: hit.score }))
