@@ -1,6 +1,6 @@
 /* ctrl — 一个命名 agent 的页面。
    一条时间线，没有侧栏、没有气泡。所有颜色只在 :root / 浅色块里定义一次。
-   等宽字体只留给工具卡片、时间和状态条里的机器名。 */
+   等宽字体只留给工具卡片、时间和状态条里的数字。 */
 
 :root {
   color-scheme: dark;
@@ -349,7 +349,6 @@ body {
   color: var(--fg);
 }
 
-.tool-machine,
 .tool-dur {
   font-size: 10.5px;
   color: var(--fg-faint);
@@ -438,6 +437,147 @@ body {
 
 .tool-pre.is-empty {
   color: var(--fg-faint);
+}
+
+/* ------------------------------------------------------ delegate 卡片（job） */
+
+/* 一行头部：delegate · 徽章 · job id · 耗时（耗时靠 margin-left:auto 顶到右边） */
+
+.job-head {
+  align-items: center;
+  gap: 7px;
+}
+
+.job-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 1.65;
+  color: var(--fg-faint);
+  white-space: nowrap;
+}
+
+.job-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+
+.job[data-state="running"] .job-badge {
+  color: var(--accent);
+  border-color: var(--accent-soft);
+}
+
+.job[data-state="running"] .job-dot {
+  animation: job-pulse 1.5s ease-in-out infinite;
+}
+
+.job[data-state="exited"] .job-badge {
+  color: var(--ok);
+  border-color: var(--ok-line);
+}
+
+.job[data-state="failed"] .job-badge {
+  color: var(--fail);
+  border-color: var(--fail-line);
+}
+
+/* `killed`（job_stop 之后）：不是失败，是被人叫停的 */
+.job[data-state="killed"] .job-badge {
+  color: var(--warn);
+}
+
+.job[data-state="lost"] .job-badge {
+  color: var(--fg-faint);
+  border-style: dashed;
+}
+
+@keyframes job-pulse {
+  0%,
+  100% {
+    opacity: 0.2;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+.job-id {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.job-id:empty {
+  display: none;
+}
+
+.job-body {
+  padding: 0 11px 9px;
+}
+
+/* 任务全文：默认两行；点「展开全文」或点文字本身展开。
+   line-clamp 负责省略号，max-height 保证每个浏览器都能真的钳住。 */
+
+.job-task {
+  margin: 0;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  max-height: 3.2em;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--fg-body);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.job[data-open="true"] .job-task {
+  display: block;
+  max-height: none;
+  overflow: visible;
+}
+
+.job-toggle {
+  margin: 5px 0 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--fg-faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.job-toggle:hover {
+  color: var(--fg-dim);
+}
+
+.job-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 5px;
+  font-size: 10.5px;
+  color: var(--fg-faint);
+}
+
+.job-meta:empty {
+  display: none;
 }
 
 /* ---------------------------------------------------------------- 错误 / 压缩 / 运行中 */
@@ -706,10 +846,6 @@ body {
 
   .sep {
     gap: 9px;
-  }
-
-  .tool-machine {
-    display: none;
   }
 }
 

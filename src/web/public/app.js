@@ -1,16 +1,20 @@
 // ctrl — 一个命名 agent 的页面：它的名字、它的一生（一条时间线）、一个输入框。
 //
 // 纯静态 ES module：零 import、零依赖、零构建、无 top-level await。
-// 只使用契约 §7 的接口（v2 里没有"会话"这个概念，所以页面也不按会话拉数据）：
+// 只使用契约 §7 的接口（v3 里没有会话、也没有"机器"这个概念；ctrl 自己不动手，
+// 活交给 pi worker，页面靠 `/api/jobs` 看 worker 的当下状态）：
 //   GET  /api/agent
 //   GET  /api/agent/events?since=N | tail=T | before=S&tail=T
 //   POST /api/agent/messages   { text }
 //   POST /api/agent/abort
+//   GET  /api/jobs             { jobs: [{ id, state, task, startedAt, elapsedMs, code? }] }
 //
 // 安全：服务端 / 模型 / 用户的所有文本都走 textContent 或 createElement，
 // 这个文件里没有一处把字符串当 HTML 塞回 DOM。
 
 const API = "/api/agent"
+/** 契约 §7：`GET /api/jobs` 不在 /api/agent 下面（worker 不是日志的一部分）。 */
+const JOBS_API = "/api/jobs"
 /** 首屏和"加载更早"一次拿多少条（契约 §7：单次上限 200） */
 const TAIL = 100
 const POLL_RUNNING_MS = 700
@@ -26,11 +30,16 @@ const MAX_INPUT_HEIGHT = 200
 
 const state = {
   name: "",
-  machine: "",
   turn: { running: false },
   resumePoint: null,
   eventCount: 0,
   lastActivity: "",
+  /** `/api/jobs` 里 state === "running" 的条数：状态条的 workers */
+  workerCount: 0,
+  /** job id → 渲染过的 delegate 卡片数组；轮询到了就按 id 合并，从不删除卡片 */
+  jobs: new Map(),
+  /** 所有 delegate 卡片（量「展开全文」要遍历它们） */
+  jobCards: [],
   /** 流式游标：下一次 since= 用（最后一条 seq + 1） */
   since: 0,
   /** 已收到的最小 seq；> 0 就说明上面还有历史（null = 一条都没收到） */
@@ -56,9 +65,9 @@ const state = {
 
 const els = {
   name: document.getElementById("agent-name"),
-  machine: document.getElementById("status-machine"),
   events: document.getElementById("status-events"),
   last: document.getElementById("status-last"),
+  workers: document.getElementById("status-workers"),
   resume: document.getElementById("status-resume"),
   connDot: document.getElementById("conn-dot"),
   connText: document.getElementById("conn-text"),
@@ -162,7 +171,8 @@ function formatDuration(ms) {
   return `${minutes}m${pad2(seconds)}s`
 }
 
-async function api(path, options) {
+/** 发一次 GET/POST，拿 JSON。`path` 是完整路径（/api/jobs 不在 /api/agent 下面）。 */
+async function request(fullPath, options) {
   const init = {
     method: (options && options.method) || "GET",
     headers: { accept: "application/json" },
@@ -171,7 +181,7 @@ async function api(path, options) {
     init.headers["content-type"] = "application/json"
     init.body = JSON.stringify(options.body)
   }
-  const response = await fetch(API + path, init)
+  const response = await fetch(fullPath, init)
   const raw = await response.text()
   let data = null
   if (raw) {
@@ -190,6 +200,10 @@ async function api(path, options) {
     throw error
   }
   return data ?? {}
+}
+
+function api(path, options) {
+  return request(API + path, options)
 }
 
 function setConnected(ok) {
@@ -225,18 +239,6 @@ function pickName(data) {
   return ""
 }
 
-/** `/api/agent` 的 machine 可能是字符串，也可能是 `{ name }`；两种都认。 */
-function pickMachine(data) {
-  const candidates = [data?.machine, data?.session?.machine, data?.session?.machineName, data?.agent?.machine]
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim()) return candidate.trim()
-    if (candidate && typeof candidate === "object" && typeof candidate.name === "string" && candidate.name.trim()) {
-      return candidate.name.trim()
-    }
-  }
-  return ""
-}
-
 function normalizeTurn(turn) {
   if (!turn || typeof turn !== "object") return { running: false }
   const running = turn.running === true
@@ -264,8 +266,6 @@ function resumeKind() {
 function applyAgent(data) {
   const name = pickName(data)
   if (name) state.name = name
-  const machine = pickMachine(data)
-  if (machine) state.machine = machine
 
   const session = data && typeof data.session === "object" && data.session ? data.session : null
   if (session) {
@@ -287,10 +287,11 @@ function updateHead() {
   els.name.textContent = state.name || "—"
   document.title = state.name ? `${state.name} · ctrl` : "ctrl"
 
-  els.machine.textContent = state.machine || "—"
-  els.machine.title = state.machine ? `工具跑在 ${state.machine} 上（本次运行固定）` : ""
-
   els.events.textContent = String(Math.max(0, state.eventCount))
+
+  const workers = Math.max(0, state.workerCount)
+  els.workers.textContent = String(workers)
+  els.workers.title = workers ? `${workers} 个 pi worker 正在跑` : "眼下没有 worker 在跑"
 
   const when = state.lastActivity
   els.last.textContent = when ? timeAgo(when) : "—"
@@ -306,8 +307,93 @@ function updateEmpty() {
   els.empty.hidden = !empty
   if (!empty) return
   const name = state.name || "这个 agent"
-  const where = state.machine ? `工具跑在 ${state.machine} 上` : "工具跑在它自己的机器上"
-  els.emptyLine.textContent = `这是 ${name}：一个一直活着的 agent，${where}。`
+  els.emptyLine.textContent = `这是 ${name}：一个一直活着的 agent，它自己不动手，活交给 pi worker 去干。`
+}
+
+// ---------------------------------------------------------------------------
+// worker（job）：岗位状态。契约 §7 `GET /api/jobs` 只给这一行信息，
+// 卡片上的任务文本、输出还是从日志里的 tool_call / tool_result 来。
+// ---------------------------------------------------------------------------
+
+/** 后端的 state 是 meta 推导出来的：running / exited / failed / killed / lost。
+ *  这里只做一件事：`exited` 却带了非 0 退出码（同一条信息被拆成两半时）算 failed。 */
+function normalizeJobState(value, code) {
+  const raw = typeof value === "string" ? value.trim().toLowerCase() : ""
+  if (raw === "exited" && code !== null && code !== 0) return "failed"
+  if (raw === "running" || raw === "exited" || raw === "failed" || raw === "lost") return raw
+  return raw || ""
+}
+
+/** 徽章上写什么：把退出码写进去，比一个孤零零的 exited 有用。 */
+function badgeText(jobState, code) {
+  if (jobState === "running") return "running"
+  if (jobState === "lost") return "lost"
+  if (jobState === "exited" || jobState === "failed") {
+    return code === null ? jobState : `${jobState} ${code}`
+  }
+  return jobState || "—"
+}
+
+/** `{ jobs: [...] }` → 数组；形状不对就当没拿到。 */
+function readJobs(data) {
+  const list = data && Array.isArray(data.jobs) ? data.jobs : null
+  if (!list) return null
+  const jobs = []
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue
+    const id = typeof item.id === "string" ? item.id.trim() : ""
+    if (!id) continue
+    jobs.push({
+      id,
+      state: normalizeJobState(item.state, numberOf(item.code)),
+      task: typeof item.task === "string" ? item.task : "",
+      startedAt: typeof item.startedAt === "string" ? item.startedAt : "",
+      elapsedMs: numberOf(item.elapsedMs),
+      code: numberOf(item.code),
+    })
+  }
+  return jobs
+}
+
+/**
+ * 拿到 `/api/jobs` 就合并进已渲染的卡片；拿不到就什么也不做——
+ * 卡片保留最后一次已知状态，比凭空消失或者掉回「运行中」诚实。
+ */
+function applyJobs(data) {
+  const jobs = readJobs(data)
+  if (!jobs) return false
+  let running = 0
+  for (const job of jobs) {
+    if (job.state === "running") running += 1
+    const cards = state.jobs.get(job.id)
+    if (!cards) continue
+    for (const card of cards) applyJobToCard(card, job)
+  }
+  state.workerCount = running
+  updateHead()
+  return true
+}
+
+let jobRefreshTimer = 0
+
+async function refreshJobs() {
+  window.clearTimeout(jobRefreshTimer)
+  jobRefreshTimer = 0
+  try {
+    return applyJobs(await request(JOBS_API))
+  } catch {
+    // worker 列表拉不到不该把事件流带倒；下一次轮询再试。
+    return false
+  }
+}
+
+/** 一批卡片刚落地时把 worker 状态补一次（拢在一起发，不一张卡片一个请求）。 */
+function scheduleJobRefresh() {
+  if (jobRefreshTimer) return
+  jobRefreshTimer = window.setTimeout(() => {
+    jobRefreshTimer = 0
+    void refreshJobs()
+  }, 120)
 }
 
 // ---------------------------------------------------------------------------
@@ -406,7 +492,6 @@ function createCard(name) {
   const head = el("div", "tool-head")
   const nameEl = el("span", "tool-name", String(name || "tool"))
   head.appendChild(nameEl)
-  if (state.machine) head.appendChild(el("span", "tool-machine", state.machine))
 
   const durEl = el("span", "tool-dur", "")
   const stateEl = el("span", "tool-state", "…")
@@ -424,7 +509,199 @@ function createCard(name) {
   details.append(summary, pre)
 
   root.append(head, argsEl, details)
-  return { root, nameEl, durEl, stateEl, argsEl, details, pre, callTs: null, resultTs: null }
+  return { kind: "tool", root, nameEl, durEl, stateEl, argsEl, details, pre, callTs: null, resultTs: null }
+}
+
+// --- delegate 卡片：任务全文 + job id + worker 状态 + 输出 -------------------
+
+/** 卡片根节点 → 卡片对象（点击「展开全文」时要回找）。 */
+const cardOf = new WeakMap()
+
+/** job 目录名 / `pi --session-id`：`YYYYMMDDTHHMMSSZ-<随机>`（契约 §5.1）。 */
+const JOB_ID_RE = /\b\d{8}T\d{6}Z-[a-z0-9]{4,12}\b/i
+
+/**
+ * `delegate` 的返回值是一句人话（`started job <id> — poll with job_status`），
+ * 契约没有结构化字段，所以先在几个可能的键里找，再退回从文本里抠。
+ * 抠不到就返回空串：那张卡片就按普通失败处理（比如并发到顶没起来）。
+ */
+function jobIdOf(data) {
+  for (const candidate of [data?.id, data?.jobId, data?.job_id, data?.job]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim()
+  }
+  const text = String((data && data.output) ?? "")
+  const hit = JOB_ID_RE.exec(text)
+  if (hit) return hit[0]
+  const loose = /\bjob[:\s#]+([A-Za-z0-9][A-Za-z0-9._-]{3,})/i.exec(text)
+  return loose ? loose[1] : ""
+}
+
+function createJobCard(name) {
+  const root = el("div", "tool job")
+  root.dataset.state = "running"
+
+  const head = el("div", "tool-head job-head")
+  const nameEl = el("span", "tool-name", String(name || "delegate"))
+  const badge = el("span", "job-badge")
+  badge.append(el("span", "job-dot", ""), el("span", "job-badge-text", "running"))
+  const badgeState = badge.lastElementChild
+  const idEl = el("span", "job-id", "")
+  const durEl = el("span", "tool-dur", "")
+  head.append(nameEl, badge, idEl, durEl)
+
+  const body = el("div", "job-body")
+  const taskEl = el("p", "job-task", "")
+  const toggle = el("button", "job-toggle", "展开全文")
+  toggle.type = "button"
+  toggle.hidden = true
+  const metaEl = el("div", "job-meta", "")
+  body.append(taskEl, toggle, metaEl)
+
+  const details = document.createElement("details")
+  details.className = "tool-out"
+  details.hidden = true
+  const summary = document.createElement("summary")
+  summary.textContent = "输出"
+  const pre = el("pre", "tool-pre", "")
+  details.append(summary, pre)
+
+  root.append(head, body, details)
+
+  const card = {
+    kind: "job",
+    root,
+    nameEl,
+    durEl,
+    badgeState,
+    idEl,
+    taskEl,
+    toggle,
+    metaEl,
+    details,
+    pre,
+    jobId: "",
+    callTs: null,
+    resultTs: null,
+    /** 任务文本被钳成两行时是否会溢出（决定要不要给「展开全文」） */
+    taskOverflows: false,
+  }
+  cardOf.set(root, card)
+  state.jobCards.push(card)
+  return card
+}
+
+/** 记下这张卡片属于哪个 job：之后 `/api/jobs` 就来这里找它。 */
+function registerJob(card, id) {
+  if (!id) return
+  card.jobId = id
+  card.idEl.textContent = id
+  card.idEl.title = id
+  const cards = state.jobs.get(id)
+  if (!cards) state.jobs.set(id, [card])
+  else if (!cards.includes(card)) cards.push(card)
+}
+
+/** 任务全文：默认只露两行，真溢出了才给一个「展开全文」。 */
+function measureJobTask(card) {
+  if (!card.taskEl.isConnected) return
+  if (card.root.dataset.open === "true") {
+    card.toggle.hidden = !card.taskOverflows
+    return
+  }
+  card.taskOverflows = card.taskEl.scrollHeight > card.taskEl.clientHeight + 1
+  card.toggle.hidden = !card.taskOverflows
+}
+
+function measureJobTasks() {
+  for (const card of state.jobCards) measureJobTask(card)
+}
+
+let measureFrame = 0
+
+/** 卡片刚插进 DOM 时量不出来（还没有布局），下一帧再量。 */
+function scheduleTaskMeasure() {
+  if (measureFrame) return
+  measureFrame = window.requestAnimationFrame(() => {
+    measureFrame = 0
+    measureJobTasks()
+  })
+}
+
+function setJobTask(card, text) {
+  card.taskEl.textContent = String(text ?? "")
+  measureJobTask(card)
+}
+
+function toggleJobTask(card, force) {
+  const open = typeof force === "boolean" ? force : card.root.dataset.open !== "true"
+  card.root.dataset.open = open ? "true" : "false"
+  card.toggle.textContent = open ? "收起" : "展开全文"
+  measureJobTask(card)
+}
+
+/** `/api/jobs` 的一行 → 这张卡片的徽章与耗时（状态只认 worker 的真实状态）。 */
+function applyJobToCard(card, job) {
+  const jobState = job.state || "unknown"
+  card.root.dataset.state = jobState
+  card.badgeState.textContent = badgeText(jobState, job.code)
+  if (job.elapsedMs !== null) card.durEl.textContent = formatDuration(job.elapsedMs)
+  if (job.task && !card.taskEl.textContent) setJobTask(card, job.task)
+}
+
+function fillJobCall(card, data, ts) {
+  const args = data && data.args && typeof data.args === "object" ? data.args : null
+  if (args && typeof args.task === "string" && args.task.trim()) setJobTask(card, args.task)
+  const meta = []
+  for (const key of ["cwd", "model", "thinking"]) {
+    const value = args ? args[key] : null
+    if (value === null || value === undefined || value === "") continue
+    meta.push(`${key}: ${oneLine(valueText(value)).slice(0, 160)}`)
+  }
+  if (meta.length) card.metaEl.textContent = meta.join("  ·  ")
+  registerJob(card, jobIdOf(data))
+  const callDate = toDate(ts)
+  if (callDate) card.callTs = callDate.getTime()
+}
+
+function finishJobCall(card, data, ts) {
+  registerJob(card, jobIdOf(data))
+
+  const end = toDate(ts)
+  if (end) card.resultTs = end.getTime()
+  if (card.callTs !== null && card.resultTs !== null) {
+    card.durEl.textContent = formatDuration(card.resultTs - card.callTs)
+  }
+
+  const output = String((data && data.output) ?? "").replace(/\s+$/, "")
+  card.pre.textContent = output.trim() ? output : "（无输出）"
+  card.pre.classList.toggle("is-empty", !output.trim())
+  card.details.hidden = false
+
+  if (!card.jobId) {
+    // 没有 job id（并发到顶、spawn 失败）：没有 worker 可跟，就老实说失败。
+    const ok = !data || data.ok !== false
+    if (!ok) {
+      card.root.dataset.state = "failed"
+      card.badgeState.textContent = "failed"
+    }
+  }
+  // 卡片刚到：把 worker 的当下状态取一次，别等下一个轮询间隔。
+  scheduleJobRefresh()
+}
+
+/** 一张新的工具卡片该长什么样：`delegate` 有自己的版式。 */
+function createCardFor(name) {
+  return String(name || "") === "delegate" ? createJobCard(name) : createCard(name)
+}
+
+function callInto(card, data, ts) {
+  if (card.kind === "job") fillJobCall(card, data, ts)
+  else fillCall(card, data, ts)
+}
+
+function resultInto(card, data, ts) {
+  if (card.kind === "job") finishJobCall(card, data, ts)
+  else finishCard(card, data, ts)
 }
 
 /** call 和 result 是先后脚到的，谁后到谁负责把耗时补上（上翻分页时会反过来）。 */
@@ -500,11 +777,11 @@ function buildRow(event) {
       const existing = callId ? state.tools.get(callId) : null
       if (existing) {
         // 上翻分页时先看到了 result、后看到 call：补上参数，不另起一行。
-        fillCall(existing, data, event.ts)
+        callInto(existing, data, event.ts)
         return null
       }
-      const card = createCard(data.name)
-      fillCall(card, data, event.ts)
+      const card = createCardFor(data.name)
+      callInto(card, data, event.ts)
       if (callId) state.tools.set(callId, card)
       row.classList.add("row-tool")
       body.appendChild(card.root)
@@ -515,12 +792,13 @@ function buildRow(event) {
       const existing = callId ? state.tools.get(callId) : null
       if (existing) {
         // 和上面那张卡片是同一件事：结果写进卡片，不再多一行。
-        finishCard(existing, data, event.ts)
+        // job_status / job_stop 没有自己的卡片，它们就是普通的工具卡片。
+        resultInto(existing, data, event.ts)
         return null
       }
-      const card = createCard(data.name)
+      const card = createCardFor(data.name)
       if (callId) state.tools.set(callId, card)
-      finishCard(card, data, event.ts)
+      resultInto(card, data, event.ts)
       row.classList.add("row-tool")
       body.appendChild(card.root)
       break
@@ -600,6 +878,7 @@ function appendEvents(events) {
   els.rows.appendChild(fragment)
   for (const record of records) state.rows.push(record)
   if (state.pendingEl) els.rows.appendChild(state.pendingEl)
+  scheduleTaskMeasure()
 }
 
 function prependEvents(events) {
@@ -626,6 +905,7 @@ function prependEvents(events) {
   }
   els.rows.insertBefore(fragment, els.rows.firstElementChild)
   state.rows = records.concat(state.rows)
+  scheduleTaskMeasure()
 }
 
 // ---------------------------------------------------------------------------
@@ -810,7 +1090,11 @@ async function pollOnce() {
   const wasRunning = Boolean(state.turn && state.turn.running)
   let next = POLL_IDLE_MS
   try {
-    const data = await api(`/events?since=${since}`)
+    // 事件和 worker 列表同一拍：delegate 卡片在 turn 结束后还要跟着 worker 活。
+    const [data, jobsData] = await Promise.all([
+      api(`/events?since=${since}`),
+      request(JOBS_API).catch(() => null),
+    ])
     state.errors = 0
     setConnected(true)
 
@@ -830,6 +1114,9 @@ async function pollOnce() {
     const total = numberOf(data && data.total)
     if (total !== null) state.eventCount = Math.max(state.eventCount, total, state.since)
 
+    // job 从列表里消失（超过最近 20 条）不动已渲染的卡片：保留最后一次已知状态。
+    applyJobs(jobsData)
+
     const running = Boolean(state.turn && state.turn.running)
     const turnError = state.turn && typeof state.turn.error === "string" ? state.turn.error : ""
     if (turnError && turnError !== surfacedTurnError) {
@@ -837,7 +1124,9 @@ async function pollOnce() {
       surfacedTurnError = turnError
       toast(`这一轮出错：${turnError}`)
     }
-    next = events.length >= 200 ? POLL_CATCHUP_MS : running ? POLL_RUNNING_MS : POLL_IDLE_MS
+    // 有 worker 在跑也算“忙”：不然 turn 一结束，卡片会拖到 2.5 s 才动。
+    const busy = running || state.workerCount > 0
+    next = events.length >= 200 ? POLL_CATCHUP_MS : busy ? POLL_RUNNING_MS : POLL_IDLE_MS
     if (wasRunning && !running) void refreshHead()
 
     updateHead()
@@ -858,7 +1147,8 @@ async function pollOnce() {
 /** 一轮结束、或刚恢复连接时，把头部（事件数 / resumePoint / turn）重新拉一次。 */
 async function refreshHead() {
   try {
-    const data = await api("")
+    // 头部和 worker 列表一起拉：turn 结束后 workers 那个数字也得是新的。
+    const [data] = await Promise.all([api(""), refreshJobs()])
     applyAgent(data)
     setConnected(true)
     updateHead()
@@ -876,6 +1166,8 @@ async function tryLoadAgent() {
     setConnected(true)
     state.loaded = true
     if (state.eventCount > 0) await loadTail()
+    // 卡片都上屏了再来一次：重开页面时 job 可能早跑完了，不能等到下个轮询拍。
+    await refreshJobs()
     updateHead()
     updateEmpty()
     updateLoadEarlier()
@@ -922,6 +1214,35 @@ function bind() {
     () => {
       const gap = els.timeline.scrollHeight - els.timeline.scrollTop - els.timeline.clientHeight
       state.nearBottom = gap < NEAR_BOTTOM_PX
+    },
+    { passive: true },
+  )
+
+  // delegate 卡片是动态的：展开/收起用事件委托，不给每张卡片绑一份。
+  els.rows.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null
+    if (!target) return
+    const root = target.closest("div.tool.job")
+    if (!root) return
+    const card = cardOf.get(root)
+    if (!card) return
+    if (target.closest(".job-toggle")) {
+      toggleJobTask(card)
+      return
+    }
+    if (!target.closest(".job-task") || !card.taskOverflows) return
+    if (root.dataset.open === "true") return
+    // 选中文字了就是用户在建选区，别把卡片展开。
+    const selection = window.getSelection ? String(window.getSelection() || "") : ""
+    if (selection) return
+    toggleJobTask(card, true)
+  })
+
+  // 窗口宽度变了，两行能装下多少字也变了：重新量一次。
+  window.addEventListener(
+    "resize",
+    () => {
+      if (state.jobCards.length) scheduleTaskMeasure()
     },
     { passive: true },
   )

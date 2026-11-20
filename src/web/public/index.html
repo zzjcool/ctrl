@@ -15,10 +15,6 @@
           <span class="agent-mark" aria-hidden="true">⌃</span><span id="agent-name">…</span>
         </h1>
         <div class="status" aria-label="状态">
-          <span class="status-item" title="这次运行绑定的机器（只读）">
-            <span class="status-key">machine</span>
-            <span class="status-value is-mono" id="status-machine">—</span>
-          </span>
           <span class="status-item" title="这条日志里的事件总数">
             <span class="status-key">events</span>
             <span class="status-value is-mono" id="status-events">0</span>
@@ -26,6 +22,10 @@
           <span class="status-item">
             <span class="status-key">最后活动</span>
             <span class="status-value" id="status-last">—</span>
+          </span>
+          <span class="status-item" title="正在跑的 pi worker 数量（来自 /api/jobs）">
+            <span class="status-key">workers</span>
+            <span class="status-value is-mono" id="status-workers">0</span>
           </span>
           <span class="status-item status-resume" id="status-resume" hidden>已恢复</span>
           <span class="status-spacer"></span>
@@ -43,7 +43,7 @@
 
         <section class="empty" id="empty" hidden aria-label="空状态">
           <p class="empty-line" id="empty-line"></p>
-          <p class="empty-hint">日志就是它的一生：说过的话、跑过的命令，都在下面按时间排着。</p>
+          <p class="empty-hint">日志就是它的一生：说过的话、派出去的活，都在下面按时间排着。</p>
           <div class="prompts" aria-label="示例">
             <button
               class="prompt"
@@ -55,6 +55,11 @@
               type="button"
               data-prompt="把测试跑一遍，失败的地方逐个说清楚"
             >把测试跑一遍，失败的地方逐个说清楚</button>
+            <button
+              class="prompt"
+              type="button"
+              data-prompt="让 pi worker 统计一下这个仓库里有多少个 .ts 文件"
+            >让 pi worker 统计一下这个仓库里有多少个 .ts 文件</button>
             <button
               class="prompt"
               type="button"
