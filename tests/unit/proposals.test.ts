@@ -355,7 +355,7 @@ test("an old memory database gains the proposals table on open", async () => {
 
   const db = openMemoryDb(file)
   dbs.push(db)
-  assert.equal(SCHEMA_VERSION, 3)
+  assert.equal(SCHEMA_VERSION, 4)
   assert.equal(schemaVersion(db), SCHEMA_VERSION)
   const row = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'proposals'").get() as
     | { name?: unknown }

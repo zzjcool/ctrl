@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4
 export const MEMORY_DB_FILENAME = "memory.db"
 
 export function memoryDbPath(agentHome: string): string {
@@ -109,6 +109,21 @@ CREATE TABLE IF NOT EXISTS proposals (
 CREATE INDEX IF NOT EXISTS proposals_created ON proposals(created_at);
 `
 
+const USAGE_DDL = `
+CREATE TABLE IF NOT EXISTS usage (
+  id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  model TEXT,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  ms INTEGER NOT NULL DEFAULT 0,
+  ok INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts);
+`
+
 export const META_SCHEMA_VERSION = "schema_version"
 
 export const META_LAST_INDEXED_SEQ = "last_indexed_seq"
@@ -136,6 +151,7 @@ export function openMemoryDb(file: string): DatabaseSync {
 
 function migrate(db: DatabaseSync): void {
   ensureProposalsTable(db)
+  ensureUsageTable(db)
   ensureDreamLessonsColumn(db)
   const stored = readMeta(db, META_SCHEMA_VERSION)
   if (stored === undefined) {
@@ -153,6 +169,10 @@ function migrate(db: DatabaseSync): void {
 
 export function ensureProposalsTable(db: DatabaseSync): void {
   db.exec(PROPOSALS_DDL)
+}
+
+export function ensureUsageTable(db: DatabaseSync): void {
+  db.exec(USAGE_DDL)
 }
 
 export function ensureDreamLessonsColumn(db: DatabaseSync): void {

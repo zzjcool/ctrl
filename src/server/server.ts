@@ -8,6 +8,8 @@ import { createSqliteAgentMemory } from "../memory/agent-memory.ts"
 import { lastIndexedSeq } from "../memory/db.ts"
 import { DREAM_IDLE_MS, DREAM_TICK_MS, DreamController, lastDreamSeq } from "../memory/dream.ts"
 import { createMemoryIndex } from "../memory/index.ts"
+import { createRecordingLlm } from "../memory/usage.ts"
+import type { UsageKind } from "../memory/usage.ts"
 import { DEFAULT_CONTEXT_BUDGET } from "../memory/window.ts"
 import { SelfEditGate } from "../selfedit/gate.ts"
 import { createTools } from "../tools/index.ts"
@@ -67,7 +69,7 @@ export interface ServerConfig {
   selfEdit?: SelfEditConfig
   env?: NodeJS.ProcessEnv
 
-  createLlm?: (model: string) => LlmClient
+  createLlm?: (model: string, kind?: UsageKind) => LlmClient
 }
 
 export interface SelfEditConfig {
@@ -161,8 +163,11 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     env,
     createLlm:
       config.createLlm ??
-      ((requested: string) =>
-        createChatCompletionsClient({ model: requested || model, env, reasoningEffort, maxTokens })),
+      ((requested: string, kind: UsageKind = "turn") =>
+        createRecordingLlm(createChatCompletionsClient({ model: requested || model, env, reasoningEffort, maxTokens }), {
+          db: memory.handle(),
+          kind,
+        })),
   }
 
   ctx.selfEdit = new SelfEditGate({

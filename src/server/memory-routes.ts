@@ -8,12 +8,13 @@ import type { FocusItem } from "../memory/focus.ts"
 import { clampLimit } from "../memory/index.ts"
 import { addMemory, isMemoryKind, listMemories, tombstoneMemory } from "../memory/memories.ts"
 import type { MemoryRow } from "../memory/memories.ts"
+import { USAGE_MAX_DAYS, usageSummary } from "../memory/usage.ts"
 import { LOG_ID } from "./agents.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
 import { intParam, methodNotAllowed, notFound } from "./routes.ts"
 import type { AppContext } from "./routes.ts"
 
-const MEMORY_ROOT_PATHS = new Set(["/api/search", "/api/dreams", "/api/dream"])
+const MEMORY_ROOT_PATHS = new Set(["/api/search", "/api/dreams", "/api/dream", "/api/usage"])
 
 export function isMemoryPath(pathname: string, segments: string[]): boolean {
   return MEMORY_ROOT_PATHS.has(pathname) || segments[1] === "focus" || segments[1] === "memories"
@@ -37,6 +38,10 @@ export async function handleMemoryRoutes(
   }
   if (url.pathname === "/api/dream") {
     handleDream(response, ctx, method)
+    return
+  }
+  if (url.pathname === "/api/usage") {
+    handleUsage(response, ctx, url, method)
     return
   }
   if (segments[1] === "focus") {
@@ -231,6 +236,25 @@ function handleDream(response: ServerResponse, ctx: AppContext, method: string):
   sendJson(response, 202, { started: true })
 }
 
+function handleUsage(response: ServerResponse, ctx: AppContext, url: URL, method: string): void {
+  if (method !== "GET") {
+    methodNotAllowed(response, method)
+    return
+  }
+  const raw = (url.searchParams.get("days") ?? "").trim()
+  const days = raw === "" ? undefined : usageDays(raw)
+  const db = requireMemoryDb(ctx)
+  sendJson(response, 200, usageSummary(db, days !== undefined ? { days } : {}))
+}
+
+function usageDays(raw: string): number {
+  const invalid = new HttpError(400, `days must be an integer between 1 and ${USAGE_MAX_DAYS}`)
+  if (!/^\d+$/.test(raw)) throw invalid
+  const parsed = Number.parseInt(raw, 10)
+  if (parsed < 1 || parsed > USAGE_MAX_DAYS) throw invalid
+  return parsed
+}
+
 function focusView(item: FocusItem): Record<string, unknown> {
   return { id: item.id, text: item.text, state: item.state, updatedAt: item.updatedAt, seq: item.seq ?? null }
 }
@@ -263,7 +287,7 @@ export async function dreamOnce(ctx: AppContext): Promise<DreamResult> {
   const model = log.meta().model !== "" ? log.meta().model : ctx.defaultModel
   const llm: DreamLlm = {
     complete: async (request) => {
-      const client = ctx.createLlm(model)
+      const client = ctx.createLlm(model, "dream")
       return await client.complete(request)
     },
   }

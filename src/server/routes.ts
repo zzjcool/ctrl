@@ -4,6 +4,7 @@ import type { AgentMemory, LlmClient, MemoryKind, SessionEvent, ToolSpec } from 
 import type { JobRunner } from "../jobs/runner.ts"
 import type { DreamController } from "../memory/dream.ts"
 import type { MemoryIndex } from "../memory/index.ts"
+import type { UsageKind } from "../memory/usage.ts"
 import type { SelfEditGate } from "../selfedit/gate.ts"
 import { handleAgentRoutes } from "./agent-routes.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
@@ -35,7 +36,7 @@ export interface AppContext {
   selfEdit: SelfEditGate
   tools: ToolSpec[]
   env: NodeJS.ProcessEnv
-  createLlm: (model: string) => LlmClient
+  createLlm: (model: string, kind?: UsageKind) => LlmClient
 }
 
 const MEMORY_KINDS = new Set<MemoryKind>(["fact", "preference", "event", "skill"])

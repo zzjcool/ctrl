@@ -256,6 +256,23 @@ async function seedProposal(opts: {
   }
 }
 
+function localDay(at: Date): string {
+  const month = String(at.getMonth() + 1).padStart(2, "0")
+  const day = String(at.getDate()).padStart(2, "0")
+  return `${at.getFullYear()}-${month}-${day}`
+}
+
+async function seedUsage(promptTokens: number, completionTokens: number): Promise<void> {
+  const db = openMemoryDb(memoryDbPath(fixture.running.ctx.agentHome))
+  try {
+    db.prepare(
+      "INSERT INTO usage(id, ts, kind, model, prompt_tokens, completion_tokens, ms, ok) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+    ).run("contract-seed", new Date().toISOString(), "dream", "fake-model", promptTokens, completionTokens, 5)
+  } finally {
+    db.close()
+  }
+}
+
 before(async () => {
   const fake = await startFakeLlm()
   const root = await mkdtemp(path.join(tmpdir(), "ctrl-contract-root-"))
@@ -403,6 +420,35 @@ test("memories can be filtered by kind, and only by a kind that exists", async (
   const bogus = await api("GET", "/api/memories?kind=nonsense")
   assert.equal(bogus.status, 400, bogus.text)
   assert.match(bogus.text, /kind must be/)
+})
+
+test("GET /api/usage answers a zeroed window on a fresh ledger", async () => {
+  const reply = await api("GET", "/api/usage?days=3")
+  assert.equal(reply.status, 200, reply.text)
+  assert.deepEqual(Object.keys(reply.json).sort(), ["days", "today", "total"])
+  assert.deepEqual(reply.json.today, { calls: 0, promptTokens: 0, completionTokens: 0, ms: 0 })
+  assert.deepEqual(reply.json.total, { calls: 0, promptTokens: 0, completionTokens: 0, ms: 0 })
+  assert.equal(reply.json.days.length, 3)
+  for (const day of reply.json.days as Array<Record<string, any>>) {
+    assert.deepEqual(Object.keys(day).sort(), ["calls", "completionTokens", "date", "promptTokens"])
+    assert.equal(day.calls, 0)
+    assert.equal(day.promptTokens, 0)
+    assert.equal(day.completionTokens, 0)
+  }
+  assert.equal(reply.json.days.at(-1).date, localDay(new Date()))
+
+  const week = await api("GET", "/api/usage")
+  assert.equal(week.status, 200, week.text)
+  assert.equal(week.json.days.length, 7)
+})
+
+test("GET /api/usage only accepts days between 1 and 90", async () => {
+  for (const bad of ["abc", "0", "91", "-3", "1.5", "7days"]) {
+    const reply = await api("GET", `/api/usage?days=${bad}`)
+    assert.equal(reply.status, 400, `${bad}: ${reply.text}`)
+    assert.match(reply.json.error, /days must be an integer/)
+  }
+  assert.equal((await api("POST", "/api/usage")).status, 405)
 })
 
 test("machines and sessions are always 404", async () => {
@@ -654,4 +700,28 @@ test("discarding a proposal deletes its branch and marks it discarded", async ()
   assert.equal(red?.status, "discarded")
 
   assert.equal((await api("POST", "/api/proposals/green/discard")).status, 409)
+})
+
+test("the usage ledger counts every model call and buckets it by local day", async () => {
+  await seedUsage(1000, 2000)
+
+  const reply = await api("GET", "/api/usage?days=2")
+  assert.equal(reply.status, 200, reply.text)
+  assert.equal(reply.json.days.length, 2)
+  assert.ok(reply.json.total.calls >= 2, `expected the turns and the seed, got ${reply.json.total.calls}`)
+  assert.ok(reply.json.total.promptTokens >= 1000)
+  assert.ok(reply.json.total.completionTokens >= 2000)
+  assert.deepEqual(
+    reply.json.today,
+    {
+      calls: reply.json.total.calls,
+      promptTokens: reply.json.total.promptTokens,
+      completionTokens: reply.json.total.completionTokens,
+      ms: reply.json.today.ms,
+    },
+    "every call in a two day window landed today",
+  )
+  const summed = (reply.json.days as Array<Record<string, any>>).reduce((sum, day) => sum + day.calls, 0)
+  assert.equal(summed, reply.json.total.calls)
+  assert.ok(reply.json.days.at(-1).promptTokens >= 1000)
 })
