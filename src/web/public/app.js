@@ -18,7 +18,6 @@ const POLL_IDLE_MS = 2500
 
 const POLL_CATCHUP_MS = 60
 const NEAR_BOTTOM_PX = 120
-const STICK_WINDOW_MS = 2000
 const STICK_POLL_MS = 100
 const STICK_UP_PX = 2
 const MAX_INPUT_HEIGHT = 200
@@ -77,7 +76,6 @@ const state = {
   optimisticUntil: 0,
   connected: null,
   errors: 0,
-  nearBottom: true,
   stickToBottom: true,
   lastTimelineScrollTop: 0,
 
@@ -510,6 +508,7 @@ function applyJobs(data) {
 
   renderWorkers(alive)
   updateHead()
+  scheduleStickToBottom()
   return true
 }
 
@@ -989,6 +988,7 @@ function appendEvents(events) {
   for (const record of records) state.rows.push(record)
   if (state.pendingEl) els.rows.appendChild(state.pendingEl)
   scheduleTaskMeasure()
+  scheduleStickToBottom()
 }
 
 function prependEvents(events) {
@@ -1015,28 +1015,28 @@ function prependEvents(events) {
   els.rows.insertBefore(fragment, els.rows.firstElementChild)
   state.rows = records.concat(state.rows)
   scheduleTaskMeasure()
+  scheduleStickToBottom()
 }
 
 let stickObserver = null
-let stickStopTimer = 0
 let stickPoll = 0
 let stickFrame = 0
 
+function timelineGap() {
+  return els.timeline.scrollHeight - els.timeline.clientHeight - els.timeline.scrollTop
+}
+
 function scrollToBottom() {
+  if (stickFrame) {
+    window.cancelAnimationFrame(stickFrame)
+    stickFrame = 0
+  }
   els.timeline.scrollTop = els.timeline.scrollHeight
   state.lastTimelineScrollTop = els.timeline.scrollTop
 }
 
 function stopStickToBottom() {
   state.stickToBottom = false
-  if (stickObserver) {
-    stickObserver.disconnect()
-    stickObserver = null
-  }
-  if (stickStopTimer) {
-    window.clearTimeout(stickStopTimer)
-    stickStopTimer = 0
-  }
   if (stickPoll) {
     window.clearInterval(stickPoll)
     stickPoll = 0
@@ -1052,49 +1052,36 @@ function stickOnce() {
   scrollToBottom()
 }
 
+function scheduleStickToBottom() {
+  if (!state.stickToBottom || stickFrame) return
+  stickFrame = window.requestAnimationFrame(() => {
+    stickFrame = 0
+    stickOnce()
+  })
+}
+
 function noteTimelineScroll() {
   const top = els.timeline.scrollTop
-  if (state.stickToBottom && top < state.lastTimelineScrollTop - STICK_UP_PX) stopStickToBottom()
+  if (top < state.lastTimelineScrollTop - STICK_UP_PX) {
+    stopStickToBottom()
+  } else if (!state.stickToBottom && timelineGap() < NEAR_BOTTOM_PX) {
+    state.stickToBottom = true
+    watchTimelineGrowth()
+  }
   state.lastTimelineScrollTop = top
 }
 
 function watchTimelineGrowth() {
-  if (!state.stickToBottom) return
-  if (stickStopTimer) window.clearTimeout(stickStopTimer)
   if (typeof ResizeObserver === "function") {
-    if (stickObserver) stickObserver.disconnect()
-    stickObserver = new ResizeObserver(() => {
-      if (!state.stickToBottom || stickFrame) return
-      stickFrame = window.requestAnimationFrame(() => {
-        stickFrame = 0
-        stickOnce()
-      })
-    })
-    stickObserver.observe(els.rows)
-  } else if (!stickPoll) {
-    stickPoll = window.setInterval(stickOnce, STICK_POLL_MS)
+    if (!stickObserver) {
+      stickObserver = new ResizeObserver(() => scheduleStickToBottom())
+      stickObserver.observe(els.rows)
+    }
+    return
   }
-  stickStopTimer = window.setTimeout(() => {
-    stickStopTimer = 0
-    if (stickObserver) {
-      stickObserver.disconnect()
-      stickObserver = null
-    }
-    if (stickPoll) {
-      window.clearInterval(stickPoll)
-      stickPoll = 0
-    }
-  }, STICK_WINDOW_MS)
-}
-
-function scheduleStickToBottom() {
-  scrollToBottom()
-  window.requestAnimationFrame(() => {
-    window.requestAnimationFrame(() => {
-      stickOnce()
-      watchTimelineGrowth()
-    })
-  })
+  if (!stickPoll && state.stickToBottom) {
+    stickPoll = window.setInterval(scheduleStickToBottom, STICK_POLL_MS)
+  }
 }
 
 function updateLoadEarlier() {
@@ -2030,7 +2017,8 @@ async function sendMessage() {
     autosize()
     state.turn = { running: true, startedAt: new Date().toISOString() }
     state.optimisticUntil = Date.now() + 1500
-    state.nearBottom = true
+    state.stickToBottom = true
+    scheduleStickToBottom()
     syncPending()
     updateComposer()
     updateHead()
@@ -2076,6 +2064,7 @@ async function loadTail() {
     if (total !== null) state.eventCount = Math.max(state.eventCount, total)
     const events = Array.isArray(data && data.events) ? data.events : []
     appendEvents(events)
+    scrollToBottom()
   } catch (error) {
     toast(`历史加载失败：${messageOf(error)}`)
   }
@@ -2136,7 +2125,7 @@ async function pollOnce() {
     const events = Array.isArray(data && data.events) ? data.events : []
     if (events.length) {
       appendEvents(events)
-      if (state.nearBottom) scrollToBottom()
+      if (state.stickToBottom) scheduleStickToBottom()
     }
     const total = numberOf(data && data.total)
     if (total !== null) state.eventCount = Math.max(state.eventCount, total, state.since)
@@ -2204,8 +2193,6 @@ async function tryLoadAgent() {
     updateLoadEarlier()
     syncPending()
     updateComposer()
-    state.nearBottom = true
-    state.stickToBottom = true
     scheduleStickToBottom()
     return true
   } catch {
@@ -2215,6 +2202,8 @@ async function tryLoadAgent() {
 }
 
 function bind() {
+  watchTimelineGrowth()
+
   els.composer.addEventListener("submit", (event) => {
     event.preventDefault()
     if (state.turn && state.turn.running) void abortTurn()
@@ -2406,15 +2395,7 @@ function bind() {
     if (document.body.classList.contains("panel-open")) setPanelOpen(false)
   })
 
-  els.timeline.addEventListener(
-    "scroll",
-    () => {
-      noteTimelineScroll()
-      const gap = els.timeline.scrollHeight - els.timeline.scrollTop - els.timeline.clientHeight
-      state.nearBottom = gap < NEAR_BOTTOM_PX
-    },
-    { passive: true },
-  )
+  els.timeline.addEventListener("scroll", noteTimelineScroll, { passive: true })
 
   els.rows.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null

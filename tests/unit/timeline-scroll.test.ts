@@ -22,24 +22,13 @@ function constantOf(name: string): string {
 }
 
 const scrollerSource = sliceFrom("let stickObserver", "function updateLoadEarlier")
-const constantsSource = ["STICK_WINDOW_MS", "STICK_POLL_MS", "STICK_UP_PX"].map(constantOf).join("\n")
+const tailSource = sliceFrom("async function loadTail", "async function loadEarlier")
+const bootSource = sliceFrom("async function tryLoadAgent", "function bind")
+const constantsSource = ["NEAR_BOTTOM_PX", "STICK_POLL_MS", "STICK_UP_PX"].map(constantOf).join("\n")
 
-type Scroller = {
-  els: { timeline: { scrollTop: number; scrollHeight: number; clientHeight: number }; rows: object }
-  state: { stickToBottom: boolean; lastTimelineScrollTop: number }
-  scrollToBottom: () => void
-  stopStickToBottom: () => void
-  stickOnce: () => void
-  noteTimelineScroll: () => void
-  watchTimelineGrowth: () => void
-  scheduleStickToBottom: () => void
-  frames: Map<number, () => void>
-  timeouts: Map<number, () => void>
-  intervals: Map<number, () => void>
-  observers: FakeResizeObserver[]
-  flushFrames: () => void
-  runTimeouts: () => void
-}
+type Timeline = { scrollTop: number; scrollHeight: number; clientHeight: number }
+
+type State = { stickToBottom: boolean; lastTimelineScrollTop: number; eventCount?: number; loaded?: boolean }
 
 type FakeResizeObserver = {
   callback: () => void
@@ -50,7 +39,30 @@ type FakeResizeObserver = {
   fire: () => void
 }
 
-function harness(options: { resizeObserver: boolean }): Scroller {
+type Observed = {
+  els: { timeline: Timeline; rows: object }
+  state: State
+  frames: Map<number, () => void>
+  timeouts: Map<number, () => void>
+  intervals: Map<number, () => void>
+  observers: FakeResizeObserver[]
+  runTimeouts: () => void
+  runIntervals: () => void
+  flushFrames: () => void
+}
+
+type ScrollerApi = {
+  scrollToBottom: () => void
+  stopStickToBottom: () => void
+  stickOnce: () => void
+  scheduleStickToBottom: () => void
+  noteTimelineScroll: () => void
+  watchTimelineGrowth: () => void
+}
+
+type Scroller = Observed & ScrollerApi
+
+function fakes(options: { timeline?: Partial<Timeline>; state?: Partial<State> }) {
   const frames = new Map<number, () => void>()
   const timeouts = new Map<number, () => void>()
   const intervals = new Map<number, () => void>()
@@ -104,41 +116,170 @@ function harness(options: { resizeObserver: boolean }): Scroller {
   }
 
   const els = {
-    timeline: { scrollTop: 0, scrollHeight: 5000, clientHeight: 641 },
+    timeline: { scrollTop: 0, scrollHeight: 641, clientHeight: 641, ...(options.timeline || {}) },
     rows: {},
   }
-  const state = { stickToBottom: true, lastTimelineScrollTop: 0 }
+  const state: State = { stickToBottom: true, lastTimelineScrollTop: 0, ...(options.state || {}) }
 
+  const observed: Observed = {
+    els,
+    state,
+    frames,
+    timeouts,
+    intervals,
+    observers,
+    runTimeouts: () => {
+      const pending = [...timeouts.values()]
+      timeouts.clear()
+      for (const callback of pending) callback()
+    },
+    runIntervals: () => {
+      for (const callback of [...intervals.values()]) callback()
+    },
+    flushFrames: () => {
+      for (let guard = 0; guard < 10 && frames.size > 0; guard += 1) {
+        const pending = [...frames.values()]
+        frames.clear()
+        for (const callback of pending) callback()
+      }
+    },
+  }
+
+  return { observed, fakeWindow, Observer }
+}
+
+function harness(options: {
+  resizeObserver: boolean
+  timeline?: Partial<Timeline>
+  state?: Partial<State>
+}): Scroller {
+  const { observed, fakeWindow, Observer } = fakes(options)
   const body = [
     constantsSource,
     scrollerSource,
-    "return { scrollToBottom, stopStickToBottom, stickOnce, noteTimelineScroll, watchTimelineGrowth, scheduleStickToBottom }",
+    "return { scrollToBottom, stopStickToBottom, stickOnce, scheduleStickToBottom, noteTimelineScroll, watchTimelineGrowth }",
   ].join("\n")
 
   const factory = new Function("els", "state", "window", "ResizeObserver", body) as (
-    els: Scroller["els"],
-    state: Scroller["state"],
+    els: Observed["els"],
+    state: State,
     window: object,
     ResizeObserver: unknown,
-  ) => Omit<Scroller, "els" | "state" | "frames" | "timeouts" | "intervals" | "observers" | "flushFrames">
+  ) => ScrollerApi
 
-  const api = factory(els, state, fakeWindow, options.resizeObserver ? Observer : undefined)
+  const api = factory(observed.els, observed.state, fakeWindow, options.resizeObserver ? Observer : undefined)
+  return { ...observed, ...api }
+}
 
-  const flushFrames = () => {
-    for (let guard = 0; guard < 10 && frames.size > 0; guard += 1) {
-      const pending = [...frames.values()]
-      frames.clear()
-      for (const callback of pending) callback()
-    }
-  }
+function tailHarness(options: { timeline?: Partial<Timeline>; state?: Partial<State> }) {
+  const { observed, fakeWindow, Observer } = fakes(options)
+  const calls: string[] = []
+  const body = [constantsSource, scrollerSource, tailSource, "return { loadTail }"].join("\n")
 
-  const runTimeouts = () => {
-    const pending = [...timeouts.values()]
-    timeouts.clear()
-    for (const callback of pending) callback()
-  }
+  const factory = new Function(
+    "els",
+    "state",
+    "window",
+    "ResizeObserver",
+    "api",
+    "numberOf",
+    "appendEvents",
+    "toast",
+    "messageOf",
+    "TAIL",
+    body,
+  ) as (
+    els: Observed["els"],
+    state: State,
+    window: object,
+    ResizeObserver: unknown,
+    api: (path: string) => Promise<unknown>,
+    numberOf: (value: unknown) => number | null,
+    appendEvents: (events: unknown) => void,
+    toast: (message: string) => void,
+    messageOf: (error: unknown) => string,
+    TAIL: number,
+  ) => { loadTail: () => Promise<void> }
 
-  return { ...api, els, state, frames, timeouts, intervals, observers, flushFrames, runTimeouts }
+  const api = factory(
+    observed.els,
+    observed.state,
+    fakeWindow,
+    Observer,
+    async () => ({ total: 3, events: [{ id: 1 }] }),
+    (value) => (typeof value === "number" ? value : null),
+    (events) => {
+      calls.push("appendEvents")
+      if (Array.isArray(events) && events.length) observed.els.timeline.scrollHeight = 14468
+    },
+    (message) => calls.push(`toast:${message}`),
+    (error) => String(error),
+    100,
+  )
+  return { ...observed, ...api, calls }
+}
+
+function bootHarness(options: { timeline?: Partial<Timeline>; state?: Partial<State> }) {
+  const { observed, fakeWindow, Observer } = fakes(options)
+  const calls: string[] = []
+  const body = [constantsSource, scrollerSource, bootSource, "return { tryLoadAgent }"].join("\n")
+
+  const stubbed = [
+    "api",
+    "applyAgent",
+    "loadTail",
+    "refreshJobs",
+    "refreshProposals",
+    "refreshFocus",
+    "renderDream",
+    "updateHead",
+    "updateEmpty",
+    "updateLoadEarlier",
+    "syncPending",
+    "updateComposer",
+    "setConnected",
+  ]
+  const factory = new Function(
+    "els",
+    "state",
+    "window",
+    "ResizeObserver",
+    ...stubbed,
+    body,
+  ) as (
+    els: Observed["els"],
+    state: State,
+    window: object,
+    ResizeObserver: unknown,
+    ...stubs: unknown[]
+  ) => { tryLoadAgent: () => Promise<boolean> }
+
+  const stubs = [
+    async () => ({}),
+    () => calls.push("applyAgent"),
+    async () => calls.push("loadTail"),
+    async () => calls.push("refreshJobs"),
+    async () => calls.push("refreshProposals"),
+    () => calls.push("refreshFocus"),
+    () => calls.push("renderDream"),
+    () => calls.push("updateHead"),
+    () => calls.push("updateEmpty"),
+    () => calls.push("updateLoadEarlier"),
+    () => calls.push("syncPending"),
+    () => calls.push("updateComposer"),
+    () => calls.push("setConnected"),
+  ]
+
+  const api = factory(observed.els, observed.state, fakeWindow, Observer, ...stubs)
+  return { ...observed, ...api, calls }
+}
+
+function initialState(): Record<string, unknown> {
+  const start = appJs.indexOf("const state = {")
+  assert.ok(start >= 0, "app.js must declare the state object")
+  const end = appJs.indexOf("\n}\n", start)
+  assert.ok(end > start, "app.js must close the state object")
+  return new Function(`${appJs.slice(start, end + 2)}\nreturn state`)() as Record<string, unknown>
 }
 
 test("refresh always jumps to the newest message because scroll restoration is manual", () => {
@@ -154,31 +295,43 @@ test("refresh always jumps to the newest message because scroll restoration is m
   assert.equal(legacy.scrollRestoration, undefined, "old browsers must be left alone")
 })
 
-test("the first render re-pins the timeline after layout settles and keeps following growth", () => {
-  const scroller = harness({ resizeObserver: true })
-  assert.equal(scroller.els.timeline.scrollTop, 0, "jsdom starts at the top")
-
-  scroller.scheduleStickToBottom()
-  assert.equal(scroller.els.timeline.scrollTop, 5000, "the immediate scroll must already jump to the bottom")
-  assert.equal(scroller.els.timeline.scrollTop, scroller.els.timeline.scrollHeight)
-
-  scroller.flushFrames()
-  assert.equal(scroller.observers.length, 1, "a ResizeObserver must watch for late layout growth")
-  assert.equal(scroller.observers[0].target, scroller.els.rows, "the observer must watch rows, not the timeline")
-  assert.equal(scroller.timeouts.size, 1, "the 2s stick window must be scheduled")
-
-  scroller.els.timeline.scrollHeight = 5610
-  scroller.observers[0].fire()
-  scroller.flushFrames()
-  assert.equal(scroller.els.timeline.scrollTop, 5610, "content that grows after first paint must be followed to the bottom")
-
-  scroller.runTimeouts()
-  assert.equal(scroller.observers[0].disconnected, true, "the observer must be disconnected when the window closes")
-  assert.equal(scroller.timeouts.size, 0, "the window timer must not stay armed")
+test("the stick flag starts on and only the reader may turn it off", () => {
+  const initial = initialState()
+  assert.equal(initial.stickToBottom, true, "an untouched timeline follows the newest message")
+  assert.equal("nearBottom" in initial, false, "there is only one flag: nearBottom must not come back")
+  assert.equal(appJs.includes("nearBottom"), false, "no code may read or write nearBottom anymore")
+  assert.equal(appJs.includes("STICK_WINDOW_MS"), false, "the 2s stick window must be gone")
 })
 
-test("a manual upward swipe wins: no later resize may steal the scrollbar", () => {
+test("slow data that lands after 9s still snaps to the bottom because the stick never expires", () => {
   const scroller = harness({ resizeObserver: true })
+  scroller.watchTimelineGrowth()
+  assert.equal(scroller.observers.length, 1, "a ResizeObserver must watch for layout growth")
+  assert.equal(scroller.observers[0].target, scroller.els.rows, "the observer must watch rows, not the timeline")
+  assert.equal(scroller.timeouts.size, 0, "no expiry timer may be armed")
+
+  scroller.els.timeline.scrollTop = 0
+  assert.equal(
+    scroller.els.timeline.scrollHeight,
+    scroller.els.timeline.clientHeight,
+    "the empty container is already at the bottom",
+  )
+
+  scroller.runTimeouts()
+  assert.equal(scroller.observers[0].disconnected, false, "no timeout may ever disconnect the observer")
+  assert.equal(scroller.state.stickToBottom, true, "waiting for data must not drop the stick")
+
+  scroller.els.timeline.scrollHeight = 14468
+  scroller.observers[0].fire()
+  scroller.flushFrames()
+  assert.equal(scroller.els.timeline.scrollTop, 14468, "rows that grow after 9s must still be followed to the bottom")
+  assert.equal(scroller.state.stickToBottom, true, "late growth keeps the stick on")
+  assert.equal(scroller.observers[0].disconnected, false, "the observer stays alive for the next growth")
+})
+
+test("a manual upward swipe drops the stick and later growth must not steal the scrollbar", () => {
+  const scroller = harness({ resizeObserver: true, timeline: { scrollHeight: 5000 } })
+  scroller.watchTimelineGrowth()
   scroller.scheduleStickToBottom()
   scroller.flushFrames()
   assert.equal(scroller.els.timeline.scrollTop, 5000)
@@ -186,27 +339,86 @@ test("a manual upward swipe wins: no later resize may steal the scrollbar", () =
   scroller.els.timeline.scrollTop = 4000
   scroller.noteTimelineScroll()
   assert.equal(scroller.state.stickToBottom, false, "scrolling up must drop the stick flag")
-  assert.equal(scroller.observers[0].disconnected, true, "scrolling up must disconnect the observer")
-  assert.equal(scroller.timeouts.size, 0, "scrolling up must clear the window timer")
   assert.equal(scroller.state.lastTimelineScrollTop, 4000, "the last seen position must be recorded")
+  assert.equal(scroller.observers[0].disconnected, false, "the observer must stay alive, the flag decides instead")
+
+  scroller.scheduleStickToBottom()
+  assert.equal(scroller.frames.size, 0, "a dropped stick must not queue a scroll frame")
 
   scroller.els.timeline.scrollHeight = 9000
   scroller.observers[0].fire()
   scroller.flushFrames()
-  assert.equal(scroller.els.timeline.scrollTop, 4000, "a disabled stick must never move the scrollbar again")
+  assert.equal(scroller.els.timeline.scrollTop, 4000, "a dropped stick must never move the scrollbar again")
+  assert.equal(scroller.state.stickToBottom, false)
 })
 
-test("without ResizeObserver the stick degrades to a 100ms interval that stops after 2s", () => {
-  const scroller = harness({ resizeObserver: false })
-  scroller.scheduleStickToBottom()
+test("scrolling back to the bottom re-arms the stick", () => {
+  const scroller = harness({
+    resizeObserver: true,
+    timeline: { scrollTop: 4000, scrollHeight: 5000, clientHeight: 641 },
+    state: { stickToBottom: false, lastTimelineScrollTop: 4000 },
+  })
+  scroller.watchTimelineGrowth()
+
+  scroller.els.timeline.scrollTop = 4340
+  scroller.noteTimelineScroll()
+  assert.equal(scroller.state.stickToBottom, true, "a gap under NEAR_BOTTOM_PX re-arms the stick")
+
+  scroller.els.timeline.scrollHeight = 9000
+  scroller.observers[0].fire()
   scroller.flushFrames()
+  assert.equal(scroller.els.timeline.scrollTop, 9000, "the re-armed stick follows the next growth")
+})
+
+test("the first loadTail always snaps to the bottom, even if the flag was somehow off", async () => {
+  for (const stickToBottom of [true, false]) {
+    const tail = tailHarness({
+      timeline: { scrollTop: 0, scrollHeight: 641, clientHeight: 641 },
+      state: { stickToBottom, lastTimelineScrollTop: 0 },
+    })
+    await tail.loadTail()
+    assert.deepEqual(tail.calls, ["appendEvents"], "loadTail must render the tail before pinning")
+    assert.equal(tail.els.timeline.scrollTop, 14468, `loadTail must pin unconditionally (stick=${stickToBottom})`)
+    assert.equal(tail.state.lastTimelineScrollTop, 14468, "the pin must record the new position")
+  }
+})
+
+test("a slow boot must not resurrect the stick after the reader scrolled up", async () => {
+  for (const stickToBottom of [true, false]) {
+    const boot = bootHarness({
+      timeline: { scrollTop: 4000, scrollHeight: 9000, clientHeight: 641 },
+      state: { stickToBottom, lastTimelineScrollTop: 4000, eventCount: 5 },
+    })
+    assert.equal(await boot.tryLoadAgent(), true, "the boot load must report success")
+    assert.ok(boot.calls.includes("loadTail"), "the boot must render the tail")
+    assert.equal(boot.state.stickToBottom, stickToBottom, "boot must leave the reader's intent alone")
+
+    boot.flushFrames()
+    const expected = stickToBottom ? 9000 : 4000
+    assert.equal(boot.els.timeline.scrollTop, expected, `boot must only pin when the stick is on (stick=${stickToBottom})`)
+  }
+})
+
+test("without ResizeObserver the fallback poll runs until the reader scrolls up, then re-arms at the bottom", () => {
+  const scroller = harness({ resizeObserver: false, timeline: { scrollHeight: 5000, clientHeight: 641 } })
+  scroller.watchTimelineGrowth()
   assert.equal(scroller.observers.length, 0, "no ResizeObserver may be constructed when it is missing")
   assert.equal(scroller.intervals.size, 1, "the fallback must poll")
+  assert.equal(scroller.timeouts.size, 0, "the fallback must not be killed by a timeout")
 
   scroller.els.timeline.scrollHeight = 5610
-  for (const callback of [...scroller.intervals.values()]) callback()
+  scroller.runIntervals()
+  scroller.flushFrames()
   assert.equal(scroller.els.timeline.scrollTop, 5610, "the fallback poll must pin the timeline to the bottom")
+  assert.equal(scroller.intervals.size, 1, "the fallback keeps polling after growth")
 
-  scroller.runTimeouts()
-  assert.equal(scroller.intervals.size, 0, "the fallback poll must be cleared when the window closes")
+  scroller.els.timeline.scrollTop = 4000
+  scroller.noteTimelineScroll()
+  assert.equal(scroller.state.stickToBottom, false)
+  assert.equal(scroller.intervals.size, 0, "scrolling up must stop the fallback poll")
+
+  scroller.els.timeline.scrollTop = 4969
+  scroller.noteTimelineScroll()
+  assert.equal(scroller.state.stickToBottom, true, "returning to the bottom must re-arm the flag")
+  assert.equal(scroller.intervals.size, 1, "returning to the bottom must restart the fallback poll")
 })
