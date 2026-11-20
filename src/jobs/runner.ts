@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "node:child_process"
+import { spawn } from "node:child_process"
 import { providerExtensionPath } from "./pi-extensions.ts"
 import type { ChildProcess } from "node:child_process"
 import { accessSync, constants as fsConstants, closeSync, existsSync, openSync, statSync, writeFileSync } from "node:fs"
@@ -24,7 +24,7 @@ export const DEFAULT_MAX_WORKERS = 3
 
 export const DEFAULT_JOB_TIMEOUT_MINUTES = 15
 
-export const DEFAULT_STALL_MINUTES = 4
+export const DEFAULT_STALL_MINUTES = 8
 
 export const STALL_GRACE_MS = 120_000
 
@@ -298,22 +298,11 @@ export class JobRunner {
       if (lastWrite === undefined) continue
       const quietMs = now - lastWrite
       if (quietMs <= stallMs) continue
-      if (hasDescendants(job.pid)) continue
       appendNote(logPath, `ctrl: no output for ${Math.floor(quietMs / 60_000)}m — stopped`)
       const reply = await this.stop(job.id)
       if (reply.ok) stopped.push(job.id)
     }
     return stopped
-  }
-}
-
-function hasDescendants(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false
-  try {
-    const out = execFileSync("pgrep", ["-P", String(pid)], { encoding: "utf8", timeout: 2_000 })
-    return out.trim() !== ""
-  } catch {
-    return false
   }
 }
 

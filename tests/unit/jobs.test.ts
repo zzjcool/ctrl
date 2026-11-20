@@ -34,10 +34,6 @@ while [ "$i" -lt "\${FAKE_PI_LINES:-0}" ]; do
   printf 'line %s\\n' "$i"
   i=$((i+1))
 done
-if [ -n "$FAKE_PI_CHILD" ]; then
-  sleep 60 &
-  sleep 60
-fi
 if [ -n "$FAKE_PI_IGNORE_TERM" ]; then
   trap '' TERM
   while :; do sleep 1; done
@@ -53,7 +49,7 @@ printf 'done\\n'
 exit "\${FAKE_PI_EXIT:-0}"
 `
 
-const ENV_KEYS = ["FAKE_PI_EXIT", "FAKE_PI_SLEEP", "FAKE_PI_LINES", "FAKE_PI_BIG", "FAKE_PI_STDERR", "FAKE_PI_IGNORE_TERM", "FAKE_PI_CHILD"] as const
+const ENV_KEYS = ["FAKE_PI_EXIT", "FAKE_PI_SLEEP", "FAKE_PI_LINES", "FAKE_PI_BIG", "FAKE_PI_STDERR", "FAKE_PI_IGNORE_TERM"] as const
 type EnvKey = (typeof ENV_KEYS)[number]
 
 const savedEnv = new Map<EnvKey, string | undefined>(ENV_KEYS.map((key) => [key, process.env[key]]))
@@ -488,7 +484,7 @@ test("a worker that stopped writing its log is killed by the stall sweep, and it
   const runner = makeRunner()
   const work = await scratchDir("ctrl-jobs-work-")
   try {
-    assert.equal(runner.stallMinutes, 4)
+    assert.equal(runner.stallMinutes, 8)
     const reply = runner.delegate({ task: "go quiet" }, work)
     const id = idOf(reply.output)
     const pid = readJobMeta(agentHome, id)?.pid ?? 0
@@ -801,23 +797,3 @@ test("the jobs API renders the stream instead of leaking raw pi JSON", async () 
   assert.match(output, /assistant: done/)
 })
 
-test("a quiet worker that still has a live child is not called stalled", async () => {
-  setEnv({ FAKE_PI_CHILD: "1" })
-  const runner = makeRunner()
-  const work = await scratchDir("ctrl-jobs-work-")
-  try {
-    const reply = runner.delegate({ task: "screenshotting" }, work)
-    const id = idOf(reply.output)
-    await waitForLog(id, "args: -p screenshotting")
-
-    const quietSince = new Date(Date.now() - 10 * 60_000)
-    await utimes(jobPaths(agentHome, id).logPath, quietSince, quietSince)
-    updateJobMeta(agentHome, id, { startedAt: quietSince.toISOString() })
-
-    assert.deepEqual(await runner.sweepStalls(), [], "a busy child process is progress, not silence")
-    assert.equal(readJob(agentHome, id)?.state, "running")
-    await runner.stop(id)
-  } finally {
-    setEnv({})
-  }
-})
