@@ -35,6 +35,8 @@ export type { BuildToolsOptions } from "../../../pi-durable/src/core/tools.ts"
 
 export { appendRecord, readRecords } from "../../../pi-durable/src/core/jsonl.ts"
 
+export { makeUserMessage } from "../../../pi-durable/src/core/events.ts"
+
 export type {
   EventOf,
   JsonSchema,

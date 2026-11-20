@@ -45,6 +45,23 @@ const MEMORY_KINDS = new Set<MemoryKind>(["fact", "preference", "event", "skill"
 
 export const MAX_EVENTS_PER_CALL = 200
 
+/**
+ * Job lifecycle is not conversation, but a wake turn has to reach the agent
+ * through the log. Such a user_message is tagged with this kind on the way in;
+ * the conversation view drops tagged events and /api/jobs stays the one place
+ * job state lives. Untagged (historical) wake messages keep rendering as before.
+ */
+export const JOB_MESSAGE_KIND = "job"
+
+export function isJobLifecycleMessage(event: SessionEvent): boolean {
+  return event.type === "user_message" && (event.data as { kind?: unknown }).kind === JOB_MESSAGE_KIND
+}
+
+/** Session-view slice of a log page: everything except job lifecycle. */
+export function conversationEvents(events: SessionEvent[]): SessionEvent[] {
+  return events.filter((event) => !isJobLifecycleMessage(event))
+}
+
 export interface EventPage {
   events: SessionEvent[]
   total: number

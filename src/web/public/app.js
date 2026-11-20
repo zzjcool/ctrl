@@ -857,6 +857,9 @@ function buildRow(event) {
 
   switch (type) {
     case "user_message": {
+      // Job lifecycle belongs to the jobs panel; /api/agent/events?view=conversation
+      // already drops it, this keeps a stale/unfiltered payload from leaking in.
+      if (data.kind === "job") return null
       const text = String(data.text ?? "")
       if (!text.trim()) return null
       if (text.startsWith("[ctrl]")) {
@@ -1886,7 +1889,7 @@ async function abortTurn() {
 
 async function loadTail() {
   try {
-    const data = await api(`/events?tail=${TAIL}`)
+    const data = await api(`/events?tail=${TAIL}&view=conversation`)
     const total = numberOf(data && data.total)
     if (total !== null) state.eventCount = Math.max(state.eventCount, total)
     const events = Array.isArray(data && data.events) ? data.events : []
@@ -1904,7 +1907,7 @@ async function loadEarlier() {
   updateLoadEarlier()
   const offset = els.timeline.scrollHeight - els.timeline.scrollTop
   try {
-    const data = await api(`/events?before=${before}&tail=${TAIL}`)
+    const data = await api(`/events?before=${before}&tail=${TAIL}&view=conversation`)
     const events = Array.isArray(data && data.events) ? data.events : []
     const total = numberOf(data && data.total)
     if (total !== null) state.eventCount = Math.max(state.eventCount, total)
@@ -1940,7 +1943,7 @@ async function pollOnce() {
   let next = POLL_IDLE_MS
   try {
     const [data, jobsData, proposalsData] = await Promise.all([
-      api(`/events?since=${since}`),
+      api(`/events?since=${since}&view=conversation`),
       request(JOBS_API).catch(() => null),
       request(PROPOSALS_API).catch(() => null),
     ])
