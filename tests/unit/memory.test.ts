@@ -542,14 +542,14 @@ test("a long tool result is flattened to one line in the transcript", async () =
   }
 })
 
-test("the tool set is six: the three job tools, search_context, remember and recall", async () => {
+test("the tool set is seven: the three job tools, search_context, focus_set, remember and recall", async () => {
   const bag = await open()
   try {
     const runner = new JobRunner({ agentHome: bag.home, model: "fake-model", thinking: "max" })
     const tools = createTools({ agentHome: bag.home, runner, memory: bag.index })
     assert.deepEqual(
       tools.map((tool) => tool.name),
-      ["delegate", "job_status", "job_stop", "search_context", "remember", "recall"],
+      ["delegate", "job_status", "job_stop", "search_context", "focus_set", "remember", "recall"],
     )
 
     const search = tools.find((tool) => tool.name === "search_context")

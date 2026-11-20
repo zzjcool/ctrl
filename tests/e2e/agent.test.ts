@@ -620,6 +620,133 @@ test("/api/search finds older turns through the SQLite mirror", async () => {
   assert.equal((await api("POST", "/api/search?q=x")).status, 405)
 })
 
+/** Poll `/api/dreams` until `count` runs are recorded (a dream is detached). */
+async function waitForDreams(count: number, timeoutMs = 8000): Promise<Record<string, any>[]> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const reply = await api("GET", "/api/dreams")
+    assert.equal(reply.status, 200, reply.text)
+    const runs = reply.json.runs as Record<string, any>[]
+    if (runs.length >= count) return runs
+    if (Date.now() > deadline) throw new Error(`expected ${count} dream runs, got ${JSON.stringify(runs)}`)
+    await new Promise((resolve) => setTimeout(resolve, 40))
+  }
+}
+
+test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.1)", async () => {
+  // --- focus: create, move, list, close -------------------------------------
+  const created = await api("POST", "/api/focus", { text: "实现 M4 面板" })
+  assert.equal(created.status, 200, created.text)
+  const focusId = created.json.item.id as string
+  assert.deepEqual(Object.keys(created.json.item).sort(), ["id", "seq", "state", "text", "updatedAt"])
+  assert.equal(created.json.item.state, "open")
+  assert.equal(created.json.item.seq, null)
+
+  const moved = await api("POST", "/api/focus", { id: focusId, state: "doing" })
+  assert.equal(moved.status, 200, moved.text)
+  assert.equal(moved.json.item.state, "doing")
+  assert.equal(moved.json.item.text, "实现 M4 面板")
+
+  const listed = await api("GET", "/api/focus")
+  assert.equal(listed.status, 200, listed.text)
+  assert.ok(
+    (listed.json.items as Array<Record<string, any>>).some((item) => item.id === focusId && item.state === "doing"),
+    "the item is in the panel",
+  )
+  assert.equal((await api("POST", "/api/focus", {})).status, 400, "text or id is required")
+  assert.equal((await api("POST", "/api/focus", { text: "x", state: "nonsense" })).status, 400)
+
+  // --- memories: write, search, tombstone -----------------------------------
+  const memory = await api("POST", "/api/memories", {
+    text: "面板用 focus 和 memories 两块数据",
+    kind: "decision",
+    tags: ["m4"],
+    importance: 0.7,
+  })
+  assert.equal(memory.status, 201, memory.text)
+  const memoryId = memory.json.memory.id as string
+  assert.equal(memory.json.memory.kind, "decision")
+  assert.deepEqual(memory.json.memory.tags, ["m4"])
+  assert.equal(memory.json.memory.importance, 0.7)
+
+  const found = await api("GET", `/api/memories?query=${encodeURIComponent("面板")}`)
+  assert.equal(found.status, 200, found.text)
+  assert.equal(found.json.count, found.json.memories.length)
+  assert.ok((found.json.memories as Array<Record<string, any>>).some((row) => row.id === memoryId))
+
+  // A duplicate is merged, not added twice (normalised text).
+  const duplicate = await api("POST", "/api/memories", { text: "  面板用 focus 和 memories 两块数据。 " })
+  assert.equal(duplicate.status, 201, duplicate.text)
+  assert.equal(duplicate.json.memory.id, memoryId, "same memory, same id")
+
+  assert.equal((await api("POST", "/api/memories", { text: "  " })).status, 400)
+  assert.equal((await api("POST", "/api/memories", { text: "x", kind: "nonsense" })).status, 400)
+
+  // --- a dream, triggered by hand, parsed from a fenced reply ---------------
+  fixture.fake.reset()
+  const dreamPayload = {
+    memories: [{ kind: "fact", text: "做梦写下的记忆", tags: ["dream"], importance: 0.6 }],
+    focus: [{ text: "整理记忆", state: "open" }],
+    profileRewrite: "# Profile\n\n- 用户说中文",
+  }
+  fixture.fake.push({ content: `好的：\n\`\`\`json\n${JSON.stringify(dreamPayload)}\n\`\`\`` })
+
+  const started = await api("POST", "/api/dream")
+  assert.equal(started.status, 202, started.text)
+  assert.deepEqual(started.json, { started: true })
+  // Starting a second dream while the first is in flight is 409, not a queue.
+  const concurrent = await api("POST", "/api/dream")
+  assert.ok(concurrent.status === 409 || concurrent.status === 202, concurrent.text)
+
+  const runs = await waitForDreams(1)
+  assert.equal(runs[0]?.added, 1, JSON.stringify(runs[0]))
+  assert.equal(runs[0]?.error, undefined)
+  assert.deepEqual(
+    Object.keys(runs[0] ?? {}).sort(),
+    ["added", "endedAt", "fromSeq", "id", "merged", "startedAt", "superseded", "toSeq"],
+  )
+
+  const afterDream = await api("GET", "/api/memories")
+  assert.ok(
+    (afterDream.json.memories as Array<Record<string, any>>).some((row) => row.text === "做梦写下的记忆"),
+    afterDream.text,
+  )
+  const profile = await readFile(path.join(fixture.root, "agents", AGENT, "profile.md"), "utf8")
+  assert.match(profile, /用户说中文/)
+  assert.equal((await api("GET", "/api/dreams?limit=1")).json.runs.length, 1)
+
+  // --- `/api/agent` carries the numbers the head shows ----------------------
+  const detail = await api("GET", "/api/agent")
+  assert.equal(detail.status, 200, detail.text)
+  assert.equal(typeof detail.json.memory.memories, "number")
+  assert.ok(detail.json.memory.memories >= 2, JSON.stringify(detail.json.memory))
+  assert.ok(detail.json.memory.focusOpen >= 2)
+  assert.equal(typeof detail.json.memory.lastDreamAt, "string")
+  assert.equal(detail.json.context.windowStart, 0, "nothing has been compacted yet")
+  assert.ok(detail.json.context.chars > 0, "the log costs characters")
+
+  // --- deletes are soft on both sides --------------------------------------
+  const closed = await api("DELETE", `/api/focus/${focusId}`)
+  assert.equal(closed.status, 200, closed.text)
+  assert.equal(closed.json.item.state, "done")
+  assert.ok(!(await api("GET", "/api/focus")).json.items.some((item: { id: string }) => item.id === focusId))
+  assert.equal((await api("GET", "/api/focus?all=1")).json.items.some((item: { id: string }) => item.id === focusId), true)
+  assert.equal((await api("DELETE", "/api/focus/nope")).status, 404)
+
+  const deleted = await api("DELETE", `/api/memories/${memoryId}`)
+  assert.equal(deleted.status, 200, deleted.text)
+  assert.equal(deleted.json.deleted, memoryId)
+  assert.ok(!(await api("GET", "/api/memories")).json.memories.some((row: { id: string }) => row.id === memoryId))
+  const withAll = (await api("GET", "/api/memories?all=1")).json.memories as Array<Record<string, any>>
+  assert.equal(withAll.find((row) => row.id === memoryId)?.supersededBy, `deleted:${memoryId}`, "a tombstone in place")
+  assert.equal((await api("DELETE", "/api/memories/nope")).status, 404)
+
+  // Wrong methods and unknown sub-routes are answered, not guessed.
+  assert.equal((await api("DELETE", "/api/memories")).status, 405)
+  assert.equal((await api("GET", "/api/dream")).status, 405)
+  assert.equal((await api("GET", "/api/focus/x/y")).status, 404)
+})
+
 test("restarting ctrl finds the same log, memory, workspace and jobs", async () => {
   const beforeRestart = await eventsStream("?since=0")
   const lastSeq = beforeRestart.events.at(-1)?.seq
