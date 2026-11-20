@@ -1,3 +1,5 @@
+import { renderMarkdown } from "./markdown.js"
+
 const API = "/api/agent"
 
 const JOBS_API = "/api/jobs"
@@ -528,45 +530,7 @@ function separator(date, day) {
 }
 
 function renderProse(container, rawText) {
-  const lines = String(rawText ?? "").split("\n")
-  let buffer = []
-  let fence = null
-
-  const flushText = () => {
-    if (!buffer.length) return
-    const block = buffer.join("\n").replace(/^\n+/, "").replace(/\s+$/, "")
-    buffer = []
-    if (!block) return
-    container.appendChild(el("p", "prose", block))
-  }
-
-  const flushFence = (current) => {
-    const box = el("div", "fence")
-    if (current.lang) box.appendChild(el("div", "fence-lang", current.lang))
-    const pre = document.createElement("pre")
-    pre.appendChild(el("code", "fence-code", current.lines.join("\n")))
-    box.appendChild(pre)
-    container.appendChild(box)
-  }
-
-  for (const line of lines) {
-    const open = /^\s*```(.*)$/.exec(line)
-    if (fence) {
-      if (open) {
-        flushFence(fence)
-        fence = null
-      } else {
-        fence.lines.push(line)
-      }
-    } else if (open) {
-      flushText()
-      fence = { lang: open[1].trim(), lines: [] }
-    } else {
-      buffer.push(line)
-    }
-  }
-  if (fence) flushFence(fence)
-  flushText()
+  container.innerHTML = renderMarkdown(String(rawText ?? ""))
 }
 
 const ARG_PRIORITY = ["cmd", "command", "path", "query", "task", "pattern", "text", "id", "url", "name"]
