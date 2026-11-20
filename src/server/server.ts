@@ -1,10 +1,3 @@
-// node:http assembly: API routes plus the one page (CONTRACT §9).
-//
-// No framework, no middleware, no dependency. The process holds one named
-// agent — one log, one memory, one workspace — and that is the whole surface.
-// There is nothing to switch to, so nothing here takes an id, and there is no
-// executor: work happens in pi workers (src/jobs), not in ctrl.
-
 import { createServer } from "node:http"
 import type { IncomingMessage, Server, ServerResponse } from "node:http"
 import { fileURLToPath } from "node:url"
@@ -27,61 +20,51 @@ import { createWaker, type Waker } from "./wake.ts"
 export const DEFAULT_PORT = 7333
 export const DEFAULT_HOST = "127.0.0.1"
 export const DEFAULT_MAX_STEPS = 12
-/**
- * The model ctrl starts sessions with. pi-durable's own default (hy4) is a
- * reasoning model that costs seconds on trivial turns; deepseek-flash with a
- * max thinking budget is the daily driver here.
- */
+
 export const DEFAULT_MODEL = "workbuddy/deepseek-v4.1-flash"
 export const DEFAULT_REASONING_EFFORT = "max"
-/** Reasoning tokens are billed inside `max_tokens`; 2048 truncates tool calls. */
+
 export const DEFAULT_MAX_TOKENS = 8192
-/**
- * How often the worker-timeout sweep runs. A job is killed within this window
- * of crossing `--job-timeout`, so the tick is much finer than the timeout.
- */
+
 export const DEFAULT_SWEEP_INTERVAL_MS = 60_000
 
 export interface ServerConfig {
-  /** `<root>`: holds `agents/` and `trash/`. Defaults to CTRL_ROOT, then ~/.ctrl. */
+
   root?: string
-  /** The agent to serve; its directory is created when missing. Defaults to `main`. */
+
   agent?: string
   port?: number
   host?: string
-  /** The one directory the agent and its workers live in. Defaults to cwd. */
+
   workspace?: string
   maxSteps?: number
-  /** Model id for a new log; falls back to PI_DURABLE_MODEL, then DEFAULT_MODEL. */
+
   model?: string
-  /** Sent as reasoning_effort; falls back to PI_DURABLE_REASONING_EFFORT, then "max". */
+
   reasoningEffort?: string
-  /** Completion cap per model call. */
+
   maxTokens?: number
-  /** Characters the model's transcript may cost before M2 compresses it. */
+
   contextBudget?: number
-  /** Idle time before the background dream fires; defaults to DREAM_IDLE_MS (10 min). */
+
   dreamIdleMs?: number
-  /** How often the idle check runs; defaults to DREAM_TICK_MS (60 s). */
+
   dreamIntervalMs?: number
-  /** Turn the background dream off entirely (tests that must not call a model). */
+
   dream?: boolean
-  /** The `pi` binary a worker is spawned as. Defaults to `pi` on PATH. */
+
   piBin?: string
-  /** Provider a worker is told to use; `pi -p` is ambiguous without one. */
+
   piProvider?: string
-  /** How many workers may run at once. Defaults to 3. */
+
   maxWorkers?: number
-  /**
-   * Minutes a worker may run before the sweep kills it (default 30);
-   * 0 turns the timeout off entirely.
-   */
+
   jobTimeoutMinutes?: number
-  /** How often the timeout sweep runs; defaults to DEFAULT_SWEEP_INTERVAL_MS (60 s). */
+
   sweepIntervalMs?: number
   publicDir?: string
   env?: NodeJS.ProcessEnv
-  /** Injected by tests; by default a real chat/completions client. */
+
   createLlm?: (model: string) => LlmClient
 }
 
@@ -110,36 +93,26 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     Number.isFinite(config.contextBudget) && (config.contextBudget ?? 0) > 0
       ? Math.floor(config.contextBudget as number)
       : DEFAULT_CONTEXT_BUDGET
-  // `--job-timeout 0` is a real setting (no limit), so this clamp allows it.
+
   const jobTimeoutMinutes =
     Number.isFinite(config.jobTimeoutMinutes) && (config.jobTimeoutMinutes ?? 0) >= 0
       ? Math.floor(config.jobTimeoutMinutes as number)
       : DEFAULT_JOB_TIMEOUT_MINUTES
 
-  // One agent, resolved before anything else: `agents/<name>/` either exists
-  // (we open its log) or is created with agent.json and an empty log.
   const root = resolveRoot(config.root, env)
   const requestedAgent = config.agent?.trim()
   const agentName = requestedAgent !== undefined && requestedAgent !== "" ? requestedAgent : DEFAULT_AGENT
   const ensured = ensureAgent({ root, name: agentName, cwd: workspace, model })
-  // The workspace lives next to the log, never inside it (CONTRACT §3).
-  // Moving the agent to another directory is a supported edit; a half-remembered
-  // one is not, so `createdAt` is carried over rather than rewritten.
+
   writeSidecar(ensured.home, LOG_ID, {
     cwd: workspace,
     createdAt: readSidecar(ensured.home, LOG_ID)?.createdAt ?? ensured.meta.createdAt,
   })
 
-  // The log is the truth once it exists (PLAN §5); buildContext only picks
-  // the model for a log that is being created right now.
   const defaultModel = ensured.session.meta().model || model
 
-  // The memory mirror (MEMORY.md §4 §10): `<agentHome>/memory.db`, derived from
-  // the log. Opening it may fail — a broken or read-only database must not stop
-  // the server — so the index degrades and every search answers with nothing.
   const memory = createMemoryIndex({ agentHome: ensured.home, eventsFile: logPath(ensured.home) })
-  // One incremental import at startup: a brand-new agent mirrors nothing, an
-  // older directory gets its whole log backfilled the first time it is opened.
+
   memory.importEvents()
 
   const runner = new JobRunner({
@@ -161,22 +134,17 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     defaultModel,
     jobs: runner,
     jobTimeoutMinutes,
-    // Replaced right below, like `dreams`: a waker starts turns, so it is built
-    // from the finished context rather than before it.
+
     wake: undefined as unknown as Waker,
     turns: new TurnRegistry(),
     memory,
     contextBudget,
-    // MEMORY.md §2: the loop's remember/recall go to SQLite, so a dream-written
-    // memory is recalled by the next turn. A degraded database answers recall
-    // with nothing and keeps the turn alive.
+
     agentMemory: createSqliteAgentMemory({
       db: memory.handle(),
       warn: (message) => process.stderr.write(`${message}\n`),
     }),
-    // Replaced right below, once the context object exists: a dream reads the
-    // log, the database and the turn registry — the same three things every
-    // request reads — so it is built from the finished context, not before it.
+
     dreams: undefined as unknown as DreamController,
     tools: createTools({ agentHome: ensured.home, runner, memory }),
     env,
@@ -186,10 +154,6 @@ export function buildContext(config: ServerConfig = {}): AppContext {
         createChatCompletionsClient({ model: requested || model, env, reasoningEffort, maxTokens })),
   }
 
-  // MEMORY.md §10.1 M3: one dream at a time, at most every 60 s, only when the
-  // agent has been idle for ten minutes and the log has moved since the last
-  // dream. `startTimer()` is called by startServer, never by buildContext: a
-  // timer in a context a test builds and drops would outlive the test.
   ctx.dreams = new DreamController({
     run: () => dreamOnce(ctx),
     hasWork: () => {
@@ -214,15 +178,11 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     warn: (message) => process.stderr.write(`${message}\n`),
   })
 
-  // B: a worker that finishes after its turn ended wakes the agent. Wired here
-  // (not in startServer) so every context — a test one included — behaves the
-  // same; the runner calls it from its own exit path, never awaited.
   ctx.wake = createWaker(ctx)
   runner.onExit = (job) => ctx.wake.notify(job)
   return ctx
 }
 
-/** When something last happened in this agent's log, in ms; undefined when unknown. */
 function lastActivityMs(agentHome: string): number | undefined {
   try {
     const log = openSession(LOG_ID, { home: agentHome })
@@ -239,17 +199,12 @@ export function defaultPublicDir(): string {
   return fileURLToPath(new URL("../web/public", import.meta.url))
 }
 
-/**
- * One pass of A's timeout sweep. Never awaited by the caller: a slow SIGTERM
- * must not hold up the timer tick, and a failure must not take ctrl down.
- */
 function sweepJobs(ctx: AppContext): void {
   void ctx.jobs.sweepTimeouts().catch((error: unknown) => {
     process.stderr.write(`ctrl: job timeout sweep failed: ${error instanceof Error ? error.message : String(error)}\n`)
   })
 }
 
-/** Build the http.Server without binding a port. */
 export function createAppServer(config: ServerConfig = {}): { server: Server; ctx: AppContext } {
   const ctx = buildContext(config)
   const publicDir = config.publicDir ?? defaultPublicDir()
@@ -273,17 +228,12 @@ export async function startServer(config: ServerConfig = {}): Promise<RunningSer
   })
   const address = server.address()
   const port = typeof address === "object" && address !== null ? address.port : requestedPort
-  // MEMORY.md §7: a timer inside the process, plus one catch-up check at start —
-  // an agent that has been idle since ctrl was last closed gets its dream as
-  // soon as the server is up. Both are gated by the same idle rule, so a fresh
-  // agent never dreams about nothing.
+
   if (config.dream !== false) {
     ctx.dreams.startTimer()
     ctx.dreams.tick()
   }
-  // A: workers that outlive `--job-timeout` are killed. One sweep now (a worker
-  // left over from before this process started is still on the clock) and then
-  // one per minute; `unref` so the timer never keeps ctrl — or a test — alive.
+
   const sweepIntervalMs =
     Number.isFinite(config.sweepIntervalMs) && (config.sweepIntervalMs ?? 0) > 0
       ? Math.floor(config.sweepIntervalMs as number)
@@ -300,26 +250,22 @@ export async function startServer(config: ServerConfig = {}): Promise<RunningSer
     port,
     url: `http://${host}:${port}`,
     close: async () => {
-      // A worker exiting while we shut down must not start a turn against a
-      // database that is about to be closed (B) — and the sweep must not send a
-      // SIGTERM into a process that is on its way out.
+
       ctx.wake.stop()
       if (sweepTimer !== undefined) {
         clearInterval(sweepTimer)
         sweepTimer = undefined
       }
-      // The dream's timer must not keep the process (or a test) alive, and a
-      // dream in flight must not be cut in half while the database closes.
+
       ctx.dreams.stopTimer()
       await ctx.dreams.settle()
-      // Workers are detached on purpose: closing ctrl does not cancel a job.
+
       await ctx.turns.shutdown()
       await new Promise<void>((resolve) => {
         server.closeAllConnections()
         server.close(() => resolve())
       })
-      // The mirror is a derived cache: close it last, and never fail a shutdown
-      // over it.
+
       ctx.memory.close()
     },
   }
@@ -334,8 +280,7 @@ async function handleRequest(
   try {
     if (await handleApiRequest(request, response, ctx)) return
     const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname
-    // The page belongs to W2; until it exists a missing file is a plain 404,
-    // not a crash and not an index listing.
+
     await serveStatic(request, response, pathname, publicDir)
   } catch (error) {
     if (!response.headersSent) sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })

@@ -1,10 +1,3 @@
-// Starting and stopping a pi worker (CONTRACT §5.1, PLAN §3.2).
-//
-// ctrl has no hands: this file is the only place that touches a process, and
-// it does exactly two things — `spawn pi -p …` and SIGTERM its process group.
-// The worker is `detached` and `unref`'d, so it outlives the turn that started
-// it, the tab that watched it, and ctrl itself.
-
 import { spawn } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
 import { accessSync, constants as fsConstants, closeSync, existsSync, openSync, statSync, writeFileSync } from "node:fs"
@@ -24,38 +17,28 @@ import {
 import type { JobMeta, JobView } from "./store.ts"
 
 export const DEFAULT_PI_BIN = "pi"
-/**
- * `pi -p` is ambiguous about which provider to use when several are
- * configured, and an ambiguous worker dies on its first model call. Name one.
- */
+
 export const DEFAULT_PI_PROVIDER = "any-endpoint"
 export const DEFAULT_MAX_WORKERS = 3
-/**
- * How long a worker may run before the sweep kills it. A worker that never
- * returns holds one of the three worker slots forever, so "no limit" is not a
- * safe default; `--job-timeout 0` is still there for somebody who wants it.
- */
+
 export const DEFAULT_JOB_TIMEOUT_MINUTES = 30
-/** How long `job_stop` waits for SIGTERM to be honoured. */
+
 export const STOP_TIMEOUT_MS = 3_000
 const STOP_POLL_MS = 50
 
 export interface RunnerConfig {
-  /** `<root>/agents/<name>` — jobs live at `<agentHome>/jobs/`. */
+
   agentHome: string
   piBin?: string
   piProvider?: string
   maxWorkers?: number
-  /** Kill a worker that has run longer than this; 0 means no limit. */
+
   jobTimeoutMinutes?: number
-  /** Worker model when `delegate` does not name one (ctrl's own model). */
+
   model: string
-  /** Worker thinking budget when `delegate` does not name one. */
+
   thinking: string
-  /**
-   * Called once per job when its exit is recorded (B: wake the agent). Never
-   * awaited and never able to fail an exit path — see `emitExit`.
-   */
+
   onExit?: (job: JobView) => void
 }
 
@@ -69,7 +52,7 @@ export interface DelegateInput {
 export interface RunnerReply {
   ok: boolean
   output: string
-  /** Set when a job was actually started. */
+
   id?: string
 }
 
@@ -86,9 +69,9 @@ export class JobRunner {
   readonly piBin: string
   readonly piProvider: string
   readonly maxWorkers: number
-  /** Minutes a worker may run; 0 = unlimited (the sweep does nothing). */
+
   readonly jobTimeoutMinutes: number
-  /** Set by the server once the context exists; see RunnerConfig.onExit. */
+
   onExit?: (job: JobView) => void
   private readonly model: string
   private readonly thinking: string
@@ -110,12 +93,10 @@ export class JobRunner {
     this.thinking = config.thinking
   }
 
-  /** `jobTimeoutMinutes` in milliseconds; 0 means the sweep is off. */
   get jobTimeoutMs(): number {
     return this.jobTimeoutMinutes * 60_000
   }
 
-  /** The argv a worker gets; exposed so a test can pin it without spawning. */
   workerArgv(input: { id: string; task: string; model?: string; thinking?: string }, piDir: string): string[] {
     return [
       "-p",
@@ -133,10 +114,6 @@ export class JobRunner {
     ]
   }
 
-  /**
-   * Start a worker and return immediately: a real task takes minutes and the
-   * engine caps a tool call at 10 s (CONTRACT §5). The model polls instead.
-   */
   delegate(input: DelegateInput, fallbackCwd: string): RunnerReply {
     const task = nonEmpty(input.task)
     if (task === undefined) return { ok: false, output: "delegate requires a non-empty task" }
@@ -149,8 +126,6 @@ export class JobRunner {
     const cwd = resolveCwd(input.cwd, fallbackCwd)
     if (cwd === undefined) return { ok: false, output: `delegate cwd does not exist: ${input.cwd ?? fallbackCwd}` }
 
-    // Fail before making a job directory: a missing `pi` is an operator
-    // mistake, and a job that exists but never ran would read as `lost`.
     const binary = resolveBinary(this.piBin)
     if (binary === undefined) {
       return { ok: false, output: `pi binary not found or not executable: ${this.piBin} (check --pi-bin)` }
@@ -171,8 +146,7 @@ export class JobRunner {
     let child: ChildProcess
     let logFd: number
     try {
-      // `a` keeps whatever an earlier attempt wrote; the fd is the worker's
-      // stdout *and* stderr, so the log reads in the order it happened.
+
       logFd = openSync(paths.logPath, "a")
     } catch (error) {
       return { ok: false, output: `could not open ${paths.logPath}: ${errorMessage(error)}` }
@@ -187,14 +161,11 @@ export class JobRunner {
       closeSync(logFd)
       return { ok: false, output: `failed to start ${this.piBin}: ${errorMessage(error)}` }
     }
-    // The child holds its own dup of the fd; ctrl must not keep the log open.
+
     closeSync(logFd)
 
     const pid = child.pid ?? 0
-    // Two ways to learn the exit code, because only one of them survives ctrl:
-    // the parent's `exit` event (now) and the pid probe in deriveState (later).
-    // Attached before meta.json is written so a very fast worker cannot exit
-    // unobserved, and `unref`'d so it cannot keep ctrl alive either.
+
     child.on("exit", (code, signal) => {
       this.finalize(paths.id, { code: code ?? null, signal: signal ?? null })
     })
@@ -222,10 +193,6 @@ export class JobRunner {
     return { ok: true, output: `started job ${paths.id} — poll with job_status`, id: paths.id }
   }
 
-  /**
-   * SIGTERM the worker's process *group*: `pi` may have children of its own,
-   * and killing only the leader would leave them holding the log.
-   */
   async stop(id: string): Promise<RunnerReply> {
     if (!isJobId(id)) return { ok: false, output: `invalid job id: ${id}` }
     const job = readJob(this.agentHome, id)
@@ -236,7 +203,7 @@ export class JobRunner {
     const deadline = Date.now() + STOP_TIMEOUT_MS
     while (Date.now() < deadline) {
       if (!isProcessAlive(job.pid)) {
-        // The exit event may already have written this; finalize is idempotent.
+
         this.finalize(id, { code: null, signal: "SIGTERM" })
         return { ok: true, output: `stopped ${id}` }
       }
@@ -245,7 +212,6 @@ export class JobRunner {
     return { ok: false, output: `job ${id} did not stop within ${Math.round(STOP_TIMEOUT_MS / 1000)}s (pid ${job.pid})` }
   }
 
-  /** Record the exit once; a second caller (event vs. stop) must not rewrite it. */
   private finalize(id: string, exit: { code: number | null; signal: string | null }): void {
     const meta = readJobMeta(this.agentHome, id)
     if (meta === undefined) return
@@ -255,17 +221,11 @@ export class JobRunner {
       code: exit.code,
       signal: exit.signal,
     })
-    // Only the write above that actually happened reports an exit, so the same
-    // job cannot announce itself twice (event + stop, or stop + event).
+
     const job = readJob(this.agentHome, id)
     if (job !== undefined) this.emitExit(job)
   }
 
-  /**
-   * Tell the server a worker is done. Deliberately fire-and-forget: an exit
-   * must be recorded even when nobody is listening, and a listener that throws
-   * must not become an unhandled rejection in the parent's exit path.
-   */
   private emitExit(job: JobView): void {
     const callback = this.onExit
     if (callback === undefined) return
@@ -279,22 +239,12 @@ export class JobRunner {
     }
   }
 
-  /**
-   * Kill every worker that has run past `jobTimeoutMinutes` (A: the job timeout).
-   * `stop()` is the same SIGTERM the `job_stop` tool sends, so a swept job reads
-   * as `killed` off the disk like any other; the reason goes into its own log,
-   * where `job_status` and the delegate card already show it.
-   *
-   * `now` is a parameter so a test can sweep from the future instead of sleeping
-   * for half an hour. Returns the ids actually stopped.
-   */
   async sweepTimeouts(now: number = Date.now()): Promise<string[]> {
     const limitMs = this.jobTimeoutMs
     if (limitMs <= 0) return []
     const stopped: string[] = []
     for (const job of listJobs(this.agentHome, { limit: 0, now })) {
-      // `running` is read from disk: a job killed by an earlier sweep, or one
-      // whose process is gone, is not touched again.
+
       if (job.state !== "running") continue
       if (job.elapsedMs <= limitMs) continue
       const logPath = jobPaths(this.agentHome, job.id).logPath
@@ -306,10 +256,6 @@ export class JobRunner {
   }
 }
 
-/**
- * `pi` as the CLI would find it: a path is used as given, a bare name is
- * searched on PATH. Undefined means "not runnable from here".
- */
 function resolveBinary(requested: string): string | undefined {
   if (requested.includes(path.sep)) return isExecutableFile(requested) ? requested : undefined
   for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
@@ -330,7 +276,6 @@ function isExecutableFile(file: string): boolean {
   }
 }
 
-/** A relative `cwd` is read against the agent's workspace, never ctrl's own. */
 function resolveCwd(requested: string | undefined, fallback: string): string | undefined {
   const raw = nonEmpty(requested) ?? nonEmpty(fallback)
   if (raw === undefined) return undefined
@@ -342,19 +287,18 @@ function resolveCwd(requested: string | undefined, fallback: string): string | u
   }
 }
 
-/** Signal the whole group; fall back to the bare pid for an adopted job. */
 function signalGroup(pid: number, signal: NodeJS.Signals): void {
   if (!Number.isInteger(pid) || pid <= 0) return
   try {
     process.kill(-pid, signal)
     return
   } catch {
-    // ESRCH (already gone) or a job that is not a group leader: try the pid.
+
   }
   try {
     process.kill(pid, signal)
   } catch {
-    // Nothing left to signal — the caller's liveness poll decides the answer.
+
   }
 }
 
@@ -363,7 +307,7 @@ function appendNote(logFile: string, note: string): void {
   try {
     writeFileSync(logFile, `${note}\n`, { encoding: "utf8", flag: "a" })
   } catch {
-    // A note that cannot be written must not turn into a thrown tool.
+
   }
 }
 
@@ -371,7 +315,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-/** A throwing listener is reported, never propagated into an exit handler. */
 function warnExit(error: unknown): void {
   process.stderr.write(`ctrl: job exit listener failed: ${errorMessage(error)}\n`)
 }

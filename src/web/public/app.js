@@ -1,52 +1,27 @@
-// ctrl — 一个命名 agent 的页面：它的名字、它的一生（一条时间线）、一个输入框。
-//
-// 纯静态 ES module：零 import、零依赖、零构建、无 top-level await。
-// 只使用契约 §7 的接口（v3 里没有会话、也没有"机器"这个概念；ctrl 自己不动手，
-// 活交给 pi worker，页面靠 `/api/jobs` 看 worker 的当下状态）：
-//   GET  /api/agent
-//   GET  /api/agent/events?since=N | tail=T | before=S&tail=T
-//   POST /api/agent/messages   { text }
-//   POST /api/agent/abort
-//   GET  /api/jobs             { jobs: [{ id, state, task, startedAt, elapsedMs, code? }] }
-//
-// M4（MEMORY.md §10.1）右侧面板与记忆抽屉：
-//   GET  /api/focus            { items: [{ id, text, state, updatedAt, seq }] }
-//   POST /api/focus            { id?, text?, state? } → upsert
-//   GET  /api/memories?query=&limit=&all=   { memories, count }
-//   DELETE /api/memories/:id   写 tombstone（不是物理删）
-// 这四个口是可以不存在的：面板自己把错误吃掉，时间线照跑。
-//
-// 安全：服务端 / 模型 / 用户的所有文本都走 textContent 或 createElement，
-// 这个文件里没有一处把字符串当 HTML 塞回 DOM。
-
 const API = "/api/agent"
-/** 契约 §7：`GET /api/jobs` 不在 /api/agent 下面（worker 不是日志的一部分）。 */
+
 const JOBS_API = "/api/jobs"
-/** MEMORY.md §10.1：focus 面板与记忆审阅（M4）。旧后端上它们就是 404，面板自己兼。 */
+
 const FOCUS_API = "/api/focus"
 const MEMORIES_API = "/api/memories"
-/** 首屏和"加载更早"一次拿多少条（契约 §7：单次上限 200） */
+
 const TAIL = 100
 const POLL_RUNNING_MS = 700
 const POLL_IDLE_MS = 2500
-/** 一次拉满 200 条说明后面还有，别等一个轮询间隔 */
+
 const POLL_CATCHUP_MS = 60
 const NEAR_BOTTOM_PX = 120
 const MAX_INPUT_HEIGHT = 200
-/** MEMORY.md §8：focus 面板最多露 10 条 */
-const FOCUS_MAX = 10
-/** 面板上一条 worker 只露任务前 40 字 */
-const WORKER_TASK_CHARS = 40
-/** 抽屉一次拉多少条记忆（后端会把 limit 夹到 20：一次就是这么多，再多用搜索） */
-const MEMORY_LIMIT = 20
-/** 记忆搜索的防抖：打字时不要一个字一个请求 */
-const MEMORY_SEARCH_MS = 320
-/** `/api/agent` 只为了「记忆 N 条 / 窗口 N 字」，不用每拍都拉 */
-const AGENT_SNAPSHOT_MS = 5000
 
-// ---------------------------------------------------------------------------
-// 状态
-// ---------------------------------------------------------------------------
+const FOCUS_MAX = 10
+
+const WORKER_TASK_CHARS = 40
+
+const MEMORY_LIMIT = 20
+
+const MEMORY_SEARCH_MS = 320
+
+const AGENT_SNAPSHOT_MS = 5000
 
 const state = {
   name: "",
@@ -54,21 +29,21 @@ const state = {
   resumePoint: null,
   eventCount: 0,
   lastActivity: "",
-  /** `/api/jobs` 里 state === "running" 的条数：状态条的 workers */
+
   workerCount: 0,
-  /** job id → 渲染过的 delegate 卡片数组；轮询到了就按 id 合并，从不删除卡片 */
+
   jobs: new Map(),
-  /** 所有 delegate 卡片（量「展开全文」要遍历它们） */
+
   jobCards: [],
-  /** 流式游标：下一次 since= 用（最后一条 seq + 1） */
+
   since: 0,
-  /** 已收到的最小 seq；> 0 就说明上面还有历史（null = 一条都没收到） */
+
   oldest: null,
-  /** 收到过的所有 seq（含不渲染的 memory_*），用来去重 */
+
   seen: new Set(),
-  /** 时间线上已有的行，按时间顺序：[{ seq, date, day, el }] */
+
   rows: [],
-  /** callId → 工具卡片，用来把 tool_call 和 tool_result 合成一张 */
+
   tools: new Map(),
   pendingEl: null,
   loaded: false,
@@ -76,31 +51,28 @@ const state = {
   loadingEarlier: false,
   sending: false,
   aborting: false,
-  /** 刚发完消息的那一下：服务端的 running 可能还没翻过来，先信自己 */
+
   optimisticUntil: 0,
   connected: null,
   errors: 0,
   nearBottom: true,
 
-  // ---- 右侧面板（MEMORY.md §8）----
-  /** `/api/focus` 归一化后的条目，已按 doing → open → blocked 排好（done 不渲染） */
   focus: [],
-  /** 至少成功拉过一次：没拉过就不说「没有 focus」 */
+
   focusLoaded: false,
-  /** 面板拉取失败：只在面板里安静地说一声，不动时间线 */
+
   focusError: false,
-  /** `/api/agent` 的 memory.*；null = 旧后端没有这个字段（状态条就不显示） */
+
   memoryCount: null,
   focusOpen: null,
   lastDreamAt: "",
-  /** `/api/agent` 的 context.chars；null = 旧后端 */
+
   windowChars: null,
   windowStart: null,
 
-  // ---- 记忆抽屉 ----
   drawerOpen: false,
   drawerQuery: "",
-  /** 抽屉里是否把被 supersede 的也拉回来（它们灰显） */
+
   drawerAll: true,
   memories: [],
   memoriesLoaded: false,
@@ -156,11 +128,6 @@ const els = {
   memoryError: document.getElementById("memory-error"),
 }
 
-// ---------------------------------------------------------------------------
-// 小工具
-// ---------------------------------------------------------------------------
-
-/** 建一个元素。文本一律走 textContent。 */
 function el(tag, className, text) {
   const node = document.createElement(tag)
   if (className) node.className = className
@@ -208,7 +175,6 @@ function dayLabel(date) {
   return dayKey(date)
 }
 
-/** 今天只给 HH:MM；更早的日期在时间列里带上 MM-DD。 */
 function timeLabel(date) {
   const hm = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`
   return dayKey(date) === dayKey(new Date())
@@ -243,7 +209,6 @@ function formatDuration(ms) {
   return `${minutes}m${pad2(seconds)}s`
 }
 
-/** 发一次 GET/POST，拿 JSON。`path` 是完整路径（/api/jobs 不在 /api/agent 下面）。 */
 async function request(fullPath, options) {
   const init = {
     method: (options && options.method) || "GET",
@@ -297,10 +262,6 @@ function toast(message) {
   }, 3600)
 }
 
-// ---------------------------------------------------------------------------
-// 头部：名字 + 状态条
-// ---------------------------------------------------------------------------
-
 function pickName(data) {
   if (typeof data?.agent === "string" && data.agent.trim()) return data.agent.trim()
   const agent = data && typeof data.agent === "object" && data.agent ? data.agent : null
@@ -327,7 +288,6 @@ const RESUME_TITLE = {
   interrupted_turn: "上次的模型调用没有返回，那一轮被中断了",
 }
 
-/** 只有"不 clean 而且有历史"才配一个安静的"已恢复"。 */
 function resumeKind() {
   const kind = state.resumePoint && typeof state.resumePoint.kind === "string" ? state.resumePoint.kind : ""
   if (!kind || kind === "clean" || kind === "empty") return ""
@@ -357,10 +317,6 @@ function applyAgent(data) {
   applyContextMeta(data)
 }
 
-/**
- * 刚按下发送时，服务端那个 running 可能还没翻过来：1.5 s 内不信 `running:false`，
- * 否则按钮会在「停止/发送」之间闪一下。
- */
 function applyTurn(turn) {
   const incoming = normalizeTurn(turn)
   const keepOptimistic = !incoming.running && Date.now() < state.optimisticUntil
@@ -368,10 +324,6 @@ function applyTurn(turn) {
   if (!keepOptimistic) state.turn = incoming
 }
 
-/**
- * MEMORY.md §10.1：`/api/agent` 多了 `memory: { memories, focusOpen, lastDreamAt }`。
- * 旧后端没有这个键（或只有一半）：不报错，也不把已经拿到的值清掉。
- */
 function applyMemoryMeta(data) {
   const memory = data && typeof data.memory === "object" && data.memory ? data.memory : null
   if (!memory) return
@@ -383,7 +335,6 @@ function applyMemoryMeta(data) {
   else if (memory.lastDreamAt === null) state.lastDreamAt = ""
 }
 
-/** `context: { windowStart, chars }`：同样是可以没有的。 */
 function applyContextMeta(data) {
   const context = data && typeof data.context === "object" && data.context ? data.context : null
   if (!context) return
@@ -411,7 +362,6 @@ function updateHead() {
   els.resume.hidden = !kind
   els.resume.title = kind ? RESUME_TITLE[kind] || `从上次中断处恢复（${kind}）` : ""
 
-  // 记忆 / 窗口：后端给了才显示（旧后端上这两个数字是空的，不是 0）。
   const memories = state.memoryCount
   els.memoryItem.hidden = memories === null
   els.memoryValue.textContent = memories === null ? "" : String(memories)
@@ -438,13 +388,6 @@ function updateEmpty() {
   els.emptyLine.textContent = `这是 ${name}：一个一直活着的 agent，它自己不动手，活交给 pi worker 去干。`
 }
 
-// ---------------------------------------------------------------------------
-// worker（job）：岗位状态。契约 §7 `GET /api/jobs` 只给这一行信息，
-// 卡片上的任务文本、输出还是从日志里的 tool_call / tool_result 来。
-// ---------------------------------------------------------------------------
-
-/** 后端的 state 是 meta 推导出来的：running / exited / failed / killed / lost。
- *  这里只做一件事：`exited` 却带了非 0 退出码（同一条信息被拆成两半时）算 failed。 */
 function normalizeJobState(value, code) {
   const raw = typeof value === "string" ? value.trim().toLowerCase() : ""
   if (raw === "exited" && code !== null && code !== 0) return "failed"
@@ -452,7 +395,6 @@ function normalizeJobState(value, code) {
   return raw || ""
 }
 
-/** 徽章上写什么：把退出码写进去，比一个孤零零的 exited 有用。 */
 function badgeText(jobState, code) {
   if (jobState === "running") return "running"
   if (jobState === "lost") return "lost"
@@ -462,7 +404,6 @@ function badgeText(jobState, code) {
   return jobState || "—"
 }
 
-/** `{ jobs: [...] }` → 数组；形状不对就当没拿到。 */
 function readJobs(data) {
   const list = data && Array.isArray(data.jobs) ? data.jobs : null
   if (!list) return null
@@ -478,18 +419,13 @@ function readJobs(data) {
       startedAt: typeof item.startedAt === "string" ? item.startedAt : "",
       elapsedMs: numberOf(item.elapsedMs),
       code: numberOf(item.code),
-      // The backend sends a tail of the worker's own log; drop it here and the
-      // delegate card can never show what the worker actually did.
+
       output: typeof item.output === "string" ? item.output : "",
     })
   }
   return jobs
 }
 
-/**
- * 拿到 `/api/jobs` 就合并进已渲染的卡片；拿不到就什么也不做——
- * 卡片保留最后一次已知状态，比凭空消失或者掉回「运行中」诚实。
- */
 function applyJobs(data) {
   const jobs = readJobs(data)
   if (!jobs) return false
@@ -505,7 +441,7 @@ function applyJobs(data) {
     for (const card of cards) applyJobToCard(card, job)
   }
   state.workerCount = running
-  // 面板上的 worker 列表和状态条那个数字是同一份数据：一起刷新。
+
   renderWorkers(alive)
   updateHead()
   return true
@@ -519,12 +455,11 @@ async function refreshJobs() {
   try {
     return applyJobs(await request(JOBS_API))
   } catch {
-    // worker 列表拉不到不该把事件流带倒；下一次轮询再试。
+
     return false
   }
 }
 
-/** 一批卡片刚落地时把 worker 状态补一次（拢在一起发，不一张卡片一个请求）。 */
 function scheduleJobRefresh() {
   if (jobRefreshTimer) return
   jobRefreshTimer = window.setTimeout(() => {
@@ -533,11 +468,6 @@ function scheduleJobRefresh() {
   }, 120)
 }
 
-// ---------------------------------------------------------------------------
-// 时间线：行
-// ---------------------------------------------------------------------------
-
-/** 一条日期分隔条；和行共用时间列，所以标签是右对齐的。 */
 function separator(date, day) {
   const box = el("div", "sep")
   box.dataset.sep = day
@@ -546,7 +476,6 @@ function separator(date, day) {
   return box
 }
 
-/** 把 ``` 围栏切成代码块，其余文本原样保留换行。 */
 function renderProse(container, rawText) {
   const lines = String(rawText ?? "").split("\n")
   let buffer = []
@@ -607,7 +536,6 @@ function valueText(value) {
   }
 }
 
-/** `cmd: go build ./...  ·  cwd: /srv/app` — 先挑最像"这一行在干什么"的键。 */
 function argsLine(args) {
   if (args === null || args === undefined) return ""
   if (typeof args !== "object") return oneLine(valueText(args)).slice(0, 300)
@@ -649,19 +577,10 @@ function createCard(name) {
   return { kind: "tool", root, nameEl, durEl, stateEl, argsEl, details, pre, callTs: null, resultTs: null }
 }
 
-// --- delegate 卡片：任务全文 + job id + worker 状态 + 输出 -------------------
-
-/** 卡片根节点 → 卡片对象（点击「展开全文」时要回找）。 */
 const cardOf = new WeakMap()
 
-/** job 目录名 / `pi --session-id`：`YYYYMMDDTHHMMSSZ-<随机>`（契约 §5.1）。 */
 const JOB_ID_RE = /\b\d{8}T\d{6}Z-[a-z0-9]{4,12}\b/i
 
-/**
- * `delegate` 的返回值是一句人话（`started job <id> — poll with job_status`），
- * 契约没有结构化字段，所以先在几个可能的键里找，再退回从文本里抠。
- * 抠不到就返回空串：那张卡片就按普通失败处理（比如并发到顶没起来）。
- */
 function jobIdOf(data) {
   for (const candidate of [data?.id, data?.jobId, data?.job_id, data?.job]) {
     if (typeof candidate === "string" && candidate.trim()) return candidate.trim()
@@ -719,7 +638,6 @@ function createJobCard(name) {
     jobId: "",
     callTs: null,
     resultTs: null,
-    /** 任务文本被钳成两行时是否会溢出（决定要不要给「展开全文」） */
     taskOverflows: false,
   }
   cardOf.set(root, card)
@@ -727,7 +645,6 @@ function createJobCard(name) {
   return card
 }
 
-/** 记下这张卡片属于哪个 job：之后 `/api/jobs` 就来这里找它。 */
 function registerJob(card, id) {
   if (!id) return
   card.jobId = id
@@ -738,7 +655,6 @@ function registerJob(card, id) {
   else if (!cards.includes(card)) cards.push(card)
 }
 
-/** 任务全文：默认只露两行，真溢出了才给一个「展开全文」。 */
 function measureJobTask(card) {
   if (!card.taskEl.isConnected) return
   if (card.root.dataset.open === "true") {
@@ -755,7 +671,6 @@ function measureJobTasks() {
 
 let measureFrame = 0
 
-/** 卡片刚插进 DOM 时量不出来（还没有布局），下一帧再量。 */
 function scheduleTaskMeasure() {
   if (measureFrame) return
   measureFrame = window.requestAnimationFrame(() => {
@@ -776,7 +691,6 @@ function toggleJobTask(card, force) {
   measureJobTask(card)
 }
 
-/** `/api/jobs` 的一行 → 这张卡片的徽章与耗时（状态只认 worker 的真实状态）。 */
 function applyJobToCard(card, job) {
   const jobState = job.state || "unknown"
   card.root.dataset.state = jobState
@@ -819,18 +733,15 @@ function finishJobCall(card, data, ts) {
   card.details.hidden = false
 
   if (!card.jobId) {
-    // 没有 job id（并发到顶、spawn 失败）：没有 worker 可跟，就老实说失败。
     const ok = !data || data.ok !== false
     if (!ok) {
       card.root.dataset.state = "failed"
       card.badgeState.textContent = "failed"
     }
   }
-  // 卡片刚到：把 worker 的当下状态取一次，别等下一个轮询间隔。
   scheduleJobRefresh()
 }
 
-/** 一张新的工具卡片该长什么样：`delegate` 有自己的版式。 */
 function createCardFor(name) {
   return String(name || "") === "delegate" ? createJobCard(name) : createCard(name)
 }
@@ -845,7 +756,6 @@ function resultInto(card, data, ts) {
   else finishCard(card, data, ts)
 }
 
-/** call 和 result 是先后脚到的，谁后到谁负责把耗时补上（上翻分页时会反过来）。 */
 function updateDuration(card) {
   if (card.callTs === null || card.resultTs === null) return
   card.durEl.textContent = formatDuration(card.resultTs - card.callTs)
@@ -880,7 +790,6 @@ function finishCard(card, data, ts) {
   card.details.hidden = false
 }
 
-/** 一条事件 → 一行；返回 null 表示不渲染（memory_* / session_created / 已合并进卡片）。 */
 function buildRow(event) {
   const date = toDate(event.ts) || new Date()
   const type = String(event.type || "")
@@ -917,7 +826,6 @@ function buildRow(event) {
       const callId = String(data.callId ?? "")
       const existing = callId ? state.tools.get(callId) : null
       if (existing) {
-        // 上翻分页时先看到了 result、后看到 call：补上参数，不另起一行。
         callInto(existing, data, event.ts)
         return null
       }
@@ -932,8 +840,6 @@ function buildRow(event) {
       const callId = String(data.callId ?? "")
       const existing = callId ? state.tools.get(callId) : null
       if (existing) {
-        // 和上面那张卡片是同一件事：结果写进卡片，不再多一行。
-        // job_status / job_stop 没有自己的卡片，它们就是普通的工具卡片。
         resultInto(existing, data, event.ts)
         return null
       }
@@ -962,14 +868,12 @@ function buildRow(event) {
       break
     }
     default:
-      // memory_write / memory_recall / session_created / assistant_pending：不渲染。
       return null
   }
 
   return { seq: event.seq, date, day: dayKey(date), el: row }
 }
 
-/** 记下"这条 seq 见过了"，再交给 buildRow；重复的、坏掉的都直接丢。 */
 function recordOf(event) {
   if (!event || typeof event !== "object") return null
   const seq = numberOf(event.seq)
@@ -978,12 +882,10 @@ function recordOf(event) {
   try {
     return buildRow(event)
   } catch {
-    // 一条坏事件不该把整条流卡死：跳过它，游标照常往前。
     return null
   }
 }
 
-/** 推进三个游标：since（往后）、oldest（往前）、最后活动时间。 */
 function noteCursors(events) {
   for (const event of events) {
     if (!event || typeof event !== "object") continue
@@ -1040,7 +942,6 @@ function prependEvents(events) {
   }
   const first = state.rows.length ? state.rows[0] : null
   if (first && prevDay !== first.day) fragment.appendChild(separator(first.date, first.day))
-  // 顶上原来那条分隔条要么被上面这条取代，要么本来就多余（同一天）。
   while (els.rows.firstElementChild && els.rows.firstElementChild.classList.contains("sep")) {
     els.rows.firstElementChild.remove()
   }
@@ -1048,10 +949,6 @@ function prependEvents(events) {
   state.rows = records.concat(state.rows)
   scheduleTaskMeasure()
 }
-
-// ---------------------------------------------------------------------------
-// 时间线：滚动、加载更早、"运行中"
-// ---------------------------------------------------------------------------
 
 function scrollToBottom() {
   els.timeline.scrollTop = els.timeline.scrollHeight
@@ -1091,9 +988,7 @@ function syncPending() {
   if (els.rows.lastElementChild !== state.pendingEl) els.rows.appendChild(state.pendingEl)
 }
 
-/** 后端给的 state 只认这四个；缺字段的条目当 open，别让它从面板上消失。 */
 const FOCUS_RANK = { doing: 0, open: 1, blocked: 2, done: 3 }
-/** 点一下往下转一圈（MEMORY.md §8：「点一下标 done」；blocked 点一下 = 重新开干）。 */
 const FOCUS_NEXT = { open: "doing", doing: "done", blocked: "doing", done: "open" }
 
 function normalizeFocusState(value) {
@@ -1106,7 +1001,6 @@ function focusTime(item) {
   return date ? date.getTime() : Number.NEGATIVE_INFINITY
 }
 
-/** doing 置顶、然后 open、blocked；同一状态里最近动过的先露。 */
 function compareFocus(a, b) {
   const rank = FOCUS_RANK[a.state] - FOCUS_RANK[b.state]
   if (rank !== 0) return rank
@@ -1116,7 +1010,6 @@ function compareFocus(a, b) {
   return (b.seq ?? 0) - (a.seq ?? 0)
 }
 
-/** `{ items: [{ id, text, state, updatedAt, seq }] }` → 数组；形状不对当没拿到。 */
 function readFocus(data) {
   const list = data && Array.isArray(data.items) ? data.items : null
   if (!list) return null
@@ -1138,7 +1031,6 @@ function readFocus(data) {
   return items
 }
 
-/** 一条 focus：状态点 + 文字 + 状态名（状态名是给人看的小字，不是唯一的信号）。 */
 function focusItemEl(item) {
   const row = el("li", "focus-item")
   row.dataset.id = item.id
@@ -1164,7 +1056,6 @@ function renderFocus() {
 
   els.focusEmpty.hidden = shown.length > 0 || state.focusError || !state.focusLoaded
   els.focusError.hidden = !state.focusError
-  // 列表拉不到时还能拿 `/api/agent` 的 memory.focusOpen 当个数（它有就显示）。
   const count = state.focusError && state.focusOpen !== null ? state.focusOpen : visible.length
   els.focusCount.textContent = String(Math.max(0, count))
 }
@@ -1191,13 +1082,11 @@ async function refreshFocus() {
   }
 }
 
-/** 点一下条目：open → doing → done（blocked 点一下 = 回到 doing）。 */
 async function cycleFocus(id) {
   const item = state.focus.find((entry) => entry.id === id)
   if (!item) return
   const previous = item.state
   const next = FOCUS_NEXT[previous] || "doing"
-  // 先本地翻一下：点击反馈不用等一个往返；写失败再翻回来。
   item.state = next
   item.updatedAt = new Date().toISOString()
   state.focus.sort(compareFocus)
@@ -1225,9 +1114,6 @@ async function addFocus(text) {
   }
 }
 
-// --- 面板上的 worker ----------------------------------------------------------
-
-/** `20240101T120000Z-abcd` → `abcd`（完整 id 放 title，够用了）。 */
 function shortJobId(id) {
   const raw = String(id ?? "").trim()
   const dash = raw.lastIndexOf("-")
@@ -1236,14 +1122,12 @@ function shortJobId(id) {
   return raw.length > 10 ? `${raw.slice(0, 9)}…` : raw
 }
 
-/** 任务前 40 字，一行。 */
 function shortTask(text) {
   const line = oneLine(text)
   if (!line) return "（没写任务）"
   return line.length > WORKER_TASK_CHARS ? `${line.slice(0, WORKER_TASK_CHARS)}…` : line
 }
 
-/** 后端给了 elapsedMs 就用它；没给就用 startedAt 现算。 */
 function jobElapsed(job) {
   if (job.elapsedMs !== null) return formatDuration(job.elapsedMs)
   const started = toDate(job.startedAt)
@@ -1269,21 +1153,14 @@ function renderWorkers(jobs) {
   els.workerCount.textContent = String(list.length)
 }
 
-/** 上次做梦：面板上就一行字（`/api/agent` 的 memory.lastDreamAt）。 */
 function renderDream() {
   const when = state.lastDreamAt
   els.dreamLine.textContent = when ? `上次做梦 ${timeAgo(when)}` : "还没做过梦"
   els.dreamLine.title = when ? absoluteTime(when) : "空闲十分钟、又有新事件时它会自己整理一遍"
 }
 
-// --- 面板：数据 ----------------------------------------------------------------
-
 let lastAgentSnapshot = 0
 
-/**
- * 面板的数据拍：focus 每次都拉（跟主轮询同频），`/api/agent` 里的计数慢一点没关系。
- * 这里所有失败都在里面吃掉——面板拉不到，时间线照跑。
- */
 function refreshPanel(force) {
   void refreshFocus()
   if (!force && Date.now() - lastAgentSnapshot < AGENT_SNAPSHOT_MS) return
@@ -1297,15 +1174,10 @@ function refreshPanel(force) {
       updateComposer()
       syncPending()
     } catch {
-      // 旧后端 / 一时连不上：面板保持上一次的样子。
     }
   })()
 }
 
-// --- 记忆抽屉 ------------------------------------------------------------------
-
-/** `{ memories: [{ id, kind, text, createdAt, supersededBy }] }` → 数组。
- *  后端可能写成 camelCase 也可能写成表里的 snake_case，两种都读。 */
 function readMemories(data) {
   const list = data && Array.isArray(data.memories) ? data.memories : null
   if (!list) return null
@@ -1361,7 +1233,6 @@ function renderMemories() {
   const parts = []
   if (state.memoriesLoaded) {
     parts.push(list.length === live ? `${live} 条` : `${live} 条 · ${list.length - live} 条已合并`)
-    // 满页了就直说“这是上限”，不要让人以为库里就这么点。
     if (list.length >= MEMORY_LIMIT) parts.push(`一次最多 ${MEMORY_LIMIT} 条，搜一下能找更多`)
   }
   els.drawerSum.textContent = parts.join(" · ")
@@ -1425,7 +1296,6 @@ function closeDrawer() {
   els.drawer.hidden = true
 }
 
-/** 窄屏下那一列折叠成一个按钮：面板靠 body 上的 class 滑出来。 */
 function setPanelOpen(open) {
   document.body.classList.toggle("panel-open", Boolean(open))
   els.panelToggle.setAttribute("aria-expanded", open ? "true" : "false")
@@ -1435,10 +1305,6 @@ function setPanelOpen(open) {
 function togglePanel() {
   setPanelOpen(!document.body.classList.contains("panel-open"))
 }
-
-// ---------------------------------------------------------------------------
-// 输入区
-// ---------------------------------------------------------------------------
 
 function autosize() {
   const input = els.input
@@ -1514,10 +1380,6 @@ async function abortTurn() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 数据：首屏 + 上翻 + 轮询
-// ---------------------------------------------------------------------------
-
 async function loadTail() {
   try {
     const data = await api(`/events?tail=${TAIL}`)
@@ -1528,8 +1390,6 @@ async function loadTail() {
   } catch (error) {
     toast(`历史加载失败：${messageOf(error)}`)
   }
-  // 一条历史都没拿到（比如 tail 挂了）就别从 seq 0 开始追：那样会按顺序
-  // 把最老的一批当成新事件堆到底下。直接从日志末尾开始接。
   if (state.oldest === null) state.since = Math.max(state.since, state.eventCount)
 }
 
@@ -1547,7 +1407,6 @@ async function loadEarlier() {
     if (!events.length) state.exhausted = true
     else prependEvents(events)
     if (state.oldest === null || state.oldest >= before) state.exhausted = true
-    // 往前插了一屏：把滚动位置钉住，视线里的那一行不许动。
     els.timeline.scrollTop = els.timeline.scrollHeight - offset
   } catch (error) {
     toast(`加载更早失败：${messageOf(error)}`)
@@ -1576,7 +1435,6 @@ async function pollOnce() {
   const wasRunning = Boolean(state.turn && state.turn.running)
   let next = POLL_IDLE_MS
   try {
-    // 事件和 worker 列表同一拍：delegate 卡片在 turn 结束后还要跟着 worker 活。
     const [data, jobsData] = await Promise.all([
       api(`/events?since=${since}`),
       request(JOBS_API).catch(() => null),
@@ -1593,21 +1451,16 @@ async function pollOnce() {
     const total = numberOf(data && data.total)
     if (total !== null) state.eventCount = Math.max(state.eventCount, total, state.since)
 
-    // job 从列表里消失（超过最近 20 条）不动已渲染的卡片：保留最后一次已知状态。
     applyJobs(jobsData)
 
-    // 面板（focus / worker / 做梦时间）跟主轮询同频；它自己吞掉所有错误——
-    // 面板拉不到是不能把这条时间线带倒的。
     refreshPanel()
 
     const running = Boolean(state.turn && state.turn.running)
     const turnError = state.turn && typeof state.turn.error === "string" ? state.turn.error : ""
     if (turnError && turnError !== surfacedTurnError) {
-      // 服务端把这一轮的失败记在 turn 上（日志里另有 error 事件）。只说一次。
       surfacedTurnError = turnError
       toast(`这一轮出错：${turnError}`)
     }
-    // 有 worker 在跑也算“忙”：不然 turn 一结束，卡片会拖到 2.5 s 才动。
     const busy = running || state.workerCount > 0
     next = events.length >= 200 ? POLL_CATCHUP_MS : busy ? POLL_RUNNING_MS : POLL_IDLE_MS
     if (wasRunning && !running) void refreshHead()
@@ -1627,10 +1480,8 @@ async function pollOnce() {
   }
 }
 
-/** 一轮结束、或刚恢复连接时，把头部（事件数 / resumePoint / turn）重新拉一次。 */
 async function refreshHead() {
   try {
-    // 头部和 worker 列表一起拉：turn 结束后 workers 那个数字也得是新的。
     const [data] = await Promise.all([api(""), refreshJobs()])
     applyAgent(data)
     lastAgentSnapshot = Date.now()
@@ -1640,7 +1491,6 @@ async function refreshHead() {
     updateEmpty()
     updateComposer()
   } catch {
-    // 轮询会继续，头部保持旧值即可。
   }
 }
 
@@ -1652,9 +1502,7 @@ async function tryLoadAgent() {
     setConnected(true)
     state.loaded = true
     if (state.eventCount > 0) await loadTail()
-    // 卡片都上屏了再来一次：重开页面时 job 可能早跑完了，不能等到下个轮询拍。
     await refreshJobs()
-    // 面板不等轮询：首屏就把 focus 拉一次（失败只影响面板自己）。
     void refreshFocus()
     renderDream()
     updateHead()
@@ -1670,10 +1518,6 @@ async function tryLoadAgent() {
     return false
   }
 }
-
-// ---------------------------------------------------------------------------
-// 绑定 + 启动（无 top-level await：所有异步都收在 boot 里）
-// ---------------------------------------------------------------------------
 
 function bind() {
   els.composer.addEventListener("submit", (event) => {
@@ -1698,8 +1542,6 @@ function bind() {
     void loadEarlier()
   })
 
-  // ---- 右侧面板 ----------------------------------------------------------
-
   els.panelToggle.addEventListener("click", () => {
     togglePanel()
   })
@@ -1713,18 +1555,15 @@ function bind() {
     void addFocus(els.focusInput.value)
   })
 
-  // 表单里只有一个输入框，浏览器本来就会隐式提交；这里再明确接一手 Enter。
   els.focusInput.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" || event.isComposing) return
     event.preventDefault()
     void addFocus(els.focusInput.value)
   })
 
-  // focus 条目是动态的：点一下 / Enter 都是「往下转一格」。
   const activateFocus = (target) => {
     const row = target.closest("li.focus-item")
     if (!row || !row.dataset.id) return
-    // 选中文字了就是用户在建选区，别把状态翻了。
     const selection = window.getSelection ? String(window.getSelection() || "") : ""
     if (selection) return
     void cycleFocus(row.dataset.id)
@@ -1741,8 +1580,6 @@ function bind() {
     activateFocus(event.target)
   })
 
-  // ---- 记忆抽屉 ----------------------------------------------------------
-
   els.memoryBtn.addEventListener("click", () => {
     openDrawer()
   })
@@ -1751,7 +1588,6 @@ function bind() {
     closeDrawer()
   })
 
-  // 点抽屉的空白处（不是那张卡片）就关。
   els.drawer.addEventListener("click", (event) => {
     if (event.target === els.drawer) closeDrawer()
   })
@@ -1767,7 +1603,6 @@ function bind() {
     void refreshMemories()
   })
 
-  // 一边打字一边搜：防抖一下，不要一个字一个请求。
   let searchTimer = 0
   els.drawerQuery.addEventListener("input", () => {
     window.clearTimeout(searchTimer)
@@ -1806,7 +1641,6 @@ function bind() {
     { passive: true },
   )
 
-  // delegate 卡片是动态的：展开/收起用事件委托，不给每张卡片绑一份。
   els.rows.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null
     if (!target) return
@@ -1820,13 +1654,11 @@ function bind() {
     }
     if (!target.closest(".job-task") || !card.taskOverflows) return
     if (root.dataset.open === "true") return
-    // 选中文字了就是用户在建选区，别把卡片展开。
     const selection = window.getSelection ? String(window.getSelection() || "") : ""
     if (selection) return
     toggleJobTask(card, true)
   })
 
-  // 窗口宽度变了，两行能装下多少字也变了：重新量一次。
   window.addEventListener(
     "resize",
     () => {
@@ -1855,7 +1687,6 @@ function bind() {
 async function boot() {
   bind()
   autosize()
-  // 面板先把空状态画出来：数据到了再填，没数据也是“没有”。
   renderFocus()
   renderWorkers([])
   renderDream()

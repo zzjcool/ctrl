@@ -1,15 +1,3 @@
-// M3 — dreaming (MEMORY.md §7 §10.1).
-//
-// The model is scripted, so every test is about the *write path*: what a good
-// answer becomes, what a duplicate becomes, what a bad answer must not become.
-// The two rules the spec is emphatic about get their own tests: a memory that
-// is replaced is superseded (never deleted), and a dream that fails changes
-// nothing and does not move `last_dream_seq`.
-//
-// The database is a real SQLite file (`:memory:`), the profile is a real file,
-// and the events are the shapes pi-durable writes — nothing here is stubbed
-// below the model.
-
 import assert from "node:assert/strict"
 import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -65,7 +53,6 @@ function log(...drafts: Draft[]): LogEvent[] {
   }))
 }
 
-/** A deterministic clock: every read is one more second. */
 function clock(): () => Date {
   let at = Date.parse("2026-11-20T08:00:00.000Z")
   return () => new Date((at += 1_000))
@@ -112,10 +99,6 @@ async function bag(): Promise<Bag> {
   return { db: openMemoryDb(":memory:"), agentHome, now: clock() }
 }
 
-// ---------------------------------------------------------------------------
-// one good dream
-// ---------------------------------------------------------------------------
-
 test("a dream writes memories, focus and the profile, and moves the watermark", async () => {
   const opened = await bag()
   const reply = JSON.stringify({
@@ -146,7 +129,6 @@ test("a dream writes memories, focus and the profile, and moves the watermark", 
     assert.equal(result.fromSeq, 0)
     assert.equal(result.toSeq, 1)
 
-    // The memory, with what the model declared: kind, tags, importance, source.
     const rows = listMemories(opened.db)
     assert.equal(rows.length, 1)
     const memory = rows[0]
@@ -157,19 +139,16 @@ test("a dream writes memories, focus and the profile, and moves the watermark", 
     assert.equal(memory?.sourceFrom, 0)
     assert.equal(memory?.sourceTo, 1)
 
-    // focus: created by the dream, in the state the model asked for.
     const focus = listFocus(opened.db)
     assert.equal(focus.length, 1)
     assert.equal(focus[0]?.text, "实现 M2 窗口")
     assert.equal(focus[0]?.state, "doing")
     assert.equal(getFocus(opened.db, focus[0]?.id ?? "")?.source, "dream")
 
-    // profile.md, and the prompt carried the events.
     assert.match(readProfile(opened.agentHome) ?? "", /喜欢简洁的回答/)
     assert.match(prompts[0] ?? "", /窗口压缩放在每轮开始前/)
     assert.match(prompts[0] ?? "", /Reply with ONE JSON object/)
 
-    // meta + dream_runs (MEMORY.md §4 §10.1).
     assert.equal(lastDreamSeq(opened.db), 1, "the watermark moved to the last dreamt seq")
     assert.equal(typeof lastDreamAt(opened.db), "string")
     const runs = listDreamRuns(opened.db)
@@ -184,10 +163,6 @@ test("a dream writes memories, focus and the profile, and moves the watermark", 
     opened.db.close()
   }
 })
-
-// ---------------------------------------------------------------------------
-// dedupe and supersede
-// ---------------------------------------------------------------------------
 
 test("the same fact said twice becomes one memory (normalised)", async () => {
   const opened = await bag()
@@ -223,7 +198,7 @@ test("a replaced fact is superseded, never deleted", async () => {
     assert.ok((superseded?.supersededBy ?? "").startsWith("mem-"), "it points at the row that replaced it")
     assert.notEqual(superseded?.supersededBy, old.memory.id)
     assert.equal(getMemory(opened.db, superseded?.supersededBy ?? "")?.text, "Go moved to the laptop")
-    // The default listing hides it; `all` still shows the chain.
+
     assert.deepEqual(listMemories(opened.db).map((row) => row.text), ["Go moved to the laptop"])
     assert.equal(listMemories(opened.db, { includeSuperseded: true }).length, 2)
     assert.equal(liveMemoryCount(opened.db), 1)
@@ -244,10 +219,6 @@ test("a supersede of an unknown id is ignored, not an error", async () => {
     opened.db.close()
   }
 })
-
-// ---------------------------------------------------------------------------
-// focus
-// ---------------------------------------------------------------------------
 
 test("focus is upserted: by id when one is given, by text otherwise", async () => {
   const opened = await bag()
@@ -271,10 +242,6 @@ test("focus is upserted: by id when one is given, by text otherwise", async () =
   }
 })
 
-// ---------------------------------------------------------------------------
-// profile
-// ---------------------------------------------------------------------------
-
 test("each profile rewrite keeps the previous version in profile.history/", async () => {
   const opened = await bag()
   await runDream({
@@ -287,7 +254,7 @@ test("each profile rewrite keeps the previous version in profile.history/", asyn
   await runDream({
     db: opened.db,
     agentHome: opened.agentHome,
-    // A second batch: a dream with nothing new does not even call the model.
+
     events: [...CONVERSATION, { seq: 2, ts: "2026-11-20T07:59:00.000Z", type: "user_message", data: { text: "再做一版画像" } }],
     llm: scriptedDreamLlm(JSON.stringify({ profileRewrite: "# v2" })).llm,
     now: opened.now,
@@ -308,10 +275,6 @@ test("writeProfile refuses an empty rewrite instead of erasing the profile", asy
   assert.throws(() => writeProfile(agentHome, "   "), /non-empty/)
   assert.match(readProfile(agentHome) ?? "", /keep me/)
 })
-
-// ---------------------------------------------------------------------------
-// failure: nothing changes
-// ---------------------------------------------------------------------------
 
 test("a reply that is not JSON is recorded as an error and moves nothing", async () => {
   const opened = await bag()
@@ -355,7 +318,7 @@ test("a write that fails rolls the whole dream back", async () => {
     focus: [{ text: "x", state: "doing" }],
     profileRewrite: "# profile",
   })
-  // A read-only database: BEGIN works, every write throws.
+
   opened.db.exec("PRAGMA query_only = ON")
   const result = await runDream({
     db: opened.db,
@@ -389,25 +352,17 @@ test("an empty payload is a successful dream with nothing to keep", async () => 
   }
 })
 
-// ---------------------------------------------------------------------------
-// the batch
-// ---------------------------------------------------------------------------
-
 test("the batch is at most 40 events or 12 000 characters", () => {
   const many = log(...Array.from({ length: 60 }, () => ({ type: "user_message", data: { text: "hello" } })))
   const capped = dreamBatch(many, -1)
   assert.equal(capped.events.length, DREAM_MAX_EVENTS)
   assert.equal(capped.toSeq, DREAM_MAX_EVENTS - 1)
 
-  // One event is clipped to 2 000 chars before it enters a prompt, so ten
-  // 5 000-char events fit six times, not twice.
   const fat = log(...Array.from({ length: 10 }, () => ({ type: "user_message", data: { text: "x".repeat(5_000) } })))
   const byChars = dreamBatch(fat, -1)
   assert.equal(byChars.events.length, 6, "6 × 2 000 chars fits in 12 000; the seventh would not")
   assert.equal(byChars.chars, DREAM_MAX_CHARS)
 
-  // A single event bigger than the cap is still taken: otherwise the dream
-  // could never move past it.
   const single = dreamBatch(log({ type: "tool_result", data: { output: "y".repeat(20_000) } }), -1)
   assert.equal(single.events.length, 1)
 })
@@ -418,7 +373,6 @@ test("a dream only reads what came after the last one", async () => {
   await runDream({ db: opened.db, agentHome: opened.agentHome, events: CONVERSATION, llm: first.llm, now: opened.now })
   const before = first.prompts.length
 
-  // Same events, nothing new: no model call, no writes, but a run is recorded.
   const idle = scriptedDreamLlm("{}")
   const second = await runDream({
     db: opened.db,
@@ -433,7 +387,6 @@ test("a dream only reads what came after the last one", async () => {
   assert.equal(first.prompts.length, before)
   assert.equal(listDreamRuns(opened.db).length, 2, "the manual run is still visible")
 
-  // A new event brings the batch back, starting after seq 1.
   const grown = [...CONVERSATION, ...log({ type: "user_message", data: { text: "下一步做做梦" } }).map((event) => ({ ...event, seq: 2 }))]
   const third = scriptedDreamLlm("{}")
   const result = await runDream({ db: opened.db, agentHome: opened.agentHome, events: grown, llm: third.llm, now: opened.now })
@@ -475,10 +428,6 @@ test("buildDreamPrompt says so when there are no existing memories", () => {
   assert.match(prompt, /\[seq 0\] user:/)
   assert.match(prompt, /\[seq 1\] assistant:/)
 })
-
-// ---------------------------------------------------------------------------
-// defensive parsing
-// ---------------------------------------------------------------------------
 
 test("extractJsonObject survives fences, prose and braces inside strings", () => {
   assert.equal(extractJsonObject('```json\n{"a":1}\n```'), '{"a":1}')
@@ -523,10 +472,6 @@ test("supersedes may be a string, an id object, or a list", () => {
   assert.deepEqual(objects?.memories[0]?.supersedes, ["mem-2", "mem-3"])
 })
 
-// ---------------------------------------------------------------------------
-// the idle trigger (MEMORY.md §10.1 M3)
-// ---------------------------------------------------------------------------
-
 test("the controller runs one dream at a time and only when the agent is idle", async () => {
   let started = 0
   let now = 1_000 + 599_999
@@ -547,11 +492,9 @@ test("the controller runs one dream at a time and only when the agent is idle", 
     now: () => now,
   })
 
-  // Not idle yet.
   assert.equal(controller.tick(), false)
   assert.equal(controller.running, false)
 
-  // Idle: the tick starts a dream, and a second start joins the one in flight.
   now = 1_000 + 600_000
   assert.equal(controller.tick(), true)
   assert.equal(controller.running, true)
@@ -598,10 +541,6 @@ function emptyDream(): DreamResult {
     batchEvents: 0,
   }
 }
-
-// ---------------------------------------------------------------------------
-// focus_set — the one tool M4 adds
-// ---------------------------------------------------------------------------
 
 test("focus_set creates, edits and never throws", async () => {
   const opened = await bag()

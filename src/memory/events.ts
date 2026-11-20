@@ -1,22 +1,3 @@
-// What one log event says, in the two shapes the memory layer needs (MEMORY.md §5 §7).
-//
-// M1 (./index.ts) owns the *indexed* form of an event — clipped to 2 000 chars,
-// one line per event, built for bm25. M2/M3 need a different pair of views:
-//
-//   eventChars(event)   how much of the model's window this event costs, in
-//                       characters — the budget M2 measures (MEMORY.md §10.1:
-//                       "字符数 > budget"). Deliberately the same accounting
-//                       pi-durable's own compaction uses, so switching the
-//                       engine's compactor off does not change what "the
-//                       transcript" means.
-//   eventText(event)    the event as prose for a summary/dream prompt, or
-//                       undefined for lifecycle noise that carries no meaning.
-//
-// This module is a leaf: no database, no engine types, no I/O. `LogEvent` is a
-// structural subset of the session event, so a `SessionEvent[]` is assignable
-// without importing pi-durable into the memory layer.
-
-/** The part of a session event this layer reads. */
 export interface LogEvent {
   seq: number
   ts?: string
@@ -24,20 +5,12 @@ export interface LogEvent {
   data: unknown
 }
 
-/** One event's prose is clipped before it enters a prompt (a worker log must not). */
 export const EVENT_TEXT_LIMIT = 2_000
 
 export function eventRecord(event: LogEvent): Record<string, unknown> {
   return isRecord(event.data) ? event.data : {}
 }
 
-/**
- * The event as prose for a prompt — or undefined when it has nothing to say.
- *
- * `memory_recall`, `session_created` and `assistant_pending` are plumbing: they
- * name ids and models, not what happened. Feeding them to a summariser only
- * spends tokens on noise.
- */
 export function eventText(event: LogEvent, limit: number = EVENT_TEXT_LIMIT): string | undefined {
   const data = eventRecord(event)
   const text = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined)
@@ -74,7 +47,6 @@ export function eventText(event: LogEvent, limit: number = EVENT_TEXT_LIMIT): st
   return clipped === "" ? undefined : clipped
 }
 
-/** `user` / `assistant` / `tool` read better in a transcript than the wire names. */
 export function eventRole(event: LogEvent): string {
   switch (event.type) {
     case "user_message":
@@ -94,14 +66,6 @@ export function eventRole(event: LogEvent): string {
   }
 }
 
-/**
- * Characters this event costs the model window (MEMORY.md §10.1).
- *
- * Mirrors pi-durable's `eventCharacterCount`: message text, tool output, tool
- * call name+args, memory text/query, summary and error text; markers and
- * `session_created` are free. Counting the same way keeps "over budget" the
- * same number before and after ctrl takes the compactor over.
- */
 export function eventChars(event: LogEvent): number {
   const data = eventRecord(event)
   const length = (value: unknown): number => (typeof value === "string" ? charLength(value) : 0)
@@ -120,7 +84,7 @@ export function eventChars(event: LogEvent): number {
       return length(data.summary)
     case "error":
       return length(data.message)
-    // Markers carry no transcript content.
+
     case "assistant_pending":
     case "session_created":
       return 0
@@ -135,7 +99,6 @@ export function sessionChars(events: LogEvent[]): number {
   return total
 }
 
-/** Code points, so CJK and emoji count as one character each (the budget is chars, not bytes). */
 export function charLength(text: string): number {
   return Array.from(text).length
 }

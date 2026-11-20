@@ -1,25 +1,8 @@
-// The routes of CONTRACT §7, and nothing else (v3: one named agent, no machine).
-//
-// Shape rules that matter to the page:
-//   * `POST /api/agent/messages` answers 202 immediately; the turn runs on.
-//   * a second turn on the agent is 409, never a queue.
-//   * events has three paging modes with the priority `before` > `tail` > `since`,
-//     capped at 200 per call; `since` is a *seq*, never an array index.
-//   * there is no sessions route: the log id is "main" and nobody may ask for another.
-//   * `/api/jobs` is read straight from disk, so a delegate card keeps updating
-//     long after the turn that started the worker has ended.
-//   * the memory routes (MEMORY.md §10.1 M4) are `/api/focus`, `/api/memories`,
-//     `/api/dreams` and `/api/dream`; deleting a memory or a focus item is a
-//     soft write, never a physical delete.
-//   * a broken memory database never takes the server down: search answers
-//     empty, the memory routes answer 503, and turns keep running.
-
 import type { IncomingMessage, ServerResponse } from "node:http"
 import type { DatabaseSync } from "node:sqlite"
 import {
   appendRecord,
-  // Only `/api/memory` still speaks pi-durable's own memory log (CONTRACT §7);
-  // the agent loop's memory is `ctx.agentMemory` (SQLite, MEMORY.md §2).
+
   createMemoryStore,
   detectResumePoint,
   openSession,
@@ -65,35 +48,31 @@ import { createAbortableLlm, type TurnRegistry } from "./turns.ts"
 import type { Waker } from "./wake.ts"
 
 export interface AppContext {
-  /** `<root>`: holds `agents/` and `trash/`. */
+
   root: string
-  /** The agent name this process serves — its identity, not a title. */
+
   agent: string
-  /** `<root>/agents/<name>` — pi-durable's home for this agent, and the jobs. */
+
   agentHome: string
-  /** The directory the agent (and therefore its workers) works in. */
+
   workspace: string
   maxSteps: number
-  /** Model for a log that has not recorded one yet. */
+
   defaultModel: string
-  /** Starts and stops pi workers; the only thing here that touches a process. */
+
   jobs: JobRunner
-  /**
-   * Minutes a worker may run before the sweep kills it; 0 is "no limit".
-   * The sweep itself lives on the runner (`sweepTimeouts`), the timer in
-   * `startServer`; the server reports the number at startup.
-   */
+
   jobTimeoutMinutes: number
-  /** Wakes the agent when a worker exits (B); the runner's `onExit` calls it. */
+
   wake: Waker
   turns: TurnRegistry
-  /** The SQLite mirror of the log (MEMORY.md §4); may be degraded, never absent. */
+
   memory: MemoryIndex
-  /** Characters the model's transcript may cost before M2 compresses it. */
+
   contextBudget: number
-  /** The background dream (M3): one at a time, idle-gated, manually triggerable. */
+
   dreams: DreamController
-  /** `remember`/`recall` for the agent loop, over the `memories` table (M3/M4). */
+
   agentMemory: AgentMemory
   tools: ToolSpec[]
   env: NodeJS.ProcessEnv
@@ -101,7 +80,7 @@ export interface AppContext {
 }
 
 const MEMORY_KINDS = new Set<MemoryKind>(["fact", "preference", "event", "skill"])
-/** CONTRACT §7: no call may return more than this many events. */
+
 export const MAX_EVENTS_PER_CALL = 200
 
 export interface EventPage {
@@ -116,18 +95,6 @@ export interface EventQuery {
   before?: unknown
 }
 
-/**
- * The stream (CONTRACT §7, PLAN §3.3).
- *
- *   since=N          events with seq >= N, at most 200
- *   tail=T           the last T events
- *   before=S&tail=T  the T events before seq S (paging up)
- *
- * Priority is `before` > `tail` > `since`. `since` in the answer is the seq of
- * the first returned event; when there is nothing to return it stays where the
- * caller already is (`since` mode) or is 0 (tail/before mode), which is what
- * stops the page from asking "load earlier" forever.
- */
 export function pageEvents(events: SessionEvent[], query: EventQuery): EventPage {
   const total = events.length
   const before = intParam(query.before)
@@ -146,7 +113,7 @@ export function pageEvents(events: SessionEvent[], query: EventQuery): EventPage
 
   const first = picked[0]
   if (first !== undefined) return { events: picked, total, since: first.seq }
-  // Nothing came back: report where the caller is, clamped into the log.
+
   if (before === undefined && tail === undefined) {
     return { events: [], total, since: Math.min(since !== undefined && since > 0 ? since : 0, total) }
   }
@@ -162,7 +129,6 @@ export async function handleApiRequest(
   if (!url.pathname.startsWith("/api/")) return false
   const method = request.method ?? "GET"
   const segments = url.pathname.split("/").filter((part) => part.length > 0)
-  // ["api", ...]
 
   try {
     if (method === "GET" && url.pathname === "/api/health") {
@@ -187,22 +153,19 @@ export async function handleApiRequest(
         return true
       }
       const q = (url.searchParams.get("q") ?? "").trim()
-      // A blank query is a caller error, not "search everything": /api/search
-      // never dumps the log, it only ever answers a query.
+
       if (q === "") {
         throw new HttpError(400, "q must be a non-empty string (GET /api/search?q=<text>&limit=<1-20>&before=<seq>)")
       }
       const requested = url.searchParams.get("limit")
-      // One clamp for both paths: 1..20, default 8 (task M1 §6).
+
       const limit = clampLimit(requested === null ? undefined : requested)
       const before = intParam(url.searchParams.get("before"))
-      // The mirror is derived, so refresh it before answering: an event appended
-      // between turns (by hand, or by a turn that just ended) is searchable at
-      // once. A refresh that fails must not fail the read.
+
       try {
         ctx.memory.importEvents()
       } catch {
-        // search answers from whatever the mirror already holds, or with nothing.
+
       }
       const hits = ctx.memory.search(q, {
         limit,
@@ -309,7 +272,7 @@ export async function handleApiRequest(
 
       if (method === "DELETE") {
         if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new HttpError(400, "invalid memory id")
-        // A tombstone, never a physical delete (MEMORY.md §10.1).
+
         const row = tombstoneMemory(db, id)
         if (row === undefined) throw new HttpError(404, "memory not found")
         sendJson(response, 200, { deleted: id })
@@ -336,7 +299,7 @@ export async function handleApiRequest(
         return true
       }
       requireMemoryDb(ctx)
-      // The claim happens synchronously, so this check cannot race a start.
+
       if (ctx.dreams.running) throw new HttpError(409, "a dream is already running")
       void ctx.dreams.start()
       sendJson(response, 202, { started: true })
@@ -346,8 +309,7 @@ export async function handleApiRequest(
     if (segments[1] === "agent") {
       const action = segments[2]
       if (segments[3] !== undefined) {
-        // `/api/agent/events/anything` is not a route, and neither is any
-        // other path with a tail on it.
+
         sendJson(response, 404, { error: "not found" })
         return true
       }
@@ -443,8 +405,7 @@ export async function handleApiRequest(
         if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new HttpError(400, "invalid memory id")
         const entry = store.get(id)
         if (!entry || entry.supersededBy) throw new HttpError(404, "memory not found")
-        // Tombstone, not a rewrite: the append-only log stays the truth and the
-        // store already hides superseded rows.
+
         appendRecord(resolvePaths(ctx.agentHome).memoryLog, { ...entry, supersededBy: `deleted:${id}` })
         sendJson(response, 200, { deleted: id })
         return true
@@ -468,10 +429,6 @@ export async function handleApiRequest(
   }
 }
 
-// ---------------------------------------------------------------------------
-// `GET /api/agent` — everything the page's head needs, in one call
-// ---------------------------------------------------------------------------
-
 function describeAgent(ctx: AppContext): Record<string, unknown> {
   repairSession(LOG_ID, { home: ctx.agentHome })
   const log = openSession(LOG_ID, { home: ctx.agentHome })
@@ -484,14 +441,12 @@ function describeAgent(ctx: AppContext): Record<string, unknown> {
     agent: ctx.agent,
     session: {
       ...meta,
-      // The sidecar is the workspace the agent was last started with; the
-      // log's own cwd is the fallback when there is no sidecar yet.
+
       cwd: sidecar?.cwd ?? meta.cwd,
     },
     resumePoint: detectResumePoint(events),
     turn: ctx.turns.state(LOG_ID),
-    // MEMORY.md §10.1 M4: the panel's numbers, in the one call it already polls.
-    // A degraded database answers with zeros rather than failing the page.
+
     memory: {
       memories: db === undefined ? 0 : safeCount(() => liveMemoryCount(db)),
       focusOpen: db === undefined ? 0 : safeCount(() => openFocusCount(db)),
@@ -501,7 +456,6 @@ function describeAgent(ctx: AppContext): Record<string, unknown> {
   }
 }
 
-/** A count that a broken table must not turn into a 500 for the page. */
 function safeCount(read: () => number): number {
   try {
     return read()
@@ -518,7 +472,6 @@ function safeMeta(read: () => string | undefined): string | undefined {
   }
 }
 
-/** CONTRACT §7: the six fields the page polls for a delegate card. */
 export function jobSummary(job: JobView, agentHome?: string): Record<string, unknown> {
   const summary: Record<string, unknown> = {
     id: job.id,
@@ -528,9 +481,7 @@ export function jobSummary(job: JobView, agentHome?: string): Record<string, unk
     elapsedMs: job.elapsedMs,
     ...(typeof job.code === "number" ? { code: job.code } : {}),
   }
-  // The page shows a delegate card long after the turn that started it, and
-  // the tool result only says "started job …". A tail of the worker's own log
-  // is what makes the card worth looking at.
+
   if (agentHome !== undefined) {
     const log = readJobLog(agentHome, job.id, { lines: 15 })
     const text = log.text.trimEnd()
@@ -539,21 +490,6 @@ export function jobSummary(job: JobView, agentHome?: string): Record<string, unk
   return summary
 }
 
-// ---------------------------------------------------------------------------
-// A turn
-// ---------------------------------------------------------------------------
-
-/**
- * One turn of the loop, plus the one thing that must happen after it: the
- * mirror catches up with the log (MEMORY.md §11, M1).
- *
- * The import lives in `finally` because an aborted or failed turn still wrote
- * events worth searching, and because a turn must never be held hostage by its
- * index — `importAfterTurn` cannot throw.
- *
- * Exported for `wake.ts`: a worker that finishes after its turn ended starts a
- * turn through this same path, so a wake is an ordinary turn in every respect.
- */
 export async function runTurn(ctx: AppContext, log: Session, text: string, signal: AbortSignal): Promise<void> {
   try {
     await runTurnOnce(ctx, log, text, signal)
@@ -562,22 +498,14 @@ export async function runTurn(ctx: AppContext, log: Session, text: string, signa
   }
 }
 
-/** Bring `memory.db` up to date after a turn; never throws, never delays a reply. */
 function importAfterTurn(ctx: AppContext): void {
   try {
     ctx.memory.importEvents()
   } catch {
-    // The mirror is a cache: a failed import degrades search, not the turn.
+
   }
 }
 
-/**
- * The whole body of a turn (PLAN §3.3). Runs detached from the request.
- *
- * Failure policy: pi-durable already appended an `error` event for a failed
- * model call, so we must not append a second one. Anything else is recorded on
- * the TurnRegistry only — the log stays a transcript, not a stack trace.
- */
 async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: AbortSignal): Promise<void> {
   const meta = log.meta()
   const sidecar = readSidecar(ctx.agentHome, LOG_ID)
@@ -587,17 +515,11 @@ async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: 
   try {
     base = ctx.createLlm(meta.model !== "" ? meta.model : ctx.defaultModel)
   } catch (error) {
-    // No client at all (no API key, say): the user has to see this one, and
-    // there is no engine turn to write it for us.
+
     log.appendError({ message: `LLM unavailable: ${errorMessage(error)}`, fatal: true })
     throw error
   }
 
-  // MEMORY.md §5 §10.1 M2: bring the window back under the budget *before* the
-  // engine reads it. This is the only compactor: the engine's own is switched
-  // off below (`compactThreshold: MAX_SAFE_INTEGER`). compressWindow never
-  // throws and never blocks the turn — a failed summary means the turn runs
-  // with the window it already has.
   try {
     await compressWindow(log, {
       llm: createAbortableLlm(base, signal),
@@ -606,7 +528,7 @@ async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: 
       signal,
     })
   } catch {
-    // Belt and braces: nothing about a summary may stop a turn.
+
   }
 
   const before = log.events().length
@@ -616,21 +538,16 @@ async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: 
       input: text,
       session: log,
       llm: createAbortableLlm(base, signal),
-      // MEMORY.md §2 §7: remember/recall read and write the SQLite `memories`
-      // table — the same table dreaming writes and the page reviews. (The old
-      // pi-durable memory log is now only what `/api/memory` still exposes.)
+
       memory: ctx.agentMemory,
       tools: ctx.tools,
       cwd,
       maxSteps: ctx.maxSteps,
-      // MEMORY.md §10.1: ctrl decides when to compress (see above), so the
-      // engine's own threshold is pushed out of reach.
+
       compactThreshold: Number.MAX_SAFE_INTEGER,
-      // ctrl has no hands (CONTRACT §2): the engine still takes the flag, but
-      // nothing in the tool set can reach it.
+
       allowBash: false,
-      // Rebuilt every turn: a restarted ctrl may be in a different directory,
-      // and the model must not be told the old one.
+
       systemPrompt: buildSystemPrompt({
         name: ctx.agent,
         cwd,
@@ -640,7 +557,7 @@ async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: 
     })
   } catch (error) {
     if (signal.aborted) {
-      // The engine saw a failed request; say plainly what happened instead.
+
       log.appendError({ message: "turn aborted by the user", fatal: false })
       return
     }
@@ -653,12 +570,6 @@ async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: 
   }
 }
 
-/** CONTRACT §6, verbatim: the agent's name and what it is (and is not). */
-/**
- * The prompt the agent actually runs with (MEMORY.md §5): identity + the
- * curated profile + what it currently cares about. Profile and focus are
- * rebuilt every turn so a dream that ran between turns lands immediately.
- */
 export function buildSystemPrompt(opts: {
   name: string
   cwd: string
@@ -682,22 +593,12 @@ export function agentSystemPrompt(opts: { name: string; cwd: string }): string {
     `You are ${opts.name}, a persistent agent with long-term memory. ` +
     "You do not edit files or run commands yourself: delegate work to a pi worker with the delegate tool, " +
     "then report what it did. The log is your memory; there is no conversation. " +
-    // MEMORY.md §5: the window is not the memory. Names the one tool that
-    // reaches past it, so the model does not answer "I don't have that" from a
-    // short context.
+
     "You can search your entire history with search_context(query) — use it when the user refers to something not in the recent context. " +
     `Your workspace is ${opts.cwd}.`
   )
 }
 
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-/**
- * `slice(-0)` is the whole array, so a T of 0 (or a negative) must be handled
- * as "nothing requested", never as a slice index.
- */
 function limitTail(events: SessionEvent[], requested: number): SessionEvent[] {
   const limit = Math.min(Math.floor(requested), MAX_EVENTS_PER_CALL)
   if (limit <= 0) return []
@@ -717,16 +618,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-// ---------------------------------------------------------------------------
-// focus / memories / dreams — the M4 routes' two shapes and one guard
-// ---------------------------------------------------------------------------
-
-/** MEMORY.md §10.1: exactly the five fields the panel reads. */
 function focusView(item: FocusItem): Record<string, unknown> {
   return { id: item.id, text: item.text, state: item.state, updatedAt: item.updatedAt, seq: item.seq ?? null }
 }
 
-/** MEMORY.md §4's columns, in the model's casing; `supersededBy` is the tombstone chain. */
 function memoryView(row: MemoryRow): Record<string, unknown> {
   return {
     id: row.id,
@@ -743,25 +638,12 @@ function memoryView(row: MemoryRow): Record<string, unknown> {
   }
 }
 
-/**
- * The memories/focus/dream tables live in the same database as the mirror.
- * When it could not be opened the server still serves turns and the page —
- * these four routes are the only ones that answer 503.
- */
 function requireMemoryDb(ctx: AppContext): DatabaseSync {
   const db = ctx.memory.handle()
   if (db === undefined) throw new HttpError(503, `memory database unavailable${ctx.memory.error !== undefined ? `: ${ctx.memory.error}` : ""}`)
   return db
 }
 
-/**
- * One dream, built from the live context (MEMORY.md §10.1 M3): the log as it is
- * now, the database, and a client created lazily.
- *
- * `createLlm` throws when there is no API key; creating the client inside
- * `complete` means that failure lands in runDream's error path and is recorded
- * in `dream_runs` like any other failed dream.
- */
 export async function dreamOnce(ctx: AppContext): Promise<DreamResult> {
   const db = requireMemoryDb(ctx)
   const log = openSession(LOG_ID, { home: ctx.agentHome })
@@ -772,7 +654,6 @@ export async function dreamOnce(ctx: AppContext): Promise<DreamResult> {
       return await client.complete(request)
     },
   }
-  // A manual dream is also the "tidy the panel now" button: review focus even
-  // when the log has nothing new.
+
   return await runDream({ db, agentHome: ctx.agentHome, events: log.events(), llm, force: true })
 }

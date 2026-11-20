@@ -1,24 +1,13 @@
-// focus — what the agent thinks it is doing right now (MEMORY.md §4 §8).
-//
-// This is not a todo app. It holds at most a handful of items, written by the
-// agent itself (`focus_set`), tidied by dreaming, and closed by a click on the
-// page (DELETE /api/focus/:id). The interesting column is `state`, because it
-// is what the panel sorts by: doing → open → blocked → done.
-//
-// `done` is terminal but not destructive: the row stays, so the dreaming pass
-// can see that something finished instead of meeting it again as new.
-
 import type { DatabaseSync } from "node:sqlite"
 import { isRecord } from "./events.ts"
 
-/** MEMORY.md §10.1: open|doing|blocked|done. */
 export const FOCUS_STATES = ["open", "doing", "blocked", "done"] as const
 export type FocusState = (typeof FOCUS_STATES)[number]
 export const DEFAULT_FOCUS_STATE: FocusState = "open"
-/** Sort order for the panel: what is being done now comes first (MEMORY.md §10 §11 M4). */
+
 export const FOCUS_ORDER: Record<FocusState, number> = { doing: 0, open: 1, blocked: 2, done: 3 }
 export const MAX_FOCUS_TEXT = 500
-/** The panel shows at most 10 (MEMORY.md §8); the API defaults to the same. */
+
 export const DEFAULT_FOCUS_LIMIT = 10
 export const MAX_FOCUS_LIMIT = 50
 
@@ -27,9 +16,9 @@ export interface FocusItem {
   text: string
   state: FocusState
   updatedAt: string
-  /** The event seq that introduced the item, when there is one. */
+
   seq?: number
-  /** agent | dream | user — who wrote it last. */
+
   source?: string
 }
 
@@ -42,10 +31,10 @@ export interface UpsertFocusInput {
   id?: string
   text?: string
   state?: string
-  /** Who is writing: `agent` (tool), `dream`, `user` (page). */
+
   source?: string
   seq?: number
-  /** Only used when a new row is created; production ids are generated. */
+
   now?: Date
 }
 
@@ -70,7 +59,6 @@ export function newFocusId(now: Date = new Date()): string {
   return `foc-${stamp}-${random}`
 }
 
-/** The items the panel shows, ordered doing → open → blocked → done. */
 export function listFocus(db: DatabaseSync, opts: ListFocusOptions = {}): FocusItem[] {
   const includeDone = opts.includeDone === true
   const limit = clampLimit(opts.limit)
@@ -95,7 +83,6 @@ export function getFocus(db: DatabaseSync, id: string): FocusItem | undefined {
   return row === undefined ? undefined : mapRow(row)
 }
 
-/** How many items are still active — the number `GET /api/agent` reports. */
 export function openFocusCount(db: DatabaseSync): number {
   const row = db
     .prepare("SELECT count(*) AS n FROM focus WHERE state IS NULL OR state <> 'done'")
@@ -104,15 +91,6 @@ export function openFocusCount(db: DatabaseSync): number {
   return typeof value === "bigint" ? Number(value) : typeof value === "number" ? value : 0
 }
 
-/**
- * Create or update one item (MEMORY.md §10.1 `focus_set`, `POST /api/focus`).
- *
- *   id given, row exists     update text/state
- *   id given, row missing    create it with that id (a dream may address an id
- *                            it saw in the same prompt)
- *   no id, same text exists  update that row instead of adding a twin
- *   otherwise                create a new `open` item
- */
 export function upsertFocus(db: DatabaseSync, input: UpsertFocusInput): FocusItem {
   const now = input.now ?? new Date()
   const stamp = now.toISOString()
@@ -174,17 +152,12 @@ export function upsertFocus(db: DatabaseSync, input: UpsertFocusInput): FocusIte
   return getFocus(db, fresh) as FocusItem
 }
 
-/** `DELETE /api/focus/:id` — soft: the row becomes `done`. */
 export function completeFocus(db: DatabaseSync, id: string, now: Date = new Date()): FocusItem | undefined {
   const existing = getFocus(db, id)
   if (existing === undefined) return undefined
   db.prepare("UPDATE focus SET state = 'done', updated_at = ? WHERE id = ?").run(now.toISOString(), id)
   return getFocus(db, id)
 }
-
-// ---------------------------------------------------------------------------
-// internals
-// ---------------------------------------------------------------------------
 
 function mapRow(raw: unknown): FocusItem {
   const row = isRecord(raw) ? raw : {}

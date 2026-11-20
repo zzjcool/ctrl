@@ -1,11 +1,3 @@
-// Worker jobs: delegate → job_status → job_stop, on a real disk.
-//
-// `pi` is never called for real. A tiny /bin/sh script stands in for it and
-// takes its behaviour from the environment (exit code, how much it prints, how
-// long it sleeps), so a job can be made to succeed, fail, flood its log or
-// hang on command. Everything else is real: real spawn, real files, real
-// SIGTERM, real state read back from meta.json.
-
 import assert from "node:assert/strict"
 import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -29,10 +21,6 @@ import {
 } from "../../src/jobs/store.ts"
 import type { JobMeta, JobView } from "../../src/jobs/store.ts"
 import { createJobTools } from "../../src/jobs/tools.ts"
-
-// ---------------------------------------------------------------------------
-// The fake pi — behaviour driven by FAKE_PI_* so one script covers every case
-// ---------------------------------------------------------------------------
 
 const FAKE_PI_SOURCE = `#!/bin/sh
 printf 'args: %s\\n' "$*"
@@ -59,7 +47,6 @@ type EnvKey = (typeof ENV_KEYS)[number]
 
 const savedEnv = new Map<EnvKey, string | undefined>(ENV_KEYS.map((key) => [key, process.env[key]]))
 
-/** Set exactly the given knobs and clear the rest, so tests cannot leak. */
 function setEnv(vars: Partial<Record<EnvKey, string>>): void {
   for (const key of ENV_KEYS) {
     const value = vars[key]
@@ -99,7 +86,6 @@ function makeRunner(opts: Partial<RunnerConfig> = {}): JobRunner {
   })
 }
 
-/** The ToolContext the engine would hand a tool; only `cwd` matters here. */
 function toolContext(cwd: string): ToolContext {
   return { cwd, allowBash: false, timeoutMs: 10_000, maxOutputChars: 8_000 }
 }
@@ -110,7 +96,6 @@ function jobTool(runner: JobRunner, name: string) {
   return tool
 }
 
-/** Pull the job id back out of `started job <id> — poll with job_status`. */
 function idOf(output: string): string {
   const match = /^started job (\S+) — poll with job_status$/.exec(output)
   assert.ok(match, `unexpected delegate output: ${output}`)
@@ -142,7 +127,6 @@ async function waitForLog(id: string, needle: string, timeoutMs = 5_000): Promis
   }
 }
 
-/** A pid that is certainly not alive on this machine. */
 function deadPid(): number {
   for (let pid = 900_000; pid < 900_100; pid += 1) {
     if (!isProcessAlive(pid)) return pid
@@ -150,7 +134,6 @@ function deadPid(): number {
   throw new Error("no free pid found")
 }
 
-/** Write a meta.json by hand — the "ctrl restarted, only the disk is left" case. */
 async function seedJob(id: string, startedAt: string, meta: Partial<JobMeta> = {}): Promise<string> {
   await mkdir(jobPaths(agentHome, id).dir, { recursive: true })
   writeJobMeta(agentHome, {
@@ -177,10 +160,6 @@ after(async () => {
   restoreEnv()
   for (const dir of scratch) await rm(dir, { recursive: true, force: true })
 })
-
-// ---------------------------------------------------------------------------
-// ids and argv
-// ---------------------------------------------------------------------------
 
 test("a job id is 20261120T080102Z-a1b2c3 shaped and sortable", () => {
   const early = newJobId(new Date("2026-11-20T08:01:02Z"), "aaaaaa")
@@ -214,10 +193,6 @@ test("the worker command line is the frozen one (CONTRACT §5.1)", () => {
   )
 })
 
-// ---------------------------------------------------------------------------
-// delegate
-// ---------------------------------------------------------------------------
-
 test("delegate starts a detached pi worker, writes the job dir, and returns at once", async () => {
   setEnv({ FAKE_PI_SLEEP: "0.6" })
   const runner = makeRunner()
@@ -232,7 +207,6 @@ test("delegate starts a detached pi worker, writes the job dir, and returns at o
     const id = reply.id as string
     assert.match(id, JOB_ID_PATTERN)
 
-    // The directory shape of CONTRACT §5.1.
     const paths = jobPaths(agentHome, id)
     assert.ok((await stat(paths.metaPath)).isFile())
     assert.ok((await stat(paths.logPath)).isFile())
@@ -249,12 +223,10 @@ test("delegate starts a detached pi worker, writes the job dir, and returns at o
     assert.equal(meta?.exitedAt, undefined)
     assert.equal(readJob(agentHome, id)?.state, "running")
 
-    // The worker really ran with the frozen argv, in the job's own session dir.
     const log = await waitForLog(id, "args: -p say hi --provider any-endpoint")
     assert.match(log, new RegExp(`--session-dir ${paths.piDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`))
     assert.match(log, new RegExp(`--session-id ${id}`))
 
-    // And it outlives this process: a *fresh* reader sees it as running.
     assert.equal(readJob(agentHome, id)?.state, "running")
     assert.equal(countRunning(agentHome), 1)
 
@@ -289,7 +261,6 @@ test("a finished worker is read from disk: state, exit code and the output tail"
     assert.match(shown.output, /done/)
     assert.match(shown.output, /something on stderr/, "stderr lands in the same log")
 
-    // state is on disk, not in the runner: a fresh reader gets the same answer.
     assert.equal(readJob(agentHome, id)?.state, "failed")
     assert.equal(makeRunner().delegate({ task: "" }, work).ok, false, "and the cap/validation still answers")
   } finally {
@@ -314,7 +285,7 @@ test("delegate is refused past the concurrency cap, in words the model can act o
     assert.equal(third.id, undefined, "a refused delegate starts nothing")
 
     for (const id of [first.id, second.id]) await runner.stop(id as string)
-    // Once they are gone the cap opens up again.
+
     const fourth = runner.delegate({ task: "four" }, work)
     assert.equal(fourth.ok, true, fourth.output)
     await runner.stop(fourth.id as string)
@@ -328,7 +299,7 @@ test("delegate refuses a task or a cwd it cannot honour — without throwing", a
   const work = await scratchDir("ctrl-jobs-work-")
   assert.equal(runner.delegate({ task: "   " }, work).ok, false)
   assert.match(runner.delegate({ task: "x", cwd: "/definitely/not/here-ctrl" }, work).output, /cwd does not exist/)
-  // A relative cwd is read against the workspace, never against ctrl's own cwd.
+
   const nested = path.join(work, "sub")
   await mkdir(nested)
   const reply = runner.delegate({ task: "relative", cwd: "sub" }, work)
@@ -336,10 +307,6 @@ test("delegate refuses a task or a cwd it cannot honour — without throwing", a
   assert.equal(readJobMeta(agentHome, reply.id as string)?.cwd, nested)
   await runner.stop(reply.id as string)
 })
-
-// ---------------------------------------------------------------------------
-// job_status
-// ---------------------------------------------------------------------------
 
 test("job_status with no id lists the recent jobs, newest first", async () => {
   const runner = makeRunner()
@@ -361,13 +328,12 @@ test("job_status with no id lists the recent jobs, newest first", async () => {
   assert.match(lines[0] ?? "", /^\S+ {2}exited +[\d.]+s {2}the newer one$/)
   assert.ok(reply.output.includes("older task with a long tail"), "the task is shown")
 
-  // `lines` is a tail of the log; `full` is the whole thing.
   const tail = await status.execute({ id: newer.id, lines: 2 }, toolContext(work))
   assert.ok(tail.output.trimEnd().endsWith("done"), tail.output)
 })
 
 test("full=true returns the whole log but stops at 20000 characters and says so", async () => {
-  setEnv({ FAKE_PI_BIG: "300" }) // ~300 lines x 110 chars, comfortably over the cap
+  setEnv({ FAKE_PI_BIG: "300" })
   const runner = makeRunner()
   const work = await scratchDir("ctrl-jobs-work-")
   try {
@@ -385,7 +351,6 @@ test("full=true returns the whole log but stops at 20000 characters and says so"
     assert.ok(shown.output.includes(`truncated to the last ${MAX_OUTPUT_CHARS} characters`), shown.output)
     assert.ok(shown.output.length < MAX_OUTPUT_CHARS + 2_000)
 
-    // The default is a tail, so a flood does not become a wall of text.
     const tail = await status.execute({ id }, toolContext(work))
     const body = tail.output.split("\n\n").slice(1).join("\n\n")
     assert.equal(body.trim().split("\n").length, 40, "default is the last 40 lines")
@@ -393,10 +358,6 @@ test("full=true returns the whole log but stops at 20000 characters and says so"
     setEnv({})
   }
 })
-
-// ---------------------------------------------------------------------------
-// job_stop
-// ---------------------------------------------------------------------------
 
 test("job_stop SIGTERMs the worker and the job then reads killed from disk alone", async () => {
   setEnv({ FAKE_PI_SLEEP: "30" })
@@ -427,13 +388,9 @@ test("job_stop SIGTERMs the worker and the job then reads killed from disk alone
   }
 })
 
-// ---------------------------------------------------------------------------
-// the timeout sweep (A)
-// ---------------------------------------------------------------------------
-
 test("a worker past the job timeout is killed by the sweep, and its log says why", async () => {
   setEnv({ FAKE_PI_SLEEP: "5" })
-  const runner = makeRunner() // DEFAULT_JOB_TIMEOUT_MINUTES = 30
+  const runner = makeRunner()
   const work = await scratchDir("ctrl-jobs-work-")
   try {
     assert.equal(runner.jobTimeoutMinutes, 30)
@@ -442,17 +399,14 @@ test("a worker past the job timeout is killed by the sweep, and its log says why
     const pid = readJobMeta(agentHome, id)?.pid ?? 0
     assert.equal(isProcessAlive(pid), true)
 
-    // Sweep from a minute past the limit instead of sleeping for 31 minutes.
     const stopped = await runner.sweepTimeouts(Date.now() + 31 * 60_000)
     assert.deepEqual(stopped, [id])
 
-    // `killed` is the state `job_stop` already produces; nothing new to explain.
     const job = readJob(agentHome, id)
     assert.equal(job?.state, "killed")
     assert.equal(job?.signal, "SIGTERM")
     assert.equal(isProcessAlive(pid), false, "the worker's process group is gone")
 
-    // The reason is in the worker's own log, where job_status shows it.
     const log = readJobLog(agentHome, id, { full: true }).text
     assert.match(log, /ctrl: job exceeded 30m — stopped/)
     const status = jobTool(runner, "job_status")
@@ -460,7 +414,6 @@ test("a worker past the job timeout is killed by the sweep, and its log says why
     assert.match(shown.output, /state: killed/)
     assert.match(shown.output, /ctrl: job exceeded 30m — stopped/)
 
-    // Sweeping again is a no-op: a job is stopped once.
     assert.deepEqual(await runner.sweepTimeouts(Date.now() + 31 * 60_000), [])
   } finally {
     setEnv({})
@@ -471,9 +424,7 @@ test("the sweep leaves a worker alone until it is actually past the timeout", as
   setEnv({ FAKE_PI_SLEEP: "5" })
   const work = await scratchDir("ctrl-jobs-work-")
   try {
-    // `--job-timeout 0` means no limit at all: not even the year 3000 kills it.
-    // The check runs before anything is started, so it cannot sweep another
-    // test's worker either.
+
     const unlimited = makeRunner({ jobTimeoutMinutes: 0 })
     assert.equal(unlimited.jobTimeoutMinutes, 0)
     assert.deepEqual(await unlimited.sweepTimeouts(Date.now() + 365 * 24 * 60 * 60_000), [])
@@ -482,20 +433,17 @@ test("the sweep leaves a worker alone until it is actually past the timeout", as
     const reply = runner.delegate({ task: "still young" }, work)
     const id = idOf(reply.output)
 
-    // Exactly at the limit is not over it, and a fresh job is nowhere near it.
     const startedAt = Date.parse(readJobMeta(agentHome, id)?.startedAt ?? "")
     assert.deepEqual(await runner.sweepTimeouts(startedAt + 30 * 60_000), [], "elapsed == timeout is not over")
     assert.deepEqual(await runner.sweepTimeouts(), [])
     assert.equal(readJob(agentHome, id)?.state, "running")
 
-    // The job's own 0-limit runner must not touch it either.
     assert.deepEqual(await unlimited.sweepTimeouts(startedAt + 365 * 24 * 60 * 60_000), [])
     assert.equal(readJob(agentHome, id)?.state, "running", "0 disables the sweep")
 
     await runner.stop(id)
     assert.equal(readJob(agentHome, id)?.state, "killed")
 
-    // A job that already exited is never swept, however old it looks.
     assert.equal(countRunning(agentHome), 0)
     assert.deepEqual(await runner.sweepTimeouts(Date.now() + 365 * 24 * 60 * 60_000), [])
   } finally {
@@ -525,10 +473,6 @@ test("the tools answer a bad id with a sentence instead of throwing", async () =
   assert.match(stopNothing.output, /requires an id/)
 })
 
-// ---------------------------------------------------------------------------
-// state comes from the disk (the "ctrl restarted" cases)
-// ---------------------------------------------------------------------------
-
 test("a job's state is derived from meta.json plus a liveness probe", async () => {
   const live = await seedJob(newJobId(new Date("2026-11-20T08:00:00Z"), "live01"), "2020-01-01T00:00:00.000Z", {
     pid: process.pid,
@@ -556,18 +500,15 @@ test("a job's state is derived from meta.json plus a liveness probe", async () =
   assert.equal(readJob(agentHome, bad)?.state, "failed")
   assert.equal(readJob(agentHome, killed)?.state, "killed")
 
-  // elapsedMs is (exitedAt ?? now) - startedAt.
   assert.equal(readJob(agentHome, ok)?.elapsedMs, 10_000)
   assert.ok((readJob(agentHome, live)?.elapsedMs ?? 0) > 0)
 
-  // listJobs is newest first, whatever else is in the directory.
   const seeded = [live, dead, ok, bad, killed]
   const listed = listJobs(agentHome, { limit: 0 })
     .map((job) => job.id)
     .filter((id) => seeded.includes(id))
   assert.deepEqual(listed, [killed, bad, ok, dead, live])
 
-  // An empty or missing jobs directory is an empty list, not a crash.
   const empty = await scratchDir("ctrl-jobs-empty-")
   assert.deepEqual(listJobs(empty), [])
   assert.equal(readJob(empty, "20261120T080102Z-ffffff"), undefined)
@@ -575,7 +516,7 @@ test("a job's state is derived from meta.json plus a liveness probe", async () =
 })
 
 test("a job directory that was hand-made in an earlier run is still readable", async () => {
-  // Exactly what the smoke test does: write a job dir, then read the store.
+
   const home = await scratchDir("ctrl-jobs-handmade-")
   const id = "20261120T080102Z-a1b2c3"
   await mkdir(path.join(home, "jobs", id, "pi"), { recursive: true })
@@ -616,14 +557,9 @@ test("a missing pi binary is refused up front, not turned into a ghost job", asy
   assert.match(missing.output, /--pi-bin/)
   assert.equal(listJobs(agentHome, { limit: 0 }).length, before, "a refused delegate leaves no job directory")
 
-  // A bare name is resolved on PATH; a name nobody installed is refused too.
   const onPath = makeRunner({ piBin: "ctrl-no-such-pi-binary" })
   assert.match(onPath.delegate({ task: "not on PATH" }, work).output, /pi binary not found/)
 })
-
-// ---------------------------------------------------------------------------
-// The tool layer waits (so the model does not burn its step budget polling)
-// ---------------------------------------------------------------------------
 
 test("the delegate tool waits out a fast worker and returns the finished job", async () => {
   setEnv({ FAKE_PI_SLEEP: "0.2", FAKE_PI_LINES: "1" })

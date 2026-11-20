@@ -1,12 +1,3 @@
-// The three tools ctrl has instead of hands (CONTRACT §5).
-//
-//   delegate    start a pi worker, return immediately
-//   job_status  read a job from disk (or list the recent ones)
-//   job_stop    SIGTERM the worker's process group
-//
-// Everything returns `{ ok, output }` and nothing throws: a tool error is a
-// sentence the model can act on, not a stack trace in the transcript.
-
 import type { JsonSchema, ToolResult, ToolSpec } from "../engine/durable.ts"
 import type { JobRunner } from "./runner.ts"
 import {
@@ -19,17 +10,12 @@ import {
   waitForJob,
 } from "./store.ts"
 
-/**
- * How long a tool waits for a worker inside one call. The engine kills a tool
- * at 10 s, so this leaves room for the disk reads around it. It exists because
- * a model that polls every second burns its whole step budget on a 40 s job.
- */
 export const DEFAULT_WAIT_MS = 8_000
 import type { JobState, JobView } from "./store.ts"
 
 export interface JobToolsOptions {
   runner: JobRunner
-  /** `<root>/agents/<name>` — where the jobs live. */
+
   agentHome: string
 }
 
@@ -49,7 +35,6 @@ async function guard(run: () => Promise<ToolResult> | ToolResult): Promise<ToolR
   }
 }
 
-/** `3.2s`, `1m 05s`, `2h 03m` — short enough for a status line. */
 export function formatElapsed(ms: number): string {
   const total = Number.isFinite(ms) && ms > 0 ? Math.floor(ms) : 0
   if (total < 60_000) return `${(total / 1000).toFixed(1)}s`
@@ -59,7 +44,6 @@ export function formatElapsed(ms: number): string {
   return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`
 }
 
-/** `exit: 0` for a code, `exit: signal SIGTERM` for a signal, nothing if unknown. */
 export function formatExit(job: JobView): string | undefined {
   if (typeof job.code === "number") return `exit: ${job.code}`
   if (typeof job.signal === "string" && job.signal !== "") return `exit: signal ${job.signal}`
@@ -67,7 +51,6 @@ export function formatExit(job: JobView): string | undefined {
   return undefined
 }
 
-/** Clamp the model's `wait` argument into the window the engine allows. */
 function waitMs(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_WAIT_MS
   return Math.max(0, Math.min(8_500, Math.floor(value)))
@@ -84,7 +67,6 @@ const STATE_HINTS: Partial<Record<JobState, string>> = {
   killed: "the worker was stopped",
 }
 
-/** One job: what it is, how it ended, and the tail of what it said. */
 export function renderJobStatus(
   agentHome: string,
   job: JobView,
@@ -143,8 +125,7 @@ export function createJobTools(opts: JobToolsOptions): ToolSpec[] {
             ctx.cwd,
           )
           if (!reply.ok || reply.id === undefined) return reply
-          // Fast tasks finish inside the same call; the model gets the answer
-          // instead of an id it has to chase.
+
           const wait = waitMs(args.wait)
           const job = await waitForJob(agentHome, reply.id, wait)
           if (job === undefined || job.state === "running") {

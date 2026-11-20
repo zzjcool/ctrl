@@ -1,7 +1,3 @@
-// The prompt the agent runs with (MEMORY.md §5): identity, the curated
-// profile, and what it is currently focused on. Profile and focus live in
-// files/tables, so a dream that ran between turns shows up immediately.
-
 import assert from "node:assert/strict"
 import { mkdtemp, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -13,7 +9,7 @@ import { upsertFocus } from "../../src/memory/focus.ts"
 
 const homes: string[] = []
 after(() => {
-  // The temp dirs are small and the OS cleans /tmp; nothing to unlink here.
+
   homes.length = 0
 })
 

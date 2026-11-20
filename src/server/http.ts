@@ -1,8 +1,3 @@
-// HTTP plumbing: JSON in/out, static files, and one error type.
-//
-// The 1 MB body cap is not a nicety: this process holds the only copy of the
-// conversation and a runaway paste should be rejected before it is parsed.
-
 import { readFile, stat } from "node:fs/promises"
 import type { IncomingMessage, ServerResponse } from "node:http"
 import path from "node:path"
@@ -39,7 +34,6 @@ export function sendText(response: ServerResponse, status: number, value: string
   response.end(value)
 }
 
-/** Read a JSON object body, capped at `maxBytes`. Throws HttpError. */
 export async function readJson(
   request: IncomingMessage,
   opts: { maxBytes?: number } = {},
@@ -66,10 +60,6 @@ export async function readJson(
   return parsed as Record<string, unknown>
 }
 
-/**
- * Serve one file from `root`. Returns false when nothing was written so the
- * caller can decide (it always answers 404, but the signature keeps it honest).
- */
 export async function serveStatic(
   request: IncomingMessage,
   response: ServerResponse,
@@ -91,7 +81,7 @@ export async function serveStatic(
   const relative = decoded === "/" || decoded === "" ? "/index.html" : decoded
   const base = path.resolve(root)
   const target = path.resolve(base, `.${relative}`)
-  // Path traversal guard: the resolved path must stay inside the public dir.
+
   if (target !== base && !target.startsWith(`${base}${path.sep}`)) {
     sendText(response, 403, "forbidden")
     return true
@@ -117,7 +107,7 @@ export async function serveStatic(
   response.writeHead(200, {
     "content-type": contentType(target),
     "content-length": body.byteLength,
-    // The page is a live view of a log; a cached copy is a lie.
+
     "cache-control": "no-cache",
   })
   if (method === "HEAD") response.end()

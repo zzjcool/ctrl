@@ -1,16 +1,3 @@
-// `search_context` — the agent's one way back into its own history (MEMORY.md §6).
-//
-// The window only holds the recent turns; everything older is still in the log
-// and searchable here. The output is deliberately boring to read and cheap to
-// parse: one line per hit, timestamp + seq + kind, then the snippet. The seq is
-// in the line because it is the paging token — `before=<seq>` walks backwards.
-//
-// `focus_set` lives here too: it is the same kind of thing — a small, total
-// function from the model's arguments to the memory layer's tables.
-//
-// Tool discipline (same as src/jobs/tools.ts): it never throws. A broken index
-// is a sentence the model can act on, not a stack trace in the transcript.
-
 import type { DatabaseSync } from "node:sqlite"
 import type { JsonSchema, ToolResult, ToolSpec } from "../engine/durable.ts"
 import { errorMessage } from "./events.ts"
@@ -18,52 +5,40 @@ import { FOCUS_STATES, isFocusState, upsertFocus, type FocusItem } from "./focus
 import { DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, type MemoryHit, type MemoryIndex } from "./index.ts"
 import { searchMemories, type MemoryRow } from "./memories.ts"
 
-/** `2026-11-20T07:52:56.123Z` → `2026-11-20 07:52:56`; anything else is left alone. */
 export function formatEventTime(ts: string): string {
   const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/.exec(ts)
   return match === null ? ts : `${match[1]} ${match[2]}`
 }
 
-/** `user` / `assistant` read better than the wire names; the rest are already plain. */
 export function eventKind(type: string): string {
   if (type === "user_message") return "user"
   if (type === "assistant_message") return "assistant"
   return type
 }
 
-/** One hit as one line: a long tool log must not become a paragraph. */
 export function renderHit(hit: MemoryHit): string {
   const body = hit.body.replace(/\s+/g, " ").trim()
   return `[${formatEventTime(hit.ts)} seq ${hit.seq} ${eventKind(hit.type)}] ${body}`
 }
 
-/** The exact hint the model needs to page backwards (task M1 §5). */
 export function pagingHint(oldestSeq: number): string {
   return `(older: search_context with before=${oldestSeq})`
 }
 
-/**
- * A memory hit as one line — `memory` where an event would print its type, and
- * the memory id in place of a seq (a memory is not a log position).
- */
 export function renderMemoryHit(row: MemoryRow): string {
   const at = formatEventTime(row.updatedAt !== "" ? row.updatedAt : row.createdAt)
   return `[${at} memory ${row.id}] ${row.text.replace(/\s+/g, " ").trim()}`
 }
 
-/** How many memories ride along with an event search (they are conclusions, not pages). */
 export const MEMORY_RESULT_LIMIT = 3
 
 export interface SearchContextOptions {
   index: MemoryIndex
-  /**
-   * The `memories` table (`MemoryIndex.handle()`), so a search finds what the
-   * agent concluded and not only what was said. Undefined when degraded.
-   */
+
   db?: DatabaseSync
-  /** Override the default page size (tests). */
+
   defaultLimit?: number
-  /** Override how many memories are listed with a search (tests). */
+
   memoryLimit?: number
 }
 
@@ -113,13 +88,10 @@ export function createSearchContextTool(opts: SearchContextOptions): ToolSpec {
       const query = typeof args.query === "string" ? args.query.trim() : ""
       if (query === "") return { ok: true, output: "search_context needs a non-empty query" }
       if (!index.available) {
-        // Degraded on purpose (task M1 §8): the turn goes on without history.
+
         return { ok: true, output: `search_context is unavailable: ${index.error ?? "the memory index is not open"}` }
       }
-      // The mirror is only a cache of events.jsonl, so catch it up first: a turn
-      // in progress has already written events (the user's message, this tool
-      // call), and the model should be able to find them. A no-op when nothing
-      // is new, and it never throws.
+
       index.importEvents()
 
       const requested = integerArg(args.limit)
@@ -129,9 +101,7 @@ export function createSearchContextTool(opts: SearchContextOptions): ToolSpec {
         limit,
         ...(before !== undefined && before >= 0 ? { beforeSeq: before } : {}),
       })
-      // MEMORY.md §6: memories come first — a conclusion outranks the paragraph
-      // it was drawn from — and only on the first page, because `before` pages
-      // through events and a memory has no seq to page by.
+
       const memories =
         opts.db === undefined || (before !== undefined && before >= 0)
           ? []
@@ -139,36 +109,23 @@ export function createSearchContextTool(opts: SearchContextOptions): ToolSpec {
       if (hits.length === 0 && memories.length === 0) return { ok: true, output: `no matches for "${query}"` }
 
       const lines = [...memories.map(renderMemoryHit), ...hits.map(renderHit)]
-      // Only when the event page is full: a hint nobody can act on is noise.
-      // bm25 ordering means the oldest hit is not the last one — take the minimum.
+
       if (hits.length >= limit) lines.push(pagingHint(Math.min(...hits.map((hit) => hit.seq))))
       return { ok: true, output: lines.join("\n") }
     },
   }
 }
 
-// ---------------------------------------------------------------------------
-// focus_set (MEMORY.md §6 §10.1)
-// ---------------------------------------------------------------------------
-
-/** One line the model can read back: `[doing] foc-abc 修 M2 窗口`. */
 export function renderFocus(item: FocusItem): string {
   const seq = item.seq !== undefined ? ` seq ${item.seq}` : ""
   return `[${item.state}] ${item.id}${seq} ${item.text.replace(/\s+/g, " ").trim()}`
 }
 
 export interface FocusToolOptions {
-  /** The open database (`MemoryIndex.handle()`); undefined when it is degraded. */
+
   db: DatabaseSync | undefined
 }
 
-/**
- * `focus_set` — the agent's own short list of what it is doing (MEMORY.md §6).
- *
- * `{ text, id?, state? }`: no id creates an item (open), an id edits the text
- * or the state. Written for a model: a create and an edit answer in the same
- * shape, so one call is enough to see what the list looks like now.
- */
 export function createFocusSetTool(opts: FocusToolOptions): ToolSpec {
   return {
     name: "focus_set",
@@ -192,7 +149,7 @@ export function createFocusSetTool(opts: FocusToolOptions): ToolSpec {
     async execute(args): Promise<ToolResult> {
       const db = opts.db
       if (db === undefined) {
-        // Degraded on purpose: the turn goes on without a focus list.
+
         return { ok: true, output: "focus_set is unavailable: the memory database is not open" }
       }
       const text = typeof args.text === "string" ? args.text.trim() : undefined

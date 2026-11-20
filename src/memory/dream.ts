@@ -1,24 +1,3 @@
-// M3 — dreaming (MEMORY.md §7 §10.1).
-//
-// When the agent has been idle for ten minutes and the log has moved on, ctrl
-// asks a cheap model to read the new material once and answer with one JSON
-// object: the durable facts it found, what the agent is now working on, and —
-// only when a preference really changed — a rewritten profile.
-//
-// Everything here is written to be wrong safely:
-//
-//   * the reply is parsed defensively (```json fences, prose around the object,
-//     a truncated answer): anything unusable is recorded as an error and *no
-//     data changes*, and `last_dream_seq` does not move, so the same batch is
-//     retried on the next idle window;
-//   * the writes happen in one SQLite transaction: a memory table that refuses
-//     a row does not leave half a dream behind;
-//   * correctness comes from supersede, never from deletion (MEMORY.md §3.3):
-//     an old fact keeps its row and gains a pointer to the one that replaced it.
-//
-// Nothing in this file throws at its callers: `runDream` answers with a
-// DreamResult that carries `error` instead.
-
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import type { DatabaseSync } from "node:sqlite"
@@ -34,25 +13,23 @@ import {
   type MemoryRow,
 } from "./memories.ts"
 
-/** meta keys owned by M3 (MEMORY.md §4: last_dream_seq, last_dream_at). */
 export const META_LAST_DREAM_SEQ = "last_dream_seq"
 export const META_LAST_DREAM_AT = "last_dream_at"
-/** MEMORY.md §10.1 M3: at most 40 events or 12 000 characters per dream. */
+
 export const DREAM_MAX_EVENTS = 40
 export const DREAM_MAX_CHARS = 12_000
-/** Completion budget for the consolidation call (§10.1). */
+
 export const DREAM_MAX_TOKENS = 1_500
-/** How many existing memories the model is shown to judge `supersedes` against. */
+
 export const DREAM_EXISTING_MEMORIES = 8
-/** Idle time before the background dream fires (§10.1: 10 minutes). */
+
 export const DREAM_IDLE_MS = 10 * 60_000
-/** How often the server checks whether it is time (§10.1: every 60 s). */
+
 export const DREAM_TICK_MS = 60_000
-/** `<agentHome>/profile.md` and its backups (MEMORY.md §7.6). */
+
 export const PROFILE_FILENAME = "profile.md"
 export const PROFILE_HISTORY_DIR = "profile.history"
 
-/** The slice of the llm client a dream needs. */
 export interface DreamLlm {
   complete(request: {
     messages: Array<{ role: "system" | "user" | "assistant" | "tool"; content: string }>
@@ -70,7 +47,7 @@ export interface DreamEvent {
 
 export interface DreamBatch {
   events: DreamEvent[]
-  /** First and last seq in the batch (both equal `afterSeq` when it is empty). */
+
   fromSeq: number
   toSeq: number
   chars: number
@@ -99,9 +76,9 @@ export interface DreamPayload {
 
 export interface DreamContext {
   db: DatabaseSync
-  /** `<root>/agents/<name>` — where `profile.md` lives. */
+
   agentHome: string
-  /** The whole log; the batch is taken from `last_dream_seq` forward. */
+
   events: LogEvent[]
   llm: DreamLlm
   signal?: AbortSignal
@@ -109,7 +86,7 @@ export interface DreamContext {
   maxTokens?: number
   maxEvents?: number
   maxChars?: number
-  /** Review the focus list even when no new events arrived (manual trigger). */
+
   force?: boolean
 }
 
@@ -117,26 +94,21 @@ export interface DreamResult {
   id: string
   startedAt: string
   endedAt: string
-  /** The seq the dream started from and the one it advanced to. */
+
   fromSeq: number
   toSeq: number
   added: number
   merged: number
   superseded: number
-  /** Focus items created or updated. */
+
   focus: number
   profileRewritten: boolean
   batchEvents: number
-  /** True when there was nothing new to consolidate (no model call). */
+
   skipped?: boolean
   error?: string
 }
 
-// ---------------------------------------------------------------------------
-// the batch
-// ---------------------------------------------------------------------------
-
-/** Read `meta.last_dream_seq`; -1 means "never dreamt". */
 export function lastDreamSeq(db: DatabaseSync): number {
   const raw = readMeta(db, META_LAST_DREAM_SEQ)
   if (raw === undefined) return -1
@@ -144,16 +116,10 @@ export function lastDreamSeq(db: DatabaseSync): number {
   return Number.isFinite(parsed) ? parsed : -1
 }
 
-/** `meta.last_dream_at` as the model/log saw it, or undefined. */
 export function lastDreamAt(db: DatabaseSync): string | undefined {
   return readMeta(db, META_LAST_DREAM_AT)
 }
 
-/**
- * The events after `afterSeq`, capped at 40 events or 12 000 characters
- * (MEMORY.md §10.1). A single event that is already larger than the character
- * cap is taken alone: otherwise the dream could never move past it.
- */
 export function dreamBatch(
   events: LogEvent[],
   afterSeq: number,
@@ -182,11 +148,6 @@ export function dreamBatch(
   }
 }
 
-// ---------------------------------------------------------------------------
-// the prompt
-// ---------------------------------------------------------------------------
-
-/** The JSON contract, spelled out for the model (MEMORY.md §10.1 M3). */
 export const DREAM_INSTRUCTIONS =
   "You consolidate an agent's long-term memory. You get new events from its log, plus the memories it already holds. " +
   "Reply with ONE JSON object and nothing else — no prose, no code fence:\n" +
@@ -205,11 +166,8 @@ export const DREAM_INSTRUCTIONS =
   "- `profileRewrite` only when a stable preference or habit changed; omit it otherwise.\n" +
   '- Reply `{}` when nothing is worth keeping.'
 
-/** Render the batch plus the existing memories into the user message. */
 export type FocusWithAfter = FocusItem & { after?: Array<{ seq: number; role: string; text: string }> }
 
-/** Attach the few events that followed each open item: what tells "done" apart from "still open". */
-/** Focus has not been reviewed for a while — old enough to be worth a pass. */
 export function focusIsStale(db: DatabaseSync, now: () => Date, ageMs = 30 * 60_000): boolean {
   const last = lastDreamAt(db)
   if (last === undefined) return true
@@ -245,9 +203,7 @@ export function buildDreamPrompt(batch: DreamBatch, existing: MemoryRow[], focus
               `- [${memory.id}] (${memory.kind}, importance ${memory.importance.toFixed(2)}) ${memory.text.replace(/\s+/g, " ").trim()}`,
           )
           .join("\n")
-  // Without the ids the model cannot close what finished: it sees only the new
-  // batch, so every stale item looks current. Showing them is what keeps the
-  // panel from filling up with work that was already done.
+
   const focusBlock =
     focus.length === 0
       ? "(no open items)"
@@ -273,23 +229,11 @@ export function buildDreamPrompt(batch: DreamBatch, existing: MemoryRow[], focus
   )
 }
 
-// ---------------------------------------------------------------------------
-// defensive parsing
-// ---------------------------------------------------------------------------
-
-/**
- * Pull the first JSON object out of whatever the model said.
- *
- * Models wrap JSON in ```json fences, prepend "Sure, here you go:", or both.
- * The scan is brace-balanced and string-aware, so a `}` inside a memory's text
- * does not end the object early. Truncated output yields undefined — a partial
- * dream must never be applied.
- */
 export function extractJsonObject(text: string): string | undefined {
   if (typeof text !== "string") return undefined
   let body = text.trim()
   if (body === "") return undefined
-  // A fenced block, with or without a language tag: take its contents.
+
   const fence = /```[a-zA-Z0-9_-]*\s*([\s\S]*?)```/.exec(body)
   if (fence !== null && typeof fence[1] === "string" && fence[1].trim() !== "") body = fence[1].trim()
 
@@ -319,7 +263,6 @@ export function extractJsonObject(text: string): string | undefined {
   return undefined
 }
 
-/** The payload, or undefined when the reply is not usable JSON at all. */
 export function parseDreamPayload(text: string): DreamPayload | undefined {
   const json = extractJsonObject(text)
   if (json === undefined) return undefined
@@ -372,15 +315,10 @@ export function parseDreamPayload(text: string): DreamPayload | undefined {
   }
 }
 
-// ---------------------------------------------------------------------------
-// profile.md
-// ---------------------------------------------------------------------------
-
 export function profilePath(agentHome: string): string {
   return join(agentHome, PROFILE_FILENAME)
 }
 
-/** The current profile, or undefined when the agent has none yet. */
 export function readProfile(agentHome: string): string | undefined {
   try {
     return readFileSync(profilePath(agentHome), "utf8")
@@ -389,11 +327,6 @@ export function readProfile(agentHome: string): string | undefined {
   }
 }
 
-/**
- * Write `profile.md` (MEMORY.md §7.6). The previous version is copied into
- * `profile.history/<ts>.md` first, so a bad rewrite is one `cp` away from being
- * undone — a dream may change the agent's self-description, but never erase it.
- */
 export function writeProfile(agentHome: string, text: string, now: Date = new Date()): { path: string; history?: string } {
   const body = text.trim()
   if (body === "") throw new Error("profile text must be a non-empty string")
@@ -410,21 +343,10 @@ export function writeProfile(agentHome: string, text: string, now: Date = new Da
   return history === undefined ? { path: file } : { path: file, history }
 }
 
-// ---------------------------------------------------------------------------
-// one dream
-// ---------------------------------------------------------------------------
-
-/**
- * Consolidate everything since `last_dream_seq` into one dream (MEMORY.md §10.1).
- *
- * The model call happens outside the transaction; the writes happen inside it.
- * A failure at either stage is recorded in `dream_runs` with `error` set and
- * leaves the data and the watermark untouched.
- */
 export async function runDream(ctx: DreamContext): Promise<DreamResult> {
   const now = ctx.now ?? (() => new Date())
   const startedAt = now().toISOString()
-  /** The watermark: the last seq an earlier dream already consolidated. */
+
   const watermark = lastDreamSeq(ctx.db)
   const batch = dreamBatch(ctx.events, watermark, {
     ...(ctx.maxEvents !== undefined ? { maxEvents: ctx.maxEvents } : {}),
@@ -438,8 +360,7 @@ export async function runDream(ctx: DreamContext): Promise<DreamResult> {
     id: runId,
     startedAt,
     endedAt: startedAt,
-    // What this run actually read: the batch's span, or the watermark when the
-    // batch was empty (a recorded "nothing to do").
+
     fromSeq: batch.events.length > 0 ? batch.fromSeq : watermark,
     toSeq: batch.toSeq,
     added: 0,
@@ -451,13 +372,10 @@ export async function runDream(ctx: DreamContext): Promise<DreamResult> {
   }
 
   const openFocus = listFocus(ctx.db, { limit: 10 })
-  // No new material normally means no model call. The exception is focus
-  // hygiene: an item closed by a later turn still sits on the panel until a
-  // dream re-reads it, and that turn may have produced nothing new.
+
   const reviewFocus = openFocus.length > 0 && (ctx.force === true || focusIsStale(ctx.db, ctx.now ?? (() => new Date())))
   if (batch.events.length === 0 && !reviewFocus) {
-    // Nothing new: no model call, no writes, but the run is still recorded —
-    // a manual `POST /api/dream` deserves an answer in `GET /api/dreams`.
+
     result.skipped = true
     result.toSeq = watermark
     result.endedAt = now().toISOString()
@@ -529,22 +447,20 @@ export async function runDream(ctx: DreamContext): Promise<DreamResult> {
       throw error
     }
   } catch (error) {
-    // The transaction rolled back: memories, focus and profile are as they were.
+
     return finishWithError(ctx, result, `dream write failed: ${errorMessage(error)}`, now)
   }
 
   return result
 }
 
-/** Record a run that failed: the error goes in, the watermark does not move. */
 function finishWithError(ctx: DreamContext, result: DreamResult, message: string, now: () => Date): DreamResult {
   result.error = message
   result.endedAt = now().toISOString()
   try {
     recordRun(ctx.db, result, now())
   } catch {
-    // The result already carries the error; a database that refuses the row
-    // must not turn a recorded failure into an exception.
+
   }
   return result
 }
@@ -570,15 +486,10 @@ function rollback(db: DatabaseSync): void {
   try {
     db.exec("ROLLBACK")
   } catch {
-    // Nothing open: the original error is the one worth reporting.
+
   }
 }
 
-/**
- * The existing memories the model should judge `supersedes` against: the batch
- * is turned into a keyword query, and the top 8 live memories come back with
- * their ids (MEMORY.md §10.1 M3).
- */
 function relevantMemories(db: DatabaseSync, batch: DreamBatch): MemoryRow[] {
   const words = new Set<string>()
   for (const event of batch.events) {
@@ -590,10 +501,6 @@ function relevantMemories(db: DatabaseSync, batch: DreamBatch): MemoryRow[] {
   if (query.trim() === "") return []
   return searchMemories(db, query, { limit: DREAM_EXISTING_MEMORIES })
 }
-
-// ---------------------------------------------------------------------------
-// dream_runs for the API
-// ---------------------------------------------------------------------------
 
 export interface DreamRunRow {
   id: string
@@ -607,7 +514,6 @@ export interface DreamRunRow {
   error?: string
 }
 
-/** `GET /api/dreams` (MEMORY.md §10.1): newest first. */
 export function listDreamRuns(db: DatabaseSync, opts: { limit?: number } = {}): DreamRunRow[] {
   const limit = Math.max(1, Math.min(Math.floor(opts.limit ?? 20), 200))
   const rows = db.prepare("SELECT * FROM dream_runs ORDER BY started_at DESC, id DESC LIMIT ?").all(limit) as unknown[]
@@ -634,18 +540,14 @@ export function listDreamRuns(db: DatabaseSync, opts: { limit?: number } = {}): 
   })
 }
 
-// ---------------------------------------------------------------------------
-// the idle trigger
-// ---------------------------------------------------------------------------
-
 export interface DreamControllerOptions {
-  /** One dream: builds the client, opens the log, calls runDream. */
+
   run: () => Promise<DreamResult>
-  /** Is there new material? (`last_indexed_seq > last_dream_seq`) */
+
   hasWork?: () => boolean
-  /** True while a turn or any other writer holds the agent. */
+
   busy?: () => boolean
-  /** Timestamp (ms) of the last thing that happened, for the idle check. */
+
   lastActivity?: () => number | undefined
   idleMs?: number
   intervalMs?: number
@@ -653,14 +555,6 @@ export interface DreamControllerOptions {
   warn?: (message: string) => void
 }
 
-/**
- * The single-flight dream runner (MEMORY.md §10.1 M3): one dream at a time,
- * a 60-second tick, and an idle gate so it never competes with a live turn.
- *
- * `start()` claims the slot synchronously, which is what makes the route's
- * "already running → 409" check honest: there is no await between the check and
- * the start.
- */
 export class DreamController {
   private readonly opts: DreamControllerOptions
   private current: Promise<DreamResult> | undefined
@@ -675,15 +569,13 @@ export class DreamController {
     return this.current !== undefined
   }
 
-  /** Wake up and dream. Answers with the same promise when one is in flight. */
   start(): Promise<DreamResult> {
     if (this.current !== undefined) return this.current
     const promise = (async (): Promise<DreamResult> => {
       try {
         return await this.opts.run()
       } catch (error) {
-        // runDream already records its own failures; this is the "the callback
-        // itself broke" case (no log, no database).
+
         this.warnOnce(`run:${errorMessage(error)}`, `dream failed: ${errorMessage(error)}`)
         return {
           id: "dream-failed",
@@ -707,7 +599,6 @@ export class DreamController {
     return promise
   }
 
-  /** The idle check (MEMORY.md §10.1 M3). Returns true when a dream was started. */
   tick(): boolean {
     if (this.running) return false
     if (this.opts.busy?.() === true) return false
@@ -725,7 +616,7 @@ export class DreamController {
     this.timer = setInterval(() => {
       this.tick()
     }, Math.max(1, Math.floor(this.opts.intervalMs ?? DREAM_TICK_MS)))
-    // A timer must never be the reason the process stays alive.
+
     this.timer.unref?.()
   }
 
@@ -735,7 +626,6 @@ export class DreamController {
     this.timer = undefined
   }
 
-  /** Wait for a dream that is already running (tests and graceful shutdown). */
   async settle(): Promise<void> {
     const current = this.current
     if (current === undefined) return
@@ -748,10 +638,6 @@ export class DreamController {
     this.opts.warn?.(message)
   }
 }
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
 
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
@@ -768,7 +654,7 @@ function idList(value: unknown): string[] | undefined {
   const ids = raw
     .map((item) => {
       if (typeof item === "string") return item.trim()
-      // Some models answer `supersedes: [{id: "mem-1"}]`; accept that too.
+
       if (isRecord(item) && typeof item.id === "string") return item.id.trim()
       return ""
     })

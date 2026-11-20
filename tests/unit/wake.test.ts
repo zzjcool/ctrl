@@ -1,12 +1,3 @@
-// Waking the agent when a worker finishes (B).
-//
-// A real `pi` takes minutes; the turn that delegated it ends in seconds. So the
-// exit has to become an event of its own: a `[ctrl] worker …` user_message plus
-// an ordinary turn. Everything here is real except the two things that must be
-// fake in a test — the model (a scripted LlmClient, no HTTP) and `pi` (a shell
-// script) — so the path under test is the real one: spawn → exit → runner
-// callback → waker → user_message → runTurn → assistant_message.
-
 import assert from "node:assert/strict"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -18,22 +9,18 @@ import type { JobView } from "../../src/jobs/store.ts"
 import { startServer, type RunningServer } from "../../src/server/server.ts"
 import { WAKE_PREFIX } from "../../src/server/wake.ts"
 
-// ---------------------------------------------------------------------------
-// A scripted model: one reply per call, in order
-// ---------------------------------------------------------------------------
-
 interface ScriptedReply {
   text?: string
   toolCalls?: Array<{ name: string; args: Record<string, unknown> }>
-  /** Hold the answer this long, so a worker can finish *during* a turn. */
+
   delayMs?: number
 }
 
 interface ScriptedLlm {
   client: LlmClient
-  /** Every request the model saw, oldest first. */
+
   calls: LlmCompleteRequest[]
-  /** How many scripted replies are left — a test's "nothing else happened". */
+
   remaining(): number
 }
 
@@ -66,10 +53,6 @@ function scriptedLlm(script: ScriptedReply[]): ScriptedLlm {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Fixture: a real ctrl server, a fake pi that outlives its turn
-// ---------------------------------------------------------------------------
-
 interface Fixture {
   running: RunningServer
   llm: ScriptedLlm
@@ -86,7 +69,6 @@ async function scratchDir(prefix: string): Promise<string> {
   return dir
 }
 
-/** Stands in for `pi`: it names itself, sleeps, then reports. */
 function fakePiSource(sleepSeconds: number): string {
   return `#!/bin/sh
 printf 'args: %s\\n' "$*"
@@ -115,7 +97,7 @@ async function startCtrl(opts: { sleepSeconds: number; script: ScriptedReply[] }
     maxWorkers: 3,
     piBin,
     piProvider: "any-endpoint",
-    // No background dream: this test is about worker exits, not idle memory.
+
     dream: false,
     createLlm: () => llm.client,
   })
@@ -138,10 +120,6 @@ after(async () => {
   for (const fixture of fixtures) await fixture.running.close()
   for (const dir of scratch) await rm(dir, { recursive: true, force: true })
 })
-
-// ---------------------------------------------------------------------------
-// HTTP (the page's two calls, nothing more)
-// ---------------------------------------------------------------------------
 
 interface Stream {
   events: SessionEvent[]
@@ -198,7 +176,6 @@ async function waitFor<T>(
   }
 }
 
-/** The user_message lines that a worker exit appended. */
 function wakeLines(snapshot: Stream): string[] {
   return snapshot.events
     .filter((event) => event.type === "user_message")
@@ -206,7 +183,6 @@ function wakeLines(snapshot: Stream): string[] {
     .filter((text) => text.startsWith(WAKE_PREFIX))
 }
 
-/** The job id out of `started job <id> — poll with job_status`. */
 function jobIdOf(snapshot: Stream): string {
   const results = snapshot.events.filter((event) => event.type === "tool_result") as Extract<
     SessionEvent,
@@ -226,19 +202,15 @@ async function jobState(fixture: Fixture, id: string): Promise<string> {
   return String(job.state)
 }
 
-// ---------------------------------------------------------------------------
-// The wake
-// ---------------------------------------------------------------------------
-
 test("a worker that outlives its turn wakes the agent, once", async () => {
   const fixture = await makeFixture({
-    // Longer than any turn below, so the exit can only be reported by the waker.
+
     sleepSeconds: 2,
     script: [
-      // Turn 1: delegate without waiting, then answer and finish.
+
       { toolCalls: [{ name: "delegate", args: { task: "count slowly", wait: 0 } }] },
       { text: "the worker is counting" },
-      // The wake turn: the model reports what happened.
+
       { text: "the worker finished and printed the thing" },
     ],
   })
@@ -246,13 +218,11 @@ test("a worker that outlives its turn wakes the agent, once", async () => {
   const sent = await api(fixture, "POST", "/api/agent/messages", { text: "count the files, slowly" })
   assert.equal(sent.status, 202, JSON.stringify(sent.json))
 
-  // The turn ends while the worker is still running — that is the whole point.
   const afterTurn = await settle(fixture)
   const id = jobIdOf(afterTurn)
   assert.equal(await jobState(fixture, id), "running", "the worker must still be running when the turn ends")
   assert.deepEqual(wakeLines(afterTurn), [], "a running worker has nothing to report yet")
 
-  // Now the worker exits, and the exit becomes a turn of its own.
   const woken = await waitFor(
     () => events(fixture),
     (snapshot) => wakeLines(snapshot).length > 0,
@@ -261,13 +231,12 @@ test("a worker that outlives its turn wakes the agent, once", async () => {
   const wakeSeq = seqOfWake(woken)
   const [wakeText] = wakeLines(woken)
   assert.ok(wakeText !== undefined)
-  // The frozen shape: [ctrl] worker <id> finished (<state>, <elapsed>) — …
+
   const shape = new RegExp(
     `^${WAKE_PREFIX.replace(/[[\]]/g, "\\$&")} ${id} finished \\(exited, \\d+\\.\\ds\\) — report the result to the user\\.$`,
   )
   assert.match(wakeText, shape)
 
-  // …and it is followed by a normal assistant turn.
   const answered = await waitFor(
     () => events(fixture),
     (snapshot) =>
@@ -281,10 +250,8 @@ test("a worker that outlives its turn wakes the agent, once", async () => {
   )
   assert.equal(reply?.data.text, "the worker finished and printed the thing")
 
-  // The wake turn is an ordinary turn: the log is still dense and 0-based.
   answered.events.forEach((event, index) => assert.equal(event.seq, index))
 
-  // One wake per job: the same exit reported again must not append anything.
   const second = readJob(fixture.running.ctx.agentHome, id)
   assert.ok(second, "the job is on disk")
   const before = answered.total
@@ -294,7 +261,6 @@ test("a worker that outlives its turn wakes the agent, once", async () => {
   assert.equal(after.total, before, "a duplicate exit event appends nothing")
   assert.equal(wakeLines(after).length, 1, "the job woke the agent exactly once")
 
-  // The claim is on disk, not in memory: a restart cannot wake for it again.
   const meta = readJobMeta(fixture.running.ctx.agentHome, id)
   assert.equal(typeof meta?.notifiedAt, "string")
   assert.equal(fixture.llm.remaining(), 0, "the script was consumed by exactly three model calls")
@@ -302,7 +268,7 @@ test("a worker that outlives its turn wakes the agent, once", async () => {
 
 test("a worker that finishes during a turn does not start a second one", async () => {
   const fixture = await makeFixture({
-    // Exits while the model is still answering step 2 below.
+
     sleepSeconds: 0.4,
     script: [
       { toolCalls: [{ name: "delegate", args: { task: "count quickly", wait: 0 } }] },
@@ -315,7 +281,6 @@ test("a worker that finishes during a turn does not start a second one", async (
   const id = jobIdOf(done)
   assert.equal(await jobState(fixture, id), "exited", "the worker finished while the turn was still open")
 
-  // Give a wrongly-started wake turn every chance to appear.
   await new Promise((resolve) => setTimeout(resolve, 400))
   const after = await events(fixture)
   assert.deepEqual(wakeLines(after), [], "the running turn polls the job itself; no wake message")
@@ -324,11 +289,10 @@ test("a worker that finishes during a turn does not start a second one", async (
     .filter((event) => event.type === "user_message")
     .map((event) => (event as Extract<SessionEvent, { type: "user_message" }>).data.text)
   assert.deepEqual(userTexts, ["count the files"], "exactly one user_message, the one the user sent")
-  // The wake was claimed and skipped, so it can never fire later for this job.
+
   assert.equal(typeof readJobMeta(fixture.running.ctx.agentHome, id)?.notifiedAt, "string")
 })
 
-/** The seq of the first `[ctrl]` user_message in a snapshot. */
 function seqOfWake(snapshot: Stream): number {
   const event = snapshot.events.find(
     (candidate) => candidate.type === "user_message" && candidate.data.text.startsWith(WAKE_PREFIX),

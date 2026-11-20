@@ -1,9 +1,3 @@
-// The three event paging modes (CONTRACT §7, PLAN §3.3).
-//
-// `since` is a seq, not an array index, and the priority is before > tail >
-// since. The two rules that keep the page honest: no call returns more than
-// 200 events, and a request for zero must not slice(-0) the whole log.
-
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import type { SessionEvent } from "../../src/engine/durable.ts"
@@ -22,10 +16,6 @@ function events(count: number): SessionEvent[] {
 function seqs(page: { events: SessionEvent[] }): number[] {
   return page.events.map((event) => event.seq)
 }
-
-// ---------------------------------------------------------------------------
-// since — the live stream
-// ---------------------------------------------------------------------------
 
 test("since=N returns events from seq N, and says where it started", () => {
   const page = pageEvents(events(5), { since: "2" })
@@ -70,10 +60,6 @@ test("one call never returns more than 200 events", () => {
   assert.deepEqual(seqs(page), Array.from({ length: 200 }, (_, index) => index))
 })
 
-// ---------------------------------------------------------------------------
-// tail — the first screen
-// ---------------------------------------------------------------------------
-
 test("tail=T is the last T events, since = the seq of the first one", () => {
   const page = pageEvents(events(10), { tail: "3" })
   assert.equal(page.total, 10)
@@ -101,10 +87,6 @@ test("tail=0 asks for nothing instead of slice(-0) returning everything", () => 
     assert.equal(page.total, 5)
   }
 })
-
-// ---------------------------------------------------------------------------
-// before — paging up
-// ---------------------------------------------------------------------------
 
 test("before=S&tail=T is the T events just before seq S", () => {
   const page = pageEvents(events(10), { before: "7", tail: "3" })
@@ -138,10 +120,6 @@ test("paging up reaches the very first event one page at a time", () => {
   }
   assert.deepEqual(collected, seqs({ events: log }))
 })
-
-// ---------------------------------------------------------------------------
-// priority and degenerate logs
-// ---------------------------------------------------------------------------
 
 test("priority is before > tail > since", () => {
   const withBefore = pageEvents(events(10), { before: "7", tail: "2", since: "9" })

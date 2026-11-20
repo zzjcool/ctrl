@@ -1,12 +1,3 @@
-// End-to-end: a fake LLM, a fake pi, a real ctrl server, one agent.
-//
-// No real network and no real worker: the "model" is a scripted OpenAI-compatible
-// HTTP server on 127.0.0.1 (the same trick pi-durable's tests/e2e/fake-llm-server.ts
-// uses) and "pi" is a shell script. Everything between them is real — HTTP route →
-// TurnRegistry → runAgent → delegate → spawn → meta.json → /api/jobs — so the whole
-// v3 split (ctrl talks, pi works) is exercised end to end. The identity under test
-// is a directory: `<root>/agents/<name>`.
-
 import assert from "node:assert/strict"
 import { createServer, request as httpRequest } from "node:http"
 import type { IncomingMessage, ServerResponse } from "node:http"
@@ -18,10 +9,6 @@ import { after, before, test } from "node:test"
 import type { SessionEvent } from "../../src/engine/durable.ts"
 import { startServer, type RunningServer } from "../../src/server/server.ts"
 
-// ---------------------------------------------------------------------------
-// Scripted fake model
-// ---------------------------------------------------------------------------
-
 interface FakeToolCall {
   name: string
   arguments: Record<string, unknown>
@@ -30,7 +17,7 @@ interface FakeToolCall {
 interface FakeReply {
   content?: string
   toolCalls?: FakeToolCall[]
-  /** Hold the response this long before answering (tests concurrency/abort). */
+
   delayMs?: number
 }
 
@@ -39,7 +26,7 @@ interface FakeLlm {
   requests: number
   push(reply: FakeReply): void
   reset(): void
-  /** The request bodies seen since the last reset, oldest first. */
+
   bodies: Array<{ messages: Array<{ role: string; content: string }> }>
   close(): Promise<void>
 }
@@ -62,7 +49,7 @@ async function startFakeLlm(): Promise<FakeLlm> {
       try {
         bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")))
       } catch {
-        // A body that is not JSON is not a request this test reads.
+
       }
       const reply = queue.shift() ?? { content: "(no further script)" }
       const send = () => {
@@ -129,10 +116,6 @@ async function startFakeLlm(): Promise<FakeLlm> {
   } as FakeLlm
 }
 
-// ---------------------------------------------------------------------------
-// Tiny HTTP client (no fetch: it normalises the encoded paths sent below)
-// ---------------------------------------------------------------------------
-
 interface Reply {
   status: number
   headers: Record<string, string | string[] | undefined>
@@ -175,13 +158,8 @@ function request(port: number, method: string, requestPath: string, body?: unkno
   })
 }
 
-// ---------------------------------------------------------------------------
-// Fixture
-// ---------------------------------------------------------------------------
-
 const AGENT = "tester"
 
-/** Stands in for `pi`: it prints its argv, waits, prints a result, exits 0. */
 const FAKE_PI_SOURCE = `#!/bin/sh
 printf 'args: %s\\n' "$*"
 sleep 0.3
@@ -195,9 +173,9 @@ interface Fixture {
   fake: FakeLlm
   root: string
   workspace: string
-  /** The fake `pi` binary handed to the server as --pi-bin. */
+
   piBin: string
-  /** Directory holding the fake pi, removed after the run. */
+
   binDir: string
 }
 
@@ -219,7 +197,7 @@ async function startCtrl(opts: StartOptions): Promise<RunningServer> {
     port: 0,
     host: "127.0.0.1",
     maxSteps: 6,
-    // A fake worker keeps this honest: no test may call the real pi.
+
     piBin: opts.piBin,
     piProvider: "any-endpoint",
     maxWorkers: 3,
@@ -278,7 +256,6 @@ async function eventsStream(query = ""): Promise<Stream> {
   return reply.json as Stream
 }
 
-/** Poll the stream until the turn is done (a turn is started, not awaited). */
 async function settle(timeoutMs = 8000): Promise<Stream> {
   const deadline = Date.now() + timeoutMs
   for (;;) {
@@ -292,10 +269,6 @@ async function settle(timeoutMs = 8000): Promise<Stream> {
 async function send(text: string): Promise<Reply> {
   return await api("POST", "/api/agent/messages", { text })
 }
-
-// ---------------------------------------------------------------------------
-// Tests — one narrative, in order; the agent IS the directory
-// ---------------------------------------------------------------------------
 
 test("one agent, named on disk, with one log and no machine", async () => {
   const health = await api("GET", "/api/health")
@@ -324,15 +297,12 @@ test("one agent, named on disk, with one log and no machine", async () => {
   assert.deepEqual(Object.keys(sidecar).sort(), ["createdAt", "cwd"], "v3 remembers a directory, not a machine")
   assert.equal(sidecar.cwd, fixture.workspace)
 
-  // No worker has run yet, and there is no machines route to ask about.
   assert.deepEqual((await api("GET", "/api/jobs")).json, { jobs: [] })
   assert.equal((await api("GET", "/api/machines")).status, 404)
 
-  // Nothing pretends to be a second agent.
   assert.equal((await api("GET", "/api/agents")).status, 404)
 })
 
-/** Poll `/api/jobs` until the job stops running, then return its summary. */
 async function waitForJob(id: string, timeoutMs = 10_000): Promise<Record<string, any>> {
   const deadline = Date.now() + timeoutMs
   for (;;) {
@@ -345,7 +315,6 @@ async function waitForJob(id: string, timeoutMs = 10_000): Promise<Record<string
   }
 }
 
-/** The id of the one job this narrative delegates to. */
 let delegatedJob = ""
 
 test("a turn delegates to a pi worker and the log carries the job id", async () => {
@@ -374,8 +343,6 @@ test("a turn delegates to a pi worker and the log carries the job id", async () 
   assert.deepEqual(results.map((event) => event.data.ok), [true])
   assert.equal(results[0]?.data.callId, calls[0]?.data.callId)
 
-  // delegate waits a few seconds, so a fast fake worker comes back already
-  // finished; either shape must still carry the id.
   const delegateOutput = results[0]?.data.output ?? ""
   const match = /job (\d{8}T\d{6}Z-[a-z0-9]{6})/.exec(delegateOutput)
   assert.ok(match, `unexpected delegate output: ${delegateOutput}`)
@@ -388,7 +355,6 @@ test("a turn delegates to a pi worker and the log carries the job id", async () 
     | undefined
   assert.equal(final?.data.text, "the worker is counting them")
 
-  // The job is a directory (CONTRACT §5.1): meta, log, and the worker's own pi session.
   const jobDir = path.join(fixture.root, "agents", AGENT, "jobs", id)
   const meta = JSON.parse(await readFile(path.join(jobDir, "meta.json"), "utf8"))
   assert.equal(meta.id, id)
@@ -399,15 +365,11 @@ test("a turn delegates to a pi worker and the log carries the job id", async () 
   assert.ok((await stat(path.join(jobDir, "pi"))).isDirectory())
   assert.ok((await stat(path.join(jobDir, "out.log"))).isFile())
 
-  // ctrl itself touched nothing: the workspace is still empty. The work happened
-  // in the worker, which is the whole point of the v3 split.
   assert.deepEqual(await readdir(fixture.workspace), [])
 
-  // seq is dense and 0-based: the array index IS the seq.
   events.forEach((event, index) => assert.equal(event.seq, index))
   assert.equal(snapshot.total, events.length)
 
-  // The stream slices by seq, not by index.
   const tail = await eventsStream("?since=3")
   assert.equal(tail.total, events.length)
   assert.equal(tail.since, 3)
@@ -422,8 +384,7 @@ test("job_status reports what the worker did, and /api/jobs agrees", async () =>
   assert.equal(job.task, "count the .ts files under src")
   assert.equal(typeof job.startedAt, "string")
   assert.ok(job.elapsedMs >= 250, `the worker's runtime is measured (got ${job.elapsedMs})`)
-  // CONTRACT §7's six fields, plus the worker's output tail that a delegate card
-  // shows once the log is non-empty (src/web/public/app.js reads job.output).
+
   assert.deepEqual(
     Object.keys(job).filter((key) => key !== "output").sort(),
     ["code", "elapsedMs", "id", "startedAt", "state", "task"],
@@ -443,7 +404,7 @@ test("job_status reports what the worker did, and /api/jobs agrees", async () =>
     SessionEvent,
     { type: "tool_call" }
   >[]
-  // The whole log is returned (since=0), so this is every call made so far.
+
   assert.deepEqual(calls.map((event) => event.data.name), ["delegate", "job_status"])
   assert.equal(calls.at(-1)?.data.name, "job_status", "the new turn polled the job")
   const results = snapshot.events.filter((event) => event.type === "tool_result") as Extract<
@@ -470,7 +431,6 @@ test("tail and before page through one log without losing it", async () => {
   assert.deepEqual(earlier.events.map((event) => event.seq), [Math.max(0, total - 4), Math.max(0, total - 3)])
   assert.equal(earlier.total, total)
 
-  // Walking up from the newest page reaches seq 0 and stops there.
   const collected: number[] = []
   let before: number | undefined = total
   for (let guard = 0; guard < 20; guard += 1) {
@@ -495,7 +455,7 @@ test("a second turn while one is running is 409", async () => {
 
   const snapshot = await settle()
   assert.equal(snapshot.turn.running, false)
-  // The rejected message never entered the log.
+
   const texts = (snapshot.events.filter((event) => event.type === "user_message") as Extract<
     SessionEvent,
     { type: "user_message" }
@@ -505,8 +465,7 @@ test("a second turn while one is running is 409", async () => {
 
 test("abort stops the turn and says so in the log", async () => {
   fixture.fake.reset()
-  // Longer than this test is willing to wait, so the assertions below can only
-  // pass through the abort path.
+
   fixture.fake.push({ content: "never arrives", delayMs: 10_000 })
 
   const started = await send("hang")
@@ -530,12 +489,10 @@ test("abort stops the turn and says so in the log", async () => {
   assert.ok(note, `expected an abort note, got ${JSON.stringify(errors)}`)
   assert.equal(note.fatal, false)
 
-  // Aborting an idle agent is a no-op, not a failure.
   const again = await api("POST", "/api/agent/abort")
   assert.equal(again.status, 200)
   assert.equal(again.json.aborted, false)
 
-  // A new turn is allowed after an abort.
   fixture.fake.reset()
   fixture.fake.push({ content: "back in business" })
   const resumed = await send("again")
@@ -554,7 +511,7 @@ test("memory is the agent's own, with tombstone semantics", async () => {
   const listed = await api("GET", "/api/memory")
   assert.equal(listed.status, 200)
   assert.ok(listed.json.memories.some((entry: { id: string }) => entry.id === id))
-  // Per agent (CONTRACT §4): the memory log is inside the agent directory.
+
   assert.ok((await stat(path.join(fixture.root, "agents", AGENT, "memory", "index.jsonl"))).isFile())
 
   const rejected = await api("POST", "/api/memory", { kind: "nonsense", text: "x" })
@@ -572,8 +529,7 @@ test("memory is the agent's own, with tombstone semantics", async () => {
 })
 
 test("/api/search finds older turns through the SQLite mirror", async () => {
-  // A fresh turn in Chinese, so both search regimes are exercised for real:
-  // the trigram index (>=3 characters) and the substring fallback (2).
+
   fixture.fake.reset()
   fixture.fake.push({ content: "统计完了，一共 12 个文件" })
   assert.equal((await send("帮我统计 .ts 文件的数量")).status, 202)
@@ -593,7 +549,6 @@ test("/api/search finds older turns through the SQLite mirror", async () => {
   assert.match(hit.body, /counting/, "the snippet carries the match")
   assert.ok(hit.score <= 0, "bm25 orders by score ascending")
 
-  // Three or more characters: the trigram index. Two: the LIKE fallback.
   const trigram = await api("GET", `/api/search?q=${encodeURIComponent("统计完了")}`)
   assert.equal(trigram.status, 200, trigram.text)
   assert.ok(trigram.json.count >= 1, trigram.text)
@@ -605,12 +560,10 @@ test("/api/search finds older turns through the SQLite mirror", async () => {
     assert.ok(found.body.includes("文件"), "a snippet always contains what was searched for")
   }
 
-  // Punctuation is not FTS5 syntax: `hw-` must answer, not 500.
   const punctuation = await api("GET", `/api/search?q=${encodeURIComponent("hw-")}`)
   assert.equal(punctuation.status, 200, punctuation.text)
   assert.equal(punctuation.json.count, 0, "nothing in this narrative mentions hw-")
 
-  // limit is clamped and before pages up.
   const page = await api("GET", `/api/search?q=${encodeURIComponent("统计完了")}&limit=1`)
   assert.equal(page.status, 200, page.text)
   assert.equal(page.json.hits.length, 1)
@@ -621,16 +574,13 @@ test("/api/search finds older turns through the SQLite mirror", async () => {
   assert.equal(older.status, 200, older.text)
   assert.ok((older.json.hits as Array<{ seq: number }>).every((row) => row.seq < page.json.hits[0].seq))
 
-  // MEMORY.md §4: the mirror is a file inside the agent's directory.
   assert.ok((await stat(path.join(fixture.root, "agents", AGENT, "memory.db"))).isFile())
 
-  // A blank query is a caller error, not "search everything".
   assert.equal((await api("GET", "/api/search?q=")).status, 400)
   assert.equal((await api("GET", "/api/search?q=%20%20")).status, 400)
   assert.equal((await api("POST", "/api/search?q=x")).status, 405)
 })
 
-/** Poll `/api/dreams` until `count` runs are recorded (a dream is detached). */
 async function waitForDreams(count: number, timeoutMs = 8000): Promise<Record<string, any>[]> {
   const deadline = Date.now() + timeoutMs
   for (;;) {
@@ -644,7 +594,7 @@ async function waitForDreams(count: number, timeoutMs = 8000): Promise<Record<st
 }
 
 test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.1)", async () => {
-  // --- focus: create, move, list, close -------------------------------------
+
   const created = await api("POST", "/api/focus", { text: "实现 M4 面板" })
   assert.equal(created.status, 200, created.text)
   const focusId = created.json.item.id as string
@@ -666,7 +616,6 @@ test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.
   assert.equal((await api("POST", "/api/focus", {})).status, 400, "text or id is required")
   assert.equal((await api("POST", "/api/focus", { text: "x", state: "nonsense" })).status, 400)
 
-  // --- memories: write, search, tombstone -----------------------------------
   const memory = await api("POST", "/api/memories", {
     text: "面板用 focus 和 memories 两块数据",
     kind: "decision",
@@ -684,7 +633,6 @@ test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.
   assert.equal(found.json.count, found.json.memories.length)
   assert.ok((found.json.memories as Array<Record<string, any>>).some((row) => row.id === memoryId))
 
-  // A duplicate is merged, not added twice (normalised text).
   const duplicate = await api("POST", "/api/memories", { text: "  面板用 focus 和 memories 两块数据。 " })
   assert.equal(duplicate.status, 201, duplicate.text)
   assert.equal(duplicate.json.memory.id, memoryId, "same memory, same id")
@@ -692,7 +640,6 @@ test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.
   assert.equal((await api("POST", "/api/memories", { text: "  " })).status, 400)
   assert.equal((await api("POST", "/api/memories", { text: "x", kind: "nonsense" })).status, 400)
 
-  // --- a dream, triggered by hand, parsed from a fenced reply ---------------
   fixture.fake.reset()
   const dreamPayload = {
     memories: [{ kind: "fact", text: "做梦写下的记忆", tags: ["dream"], importance: 0.6 }],
@@ -704,7 +651,7 @@ test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.
   const started = await api("POST", "/api/dream")
   assert.equal(started.status, 202, started.text)
   assert.deepEqual(started.json, { started: true })
-  // Starting a second dream while the first is in flight is 409, not a queue.
+
   const concurrent = await api("POST", "/api/dream")
   assert.ok(concurrent.status === 409 || concurrent.status === 202, concurrent.text)
 
@@ -725,7 +672,6 @@ test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.
   assert.match(profile, /用户说中文/)
   assert.equal((await api("GET", "/api/dreams?limit=1")).json.runs.length, 1)
 
-  // --- `/api/agent` carries the numbers the head shows ----------------------
   const detail = await api("GET", "/api/agent")
   assert.equal(detail.status, 200, detail.text)
   assert.equal(typeof detail.json.memory.memories, "number")
@@ -735,7 +681,6 @@ test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.
   assert.equal(detail.json.context.windowStart, 0, "nothing has been compacted yet")
   assert.ok(detail.json.context.chars > 0, "the log costs characters")
 
-  // --- deletes are soft on both sides --------------------------------------
   const closed = await api("DELETE", `/api/focus/${focusId}`)
   assert.equal(closed.status, 200, closed.text)
   assert.equal(closed.json.item.state, "done")
@@ -751,16 +696,13 @@ test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.
   assert.equal(withAll.find((row) => row.id === memoryId)?.supersededBy, `deleted:${memoryId}`, "a tombstone in place")
   assert.equal((await api("DELETE", "/api/memories/nope")).status, 404)
 
-  // Wrong methods and unknown sub-routes are answered, not guessed.
   assert.equal((await api("DELETE", "/api/memories")).status, 405)
   assert.equal((await api("GET", "/api/dream")).status, 405)
   assert.equal((await api("GET", "/api/focus/x/y")).status, 404)
 })
 
 test("a dream-written memory is recalled into the next turn's prompt", async () => {
-  // The gap this test exists for: `remember`/`recall` must read the same table
-  // sleeping writes to. The dream above wrote 「做梦写下的记忆」 into SQLite;
-  // this turn asks about it and the recalled block must be in the system prompt.
+
   fixture.fake.reset()
   fixture.fake.push({ content: "那条记忆是做梦时写下的" })
   assert.equal((await send("做梦写下的那条记忆是什么？")).status, 202)
@@ -803,7 +745,6 @@ test("restarting ctrl finds the same log, memory, workspace and jobs", async () 
   assert.deepEqual(detail.json.resumePoint, { kind: "clean" })
   assert.equal(detail.json.turn.running, false, "a restart is not a running turn")
 
-  // The job's final state was never in memory: it is meta.json on disk.
   const jobs = await api("GET", "/api/jobs")
   assert.equal(jobs.status, 200, jobs.text)
   const job = (jobs.json.jobs as Record<string, any>[]).find((candidate) => candidate.id === delegatedJob)
@@ -811,7 +752,6 @@ test("restarting ctrl finds the same log, memory, workspace and jobs", async () 
   assert.equal(job.state, "exited")
   assert.equal(job.code, 0)
 
-  // And it keeps writing to the same log: seq continues, nothing is renumbered.
   fixture.fake.reset()
   fixture.fake.push({ content: "still here" })
   assert.equal((await send("are you there?")).status, 202)
@@ -822,12 +762,9 @@ test("restarting ctrl finds the same log, memory, workspace and jobs", async () 
   assert.equal(last?.data.text, "still here")
   snapshot.events.forEach((event, index) => assert.equal(event.seq, index))
 
-  // Memory survived the restart too.
   const memories = await api("GET", "/api/memory")
   assert.equal(memories.status, 200)
 
-  // And so did the mirror: memory.db is derived, so a restarted ctrl opens it
-  // and answers the same search without re-scanning what it already has.
   const search = await api("GET", "/api/search?q=counting")
   assert.equal(search.status, 200, search.text)
   assert.ok(search.json.count >= 1, "the mirror outlives the process")
@@ -837,9 +774,7 @@ test("restarting ctrl finds the same log, memory, workspace and jobs", async () 
 })
 
 test("a worker that outlives its turn wakes the agent, and the stream shows it (B)", async () => {
-  // Its own ctrl and its own pi: the shared fake worker sleeps 0.3 s, which is
-  // shorter than a turn, and a wake needs a worker that outlives one. The fake
-  // model is shared — tests in this file run in order, so its queue is ours.
+
   const root = await mkdtemp(path.join(tmpdir(), "ctrl-e2e-wake-root-"))
   const workspace = await mkdtemp(path.join(tmpdir(), "ctrl-e2e-wake-work-"))
   const binDir = await mkdtemp(path.join(tmpdir(), "ctrl-e2e-wake-bin-"))
@@ -855,8 +790,7 @@ test("a worker that outlives its turn wakes the agent, and the stream shows it (
 
   try {
     fixture.fake.reset()
-    // wait:0 → the turn ends while the worker is still counting, which is the
-    // only situation in which a wake is the right thing to do.
+
     fixture.fake.push({ toolCalls: [{ name: "delegate", arguments: { task: "count slowly", wait: 0 } }] })
     fixture.fake.push({ content: "the worker is counting" })
     fixture.fake.push({ content: "the worker finished counting" })
@@ -885,12 +819,10 @@ test("a worker that outlives its turn wakes the agent, and the stream shows it (
       snapshot = await stream()
     }
 
-    // CONTRACT §7: the wake is visible in the one stream the page reads.
     assert.match(wake.data.text, /^\[ctrl\] worker \d{8}T\d{6}Z-[a-z0-9]{6} finished \(exited, \d+\.\ds\) — report the result to the user\.$/)
     const jobId = /\[ctrl\] worker (\S+) finished/.exec(wake.data.text)?.[1] as string
     assert.ok(jobId.length > 0)
 
-    // …and it started an ordinary turn: an assistant message follows it.
     const answer = snapshot.events.find(
       (event): event is Extract<SessionEvent, { type: "assistant_message" }> =>
         event.type === "assistant_message" && event.seq > wake.seq,
@@ -898,8 +830,6 @@ test("a worker that outlives its turn wakes the agent, and the stream shows it (
     assert.equal(answer?.data.text, "the worker finished counting")
     assert.deepEqual(userMessages(snapshot).filter((text) => text.startsWith("[ctrl]")), [wake.data.text], "one wake per job")
 
-    // No custom event type was invented: a wake is a user_message, and the
-    // worker's own job is what it talks about.
     const types = new Set(snapshot.events.map((event) => event.type))
     for (const type of types) {
       assert.ok(
@@ -921,8 +851,7 @@ test("a worker that outlives its turn wakes the agent, and the stream shows it (
 })
 
 test("a model failure is logged once, by the engine, not twice", async () => {
-  // A closed port: the client retries and then throws. Nothing to do with the
-  // shared fake, so this test gets its own isolated ctrl.
+
   const dead = await startFakeLlm()
   const deadUrl = dead.url
   await dead.close()
@@ -950,7 +879,7 @@ test("a model failure is logged once, by the engine, not twice", async () => {
     assert.equal(errors.length, 1, `the engine logs the failure exactly once, got ${errors.length}`)
     assert.equal(errors[0]?.data.fatal, true)
     assert.match(errors[0]?.data.message ?? "", /LLM request failed/)
-    // And it is not repeated in the in-memory turn state.
+
     assert.equal(snapshot?.turn.error, undefined)
   } finally {
     await isolated.running.close()
@@ -960,7 +889,7 @@ test("a model failure is logged once, by the engine, not twice", async () => {
 })
 
 test("the sessions API is gone, and nothing replaces it with a roster", async () => {
-  // Every shape of the v1 surface: the list, a create, and one session's routes.
+
   assert.equal((await api("GET", "/api/sessions")).status, 404)
   assert.equal((await api("POST", "/api/sessions", { cwd: fixture.workspace })).status, 404)
   assert.equal((await api("GET", "/api/sessions/main")).status, 404)
@@ -968,7 +897,6 @@ test("the sessions API is gone, and nothing replaces it with a roster", async ()
   assert.equal((await api("POST", "/api/sessions/main/messages", { text: "hi" })).status, 404)
   assert.equal((await api("GET", "/api/agents")).status, 404)
 
-  // Sub-routes of /api/agent that do not exist are 404, not a guess.
   assert.equal((await api("GET", "/api/agent/events/extra")).status, 404)
   assert.equal((await api("GET", "/api/agent/nope")).status, 404)
   assert.equal((await api("GET", "/api/agent/../sessions")).status, 404)
@@ -983,15 +911,14 @@ test("an empty message is refused, and there is no machine to describe", async (
   const empty = await api("POST", "/api/agent/messages", { text: "   " })
   assert.equal(empty.status, 400, empty.text)
 
-  // CONTRACT §2: no machines, local or remote.
   assert.equal((await api("GET", "/api/machines")).status, 404)
-  // `/api/jobs` is a read-only projection of the jobs directory.
+
   assert.equal((await api("POST", "/api/jobs", {})).status, 405)
 })
 
 test("the page is served, and only from the public directory", async () => {
   const index = await api("GET", "/")
-  // W2 owns the page; while it is missing, a 404 is the correct answer.
+
   assert.ok(index.status === 200 || index.status === 404, `unexpected ${index.status}`)
   if (index.status === 200) assert.match(String(index.headers["content-type"]), /text\/html/)
 
@@ -1001,7 +928,6 @@ test("the page is served, and only from the public directory", async () => {
 
   assert.equal((await api("GET", "/no-such-file.js")).status, 404)
 
-  // Encoded traversal: the URL keeps %2e%2e, the resolver must refuse it.
   const escape = await api("GET", "/%2e%2e/package.json")
   assert.ok(escape.status === 403 || escape.status === 404, `traversal must not be served (got ${escape.status})`)
   assert.ok(!escape.text.includes("\"name\": \"pi-ctrl\""))

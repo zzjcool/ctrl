@@ -1,38 +1,14 @@
-// The agent's memory database (MEMORY.md §4): one SQLite file next to the log.
-//
-//   <agentHome>/memory.db
-//
-// Nothing here knows what an event means — this file is DDL, pragmas and the
-// tiny `meta` accessors. The mirror itself is built in ./index.ts, because
-// "which events are searchable, and how" is a decision, not a schema.
-//
-// Two rules from MEMORY.md §3 shape the whole layer:
-//   * events.jsonl is the truth; memory.db is derived and may be rebuilt;
-//   * the tables the M-curve has not reached yet (memories, turns, summaries,
-//     focus, dream_runs) exist from day one and stay empty — creating them now
-//     is what keeps M2/M3 a write-path change instead of a migration.
-
 import { mkdirSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 
-/** Bumped when DDL below changes; stored in `meta.schema_version`. */
 export const SCHEMA_VERSION = 1
 export const MEMORY_DB_FILENAME = "memory.db"
-/** `<agentHome>/memory.db` (MEMORY.md §4). */
+
 export function memoryDbPath(agentHome: string): string {
   return join(agentHome, MEMORY_DB_FILENAME)
 }
 
-/**
- * The §4 data model, verbatim. `IF NOT EXISTS` everywhere so opening a live
- * database is idempotent; M2–M4 add columns through a version step, not by
- * editing what already exists on disk.
- *
- * `events_fts`/`memories_fts` are declared `content=''` on purpose: the body is
- * derived from `events.data` and must not be stored twice, and one row per
- * event means `rowid` *is* the event `seq` — the join key the whole layer uses.
- */
 const DDL = `
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY,
@@ -114,22 +90,15 @@ CREATE INDEX IF NOT EXISTS focus_state ON focus(state);
 CREATE INDEX IF NOT EXISTS memories_superseded ON memories(superseded_by);
 `
 
-/** meta keys owned by this layer (M2/M3 add theirs). */
 export const META_SCHEMA_VERSION = "schema_version"
-/** Highest event seq mirrored into `events`; -1 means "nothing indexed yet". */
+
 export const META_LAST_INDEXED_SEQ = "last_indexed_seq"
 
-/**
- * Open (creating if needed) `<agentHome>/memory.db` and bring the schema up to
- * date. Throws when the file cannot be opened — callers that must survive a
- * broken database catch it and run degraded (see `createMemoryIndex`).
- */
 export function openMemoryDb(file: string): DatabaseSync {
   if (file !== ":memory:") mkdirSync(dirname(file), { recursive: true })
   const db = new DatabaseSync(file)
   try {
-    // WAL: the mirror is written while the page reads it. foreign_keys is a
-    // contract in the spec (MEMORY.md §4 needs the supersede chain sound).
+
     db.exec("PRAGMA journal_mode = WAL")
     db.exec("PRAGMA foreign_keys = ON")
     db.exec("PRAGMA busy_timeout = 4000")
@@ -140,13 +109,12 @@ export function openMemoryDb(file: string): DatabaseSync {
     try {
       db.close()
     } catch {
-      // The open error is the one worth reporting.
+
     }
     throw error
   }
 }
 
-/** Record the schema version and, later, step older files forward. */
 function migrate(db: DatabaseSync): void {
   const stored = readMeta(db, META_SCHEMA_VERSION)
   if (stored === undefined) {
@@ -158,9 +126,7 @@ function migrate(db: DatabaseSync): void {
     writeMeta(db, META_SCHEMA_VERSION, String(SCHEMA_VERSION))
     return
   }
-  // M1 is the first version: everything above is a future step. Writing the
-  // current number here would silently claim migrations that never ran, so a
-  // newer file is left exactly as it is.
+
   if (version < SCHEMA_VERSION) writeMeta(db, META_SCHEMA_VERSION, String(SCHEMA_VERSION))
 }
 
@@ -175,7 +141,6 @@ export function writeMeta(db: DatabaseSync, key: string, value: string): void {
   db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)").run(key, value)
 }
 
-/** The schema version on disk, or 0 for a file that predates `meta`. */
 export function schemaVersion(db: DatabaseSync): number {
   const raw = readMeta(db, META_SCHEMA_VERSION)
   if (raw === undefined) return 0
@@ -183,7 +148,6 @@ export function schemaVersion(db: DatabaseSync): number {
   return Number.isFinite(parsed) ? parsed : 0
 }
 
-/** The last mirrored seq, or -1 (so "everything from seq 0" is the first import). */
 export function lastIndexedSeq(db: DatabaseSync): number {
   const raw = readMeta(db, META_LAST_INDEXED_SEQ)
   if (raw === undefined) return -1

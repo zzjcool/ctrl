@@ -1,51 +1,26 @@
-// M2 — the window (MEMORY.md §5 §10.1).
-//
-// The model sees only the recent part of the log; everything older lives in
-// SQLite and comes back through `search_context`. This file decides where
-// "recent" starts and keeps it under a character budget:
-//
-//   transcript   events with seq >= the newest compaction's firstKeptSeq
-//   over budget  cut the oldest half (keep the newest >= budget/2 chars, and
-//                never fewer than MIN_KEPT_EVENTS events)
-//   then         summarise the dropped half with the turn's own llm client,
-//                appendCompaction({ summary, firstKeptSeq }), and record the
-//                summary in `summaries(level='window')`
-//
-// Three rules make this safe to run before every turn:
-//   * the cut never lands between an assistant tool_call and its tool_result
-//     (the wire would read as tool-without-call and the model would mistake
-//     the output for something the user said);
-//   * a single remaining user message is never compacted — there is nothing to
-//     compress and the user is about to be answered;
-//   * a failed summary is not a failed turn: this function returns
-//     `{ compressed: false, reason }` and never throws.
-
 import type { DatabaseSync } from "node:sqlite"
 import { errorMessage, clipChars, charLength, eventChars, eventRole, eventText, sessionChars, type LogEvent } from "./events.ts"
 
-/** MEMORY.md §10.1: default `--context-budget`, in characters. */
 export const DEFAULT_CONTEXT_BUDGET = 40_000
-/** Never compress down to fewer than this many events. */
+
 export const MIN_KEPT_EVENTS = 6
-/** Fraction of the budget the kept window aims for (the spec's ">= budget/2"). */
+
 export const KEEP_FRACTION = 0.5
-/** Hard cap on the summary the model may write (characters). */
+
 export const SUMMARY_MAX_CHARS = 2_000
-/** Completion budget for the summary call (`maxTokens: 800`). */
+
 export const SUMMARY_MAX_TOKENS = 800
-/** The dropped half is clipped before it enters the summary prompt. */
+
 export const SUMMARY_INPUT_CHARS = 24_000
-/** One tool result in the summary prompt (the tail of the log is what matters). */
+
 const SUMMARY_EVENT_CHARS = 1_200
 
-/** What this module needs from a session; `Session` satisfies it as is. */
 export interface WindowSink {
   sessionId: string
   events(): LogEvent[]
   appendCompaction(input: { summary: string; firstKeptSeq: number }): unknown
 }
 
-/** The slice of the llm client the summary needs. */
 export interface SummaryClient {
   complete(request: {
     messages: Array<{ role: "system" | "user" | "assistant" | "tool"; content: string }>
@@ -55,11 +30,11 @@ export interface SummaryClient {
 }
 
 export interface WindowInfo {
-  /** `seq` where the model's transcript starts (0 when nothing was compacted). */
+
   windowStart: number
-  /** Characters the transcript costs right now. */
+
   chars: number
-  /** How many events the transcript holds. */
+
   events: number
 }
 
@@ -67,7 +42,7 @@ export interface CompressOptions {
   llm: SummaryClient
   budget?: number
   minKeep?: number
-  /** Where the `summaries` row goes; absent when the database is degraded. */
+
   db?: DatabaseSync
   signal?: AbortSignal
   now?: () => Date
@@ -80,21 +55,20 @@ export type CompressReason = "under-budget" | "nothing-to-compress" | `summary-f
 export interface CompressOutcome {
   compressed: boolean
   reason?: CompressReason
-  /** The summary that was appended (when compressed). */
+
   summary?: string
-  /** `seq` of the first event the model still sees. */
+
   firstKeptSeq?: number
-  /** Inclusive seq range of the events the summary replaces. */
+
   fromSeq?: number
   toSeq?: number
-  /** Transcript cost before the cut. */
+
   chars: number
   kept: number
   dropped: number
   window: WindowInfo
 }
 
-/** Where the current window starts: the newest compaction's `firstKeptSeq`. */
 export function windowStart(events: LogEvent[]): number {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]
@@ -107,7 +81,6 @@ export function windowStart(events: LogEvent[]): number {
   return 0
 }
 
-/** The transcript (window events) and its cost — what `GET /api/agent` reports. */
 export function windowInfo(events: LogEvent[]): WindowInfo {
   const start = windowStart(events)
   const transcript = events.filter((event) => event.seq >= start)
@@ -115,26 +88,19 @@ export function windowInfo(events: LogEvent[]): WindowInfo {
 }
 
 export interface WindowPlan {
-  /** Index into the transcript of the first kept event. */
+
   cut: number
   kept: number
   dropped: number
-  /** Cost of the whole transcript before the cut. */
+
   chars: number
-  /** Cost of the kept part. */
+
   keepChars: number
   fromSeq: number
   toSeq: number
   firstKeptSeq: number
 }
 
-/**
- * The pure decision: is this transcript over budget, and where does the cut go?
- *
- * Exported because the cut is the part with all the edge cases (tool boundaries,
- * the minimum window, the single message that must survive) and it deserves
- * tests that never touch a model.
- */
 export function planCompaction(
   events: LogEvent[],
   opts: { budget?: number; minKeep?: number; keepFraction?: number } = {},
@@ -147,9 +113,6 @@ export function planCompaction(
   const chars = sessionChars(transcript)
   if (chars <= budget) return undefined
 
-  // Nothing to compress: one event, nothing but lifecycle markers, or a single
-  // user message — the spec's "只剩一条 user_message 不压". There is no earlier
-  // material to fold into a summary, and the user is about to be answered.
   if (transcript.length < 2) return undefined
   const content = transcript.filter((event) => eventChars(event) > 0)
   if (content.length === 0) return undefined
@@ -165,8 +128,7 @@ export function planCompaction(
   }
 
   let cut = transcript.length - kept
-  // Never start the kept window on a tool_result: its tool_call would be gone
-  // and the wire would be illegal (see the header).
+
   while (cut < transcript.length && transcript[cut]?.type === "tool_result") cut += 1
   if (cut <= 0 || cut >= transcript.length) return undefined
 
@@ -185,13 +147,6 @@ export function planCompaction(
   }
 }
 
-/**
- * Compress the window if it is over budget (MEMORY.md §10.1 M2).
- *
- * Never throws: a model that is down, a database that is read-only or a session
- * that cannot be appended to all end in `{ compressed: false, reason }`, and
- * the turn runs with the window it already has.
- */
 export async function compressWindow(session: WindowSink, opts: CompressOptions): Promise<CompressOutcome> {
   const now = opts.now ?? (() => new Date())
   const events = session.events()
@@ -212,7 +167,7 @@ export async function compressWindow(session: WindowSink, opts: CompressOptions)
   try {
     summary = await summarise(events, plan, opts)
   } catch (error) {
-    // The hard rule from §10.1: a summary that fails must not fail the turn.
+
     return {
       compressed: false,
       reason: `summary-failed: ${errorMessage(error)}`,
@@ -246,8 +201,6 @@ export async function compressWindow(session: WindowSink, opts: CompressOptions)
     }
   }
 
-  // The summary row is bookkeeping (MEMORY.md §9): the compaction event is the
-  // truth, and a database that refuses the row must not undo the compression.
   recordSummary(opts.db, { plan, summary, at: now() })
 
   return {
@@ -262,10 +215,6 @@ export async function compressWindow(session: WindowSink, opts: CompressOptions)
     window: windowInfo(session.events()),
   }
 }
-
-// ---------------------------------------------------------------------------
-// the summary call
-// ---------------------------------------------------------------------------
 
 async function summarise(events: LogEvent[], plan: WindowPlan, opts: CompressOptions): Promise<string> {
   const start = windowStart(events)
@@ -297,11 +246,6 @@ async function summarise(events: LogEvent[], plan: WindowPlan, opts: CompressOpt
   return clipChars(text, opts.summaryChars ?? SUMMARY_MAX_CHARS).trim()
 }
 
-/**
- * The summary the current window already carries: the newest compaction's, if
- * any. Passing it back into the prompt is what makes the summaries roll
- * forward instead of the older material vanishing at the second compression.
- */
 function previousSummary(events: LogEvent[]): string | undefined {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]
@@ -312,14 +256,6 @@ function previousSummary(events: LogEvent[]): string | undefined {
   return undefined
 }
 
-/**
- * Render the dropped events as prompt text, capped at `max` characters.
- *
- * A very old log can drop more than one prompt can hold; when that happens the
- * head and the tail are kept and the middle is elided — the tail is the part
- * adjacent to the new window (the context the model is about to continue from),
- * and the head is where the story it is folding up began.
- */
 function clipTranscript(events: LogEvent[], max: number): string {
   const lines: string[] = []
   for (const event of events) {
@@ -336,7 +272,6 @@ function clipTranscript(events: LogEvent[], max: number): string {
   return `${head}\n…(middle elided)…\n${tail}`
 }
 
-/** One `summaries` row at level `window` (MEMORY.md §4 §9). */
 function recordSummary(
   db: DatabaseSync | undefined,
   opts: { plan: WindowPlan; summary: string; at: Date },
@@ -354,7 +289,7 @@ function recordSummary(
       opts.at.toISOString(),
     )
   } catch {
-    // Bookkeeping only: the compaction event already carries the summary.
+
   }
 }
 

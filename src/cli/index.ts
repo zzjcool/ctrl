@@ -1,14 +1,4 @@
 #!/usr/bin/env node
-// ctrl — one process, one named agent, one log, one workspace.
-//
-//   node --experimental-strip-types src/cli/index.ts --agent builder
-//   node --experimental-strip-types src/cli/index.ts agent new builder --model workbuddy/deepseek-v4.1-flash
-//   node --experimental-strip-types src/cli/index.ts agent list
-//   node --experimental-strip-types src/cli/index.ts dream --agent builder
-//
-// There is no `--home`, no session id and no `--machine` anywhere: an agent is
-// a directory under `--root`, and work happens in the pi workers it delegates
-// to, not in this process.
 
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
@@ -44,30 +34,30 @@ export type Mode = "serve" | "agent-list" | "agent-new" | "agent-rm" | "dream" |
 
 interface Flags {
   mode: Mode
-  /** The name an `agent` subcommand acts on. */
+
   name?: string
   port: number
   host: string
   workspace?: string
   root?: string
   agent: string
-  /** The `pi` binary a worker is spawned as. */
+
   piBin: string
-  /** Provider a worker is told to use (`pi -p` is ambiguous without one). */
+
   piProvider: string
-  /** How many workers may run at once. */
+
   maxWorkers: number
-  /** Minutes a worker may run before it is killed; 0 = no limit. */
+
   jobTimeoutMinutes: number
   maxSteps: number
-  /** Characters of transcript the model sees before M2 compresses (MEMORY.md §10.1). */
+
   contextBudget?: number
-  /** Undefined means "let the server resolve": PI_DURABLE_MODEL, then the default. */
+
   model?: string
   reasoningEffort?: string
-  /** `agent list` / `agent new` output as JSON. */
+
   json: boolean
-  /** `agent rm`: delete instead of archiving. */
+
   purge: boolean
 }
 
@@ -150,7 +140,7 @@ export function parseArgs(argv: string[]): Flags {
     rest.shift()
     flags.mode = "dream"
   } else if (first !== undefined && !first.startsWith("-")) {
-    // An optional `serve` subcommand, so `ctrl` and `ctrl serve` both work.
+
     if (first !== "serve") throw new UsageError(`unknown command: ${first}`)
     rest.shift()
   }
@@ -198,15 +188,14 @@ export function parseArgs(argv: string[]): Flags {
         flags.piBin = word(value(), "--pi-bin")
         break
       case "--pi-provider":
-        // An empty provider is allowed: pi then uses whatever it is configured
-        // with, which is exactly what somebody who passed "" asked for.
+
         flags.piProvider = inline !== undefined ? inline.trim() : value().trim()
         break
       case "--max-workers":
         flags.maxWorkers = integer(value(), "--max-workers", 1, 64)
         break
       case "--job-timeout":
-        // 0 is a setting, not a mistake: it means "never kill a worker".
+
         flags.jobTimeoutMinutes = integer(value(), "--job-timeout", 0, 10_080)
         break
       case "--max-steps":
@@ -252,7 +241,6 @@ export function parseArgs(argv: string[]): Flags {
   return flags
 }
 
-/** `--agent` is validated here so a typo is exit 2, not a directory named `Foo`. */
 function agentNameFlag(label: string, raw: string): string {
   const trimmed = word(raw, label)
   if (!isAgentName(trimmed)) {
@@ -327,12 +315,8 @@ async function main(argv: string[]): Promise<number> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// ctrl agent …
-// ---------------------------------------------------------------------------
-
 function rootOf(flags: Flags): string {
-  // Nothing is created here: `agent list` on a fresh machine must not mkdir.
+
   return resolveRoot(flags.root)
 }
 
@@ -401,12 +385,10 @@ function removeCommand(flags: Flags): number {
   }
 }
 
-/** --model > PI_DURABLE_MODEL > DEFAULT_MODEL (CONTRACT §6). */
 function resolveModel(flags: Flags): string {
   return flags.model?.trim() || process.env.PI_DURABLE_MODEL?.trim() || DEFAULT_MODEL
 }
 
-/** Where `agent new` puts the log: the current directory unless told otherwise. */
 function defaultWorkspace(flags: Flags): string {
   return flags.workspace ?? process.cwd()
 }
@@ -417,18 +399,6 @@ function report(error: unknown): number {
   return 1
 }
 
-// ---------------------------------------------------------------------------
-// ctrl dream (MEMORY.md §7 §10.1 M3)
-// ---------------------------------------------------------------------------
-
-/**
- * One dream, by hand.
- *
- * Same code path the idle timer takes (`runDream`): the batch is everything
- * after `meta.last_dream_seq`, the model is the agent's own, and the writes go
- * through the same transaction. A failure is reported on stderr and in
- * `dream_runs`, and exits 1 without touching the data.
- */
 async function dreamCommand(flags: Flags): Promise<number> {
   let ensured
   try {
@@ -443,7 +413,6 @@ async function dreamCommand(flags: Flags): Promise<number> {
     return report(error)
   }
 
-  // The index owns the one connection to memory.db; the dream writes through it.
   const memory = createMemoryIndex({ agentHome: ensured.home, eventsFile: logPath(ensured.home) })
   try {
     const db = memory.handle()
@@ -451,8 +420,7 @@ async function dreamCommand(flags: Flags): Promise<number> {
       process.stderr.write(`ctrl: memory database unavailable: ${memory.error ?? "not open"}\n`)
       return 1
     }
-    // Catch the mirror up first: the dream's idle check reads last_indexed_seq,
-    // and a manual run should never dream about a log the index has not seen.
+
     memory.importEvents()
 
     const log = openAgentLog(ensured.home)
@@ -490,15 +458,11 @@ async function dreamCommand(flags: Flags): Promise<number> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// ctrl [serve]
-// ---------------------------------------------------------------------------
-
 async function serveCommand(flags: Flags): Promise<number> {
   let root: string
   try {
     root = rootOf(flags)
-    // Fail before binding a port if the name could not be a directory.
+
     agentHome(root, flags.agent)
   } catch (error) {
     return report(error)
@@ -555,7 +519,7 @@ async function serveCommand(flags: Flags): Promise<number> {
   }
   process.once("SIGINT", () => shutdown("SIGINT"))
   process.once("SIGTERM", () => shutdown("SIGTERM"))
-  // Keep the process alive until a signal or a fatal error closes the server.
+
   await new Promise<void>((resolve) => running.server.once("close", resolve))
   return 0
 }
@@ -568,7 +532,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** Are we being run as an entry point (as opposed to imported by a test)? */
 const entry = process.argv[1]
 if (entry !== undefined && fileURLToPath(import.meta.url) === entry) {
   const code = await main(process.argv.slice(2))

@@ -1,17 +1,3 @@
-// The seam between the agent loop and the `memories` table (MEMORY.md §2 §6).
-//
-// The bug this file exists for: the loop's `recall` used pi-durable's own memory
-// store (`memory/index.jsonl`) while dreaming wrote SQLite, so a fact the agent
-// had learned overnight could never be recalled during a turn. Every test here
-// asserts the *round trip* — dream/tool writes into `memories`, the engine's
-// `AgentMemory` reads it back — not the shape of an intermediate value.
-//
-// The four cases the task names:
-//   a) a memory written by a dream is recalled;
-//   b) a memory written through the adapter's `remember` is recalled;
-//   c) a 1–2 character Chinese query finds it (the LIKE fallback);
-//   d) a superseded memory is not recalled.
-
 import assert from "node:assert/strict"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -50,10 +36,6 @@ const EVENTS: LogEvent[] = [
 
 const context = { cwd: "/w", allowBash: false, timeoutMs: 10_000, maxOutputChars: 8_000 }
 
-// ---------------------------------------------------------------------------
-// a) what a dream wrote is recallable
-// ---------------------------------------------------------------------------
-
 test("a memory written by a dream is recalled by the agent loop", async () => {
   const dir = await home()
   const db = openMemoryDb(":memory:")
@@ -71,7 +53,7 @@ test("a memory written by a dream is recalled by the agent loop", async () => {
     assert.equal(dreamed.error, undefined, `dream failed: ${dreamed.error}`)
 
     const memory = createSqliteAgentMemory({ db })
-    // The turn's input, verbatim — the engine passes the whole user message.
+
     const hits = memory.recall({ text: "我们之前说了语言的事，中文还是英文？", limit: 8 })
     assert.equal(hits.length, 1, "the dream-written memory must come back")
     assert.equal(hits[0]?.entry.text, "用户喜欢用中文交流")
@@ -81,24 +63,17 @@ test("a memory written by a dream is recalled by the agent loop", async () => {
     assert.equal(hits[0]?.entry.seq, 1, "the entry points back at the log it came from")
     assert.ok((hits[0]?.score ?? 0) > 0, "a hit carries a positive score")
 
-    // The engine's shape, exactly: these are the fields `renderMemories` reads.
     assert.deepEqual(Object.keys(hits[0]?.entry ?? {}).sort(), ["id", "kind", "salience", "seq", "tags", "text", "ts"])
   } finally {
     db.close()
   }
 })
 
-// ---------------------------------------------------------------------------
-// b) the adapter's remember is the same table
-// ---------------------------------------------------------------------------
-
 test("remember writes the table and recall reads it back", async () => {
   const db = openMemoryDb(":memory:")
   try {
     const memory = createSqliteAgentMemory({ db })
-    // The real path: the engine's `remember` tool → ctx.remember →
-    // AgentMemory.remember → `memories`. `salience` only exists on that path
-    // (`AgentMemory`'s own input type is narrower), so this is where it is tested.
+
     const remember = buildTools().find((tool) => tool.name === "remember")
     assert.ok(remember, "the engine ships a remember tool")
     const written = await remember.execute(
@@ -116,7 +91,6 @@ test("remember writes the table and recall reads it back", async () => {
     assert.equal(hits[0]?.entry.id, entry.id)
     assert.equal(hits[0]?.entry.text, "the build box runs Go 1.23")
 
-    // Saying it again merges instead of duplicating (normalised text).
     const again = memory.remember({ kind: "fact", text: "the  build box runs Go 1.23." })
     assert.equal(again.id, entry.id)
     assert.equal(memory.recall({ text: "build box", limit: 5 }).length, 1)
@@ -141,10 +115,6 @@ test("the kinds the engine does not know are reported as fact, not dropped", asy
   }
 })
 
-// ---------------------------------------------------------------------------
-// c) a 1–2 character Chinese query (the LIKE fallback)
-// ---------------------------------------------------------------------------
-
 test("a two-character Chinese query finds the memory through the LIKE fallback", async () => {
   const db = openMemoryDb(":memory:")
   try {
@@ -156,7 +126,6 @@ test("a two-character Chinese query finds the memory through the LIKE fallback",
     assert.equal(hits.length, 1, "「编译」 is two characters: trigram cannot answer, LIKE must")
     assert.match(hits[0]?.entry.text ?? "", /编译很慢/)
 
-    // One character works too, and it does not match everything.
     assert.equal(memory.recall({ text: "缓", limit: 5 }).length, 1)
     assert.equal(memory.recall({ text: "缓存", limit: 5 }).length, 1)
     assert.equal(memory.recall({ text: "机器人", limit: 5 }).length, 0)
@@ -184,10 +153,6 @@ test("a long Chinese message is fanned out into terms that find something", () =
   }
 })
 
-// ---------------------------------------------------------------------------
-// d) superseded memories are not recalled
-// ---------------------------------------------------------------------------
-
 test("a superseded memory is not recalled, and its replacement is", async () => {
   const db = openMemoryDb(":memory:")
   try {
@@ -201,12 +166,10 @@ test("a superseded memory is not recalled, and its replacement is", async () => 
     assert.equal(hits[0]?.entry.id, replacement.memory.id)
     assert.equal(hits[0]?.entry.supersededBy, undefined)
 
-    // ...and a tombstoned memory is gone from recall as well.
     const gone = addMemory(db, { text: "部署走 herdr", kind: "fact" })
     db.prepare("UPDATE memories SET superseded_by = ? WHERE id = ?").run(`deleted:${gone.memory.id}`, gone.memory.id)
     assert.ok(!memory.recall({ text: "部署走 herdr", limit: 5 }).some((hit) => hit.entry.id === gone.memory.id))
 
-    // The engine may ask for history explicitly.
     const all = memory.recall({ text: "Go", includeSuperseded: true, limit: 5 })
     assert.ok(all.length >= 2, "includeSuperseded shows the chain")
   } finally {
@@ -226,10 +189,6 @@ test("editing a memory re-indexes it: the old text stops matching", async () => 
     db.close()
   }
 })
-
-// ---------------------------------------------------------------------------
-// the degraded case and the tool
-// ---------------------------------------------------------------------------
 
 test("a broken database answers recall with nothing and refuses to pretend to remember", () => {
   const memory = createSqliteAgentMemory({ db: undefined, warn: () => undefined })
@@ -256,7 +215,7 @@ test("search_context lists memories as memories, ahead of the event hits", async
   const db = openMemoryDb(":memory:")
   try {
     addMemory(db, { text: "编译很慢，要加缓存", kind: "decision", importance: 0.9 })
-    // The mirror is empty on purpose: this test is about the memory half.
+
     const index = createMemoryIndex({ agentHome: dir, eventsFile })
     try {
       const tool = createSearchContextTool({ index, db })
@@ -265,11 +224,9 @@ test("search_context lists memories as memories, ahead of the event hits", async
       assert.match(result.output, /\[[\d-]+ [\d:]+ memory mem-[\w-]+\] 编译很慢，要加缓存/)
       assert.doesNotMatch(result.output, /no matches/)
 
-      // A query that matches nothing anywhere still says so.
       const nothing = await tool.execute({ query: "量子纠缠" }, context)
       assert.match(nothing.output, /no matches/)
 
-      // Paging events never re-lists memories (they have no seq to page by).
       const paged = await tool.execute({ query: "编译", before: 5 }, context)
       assert.match(paged.output, /no matches/)
     } finally {

@@ -1,6 +1,3 @@
-// TurnRegistry: one turn per session, an abort that reaches the model call,
-// and errors that live in memory instead of the transcript (CONTRACT §8).
-
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import type { LlmCompleteRequest, LlmResponse } from "../../src/engine/durable.ts"
@@ -51,7 +48,7 @@ test("abort reaches the signal the runner was given", async () => {
   await turns.settled("s1")
   assert.equal(observed?.aborted, true)
   assert.deepEqual(turns.state("s1"), { running: false, aborted: true })
-  // Nothing is running any more, so a second abort is a no-op.
+
   assert.equal(turns.abort("s1"), false)
 })
 
@@ -61,10 +58,10 @@ test("a thrown error is recorded on the turn and the slot is released", async ()
   await turns.settled("s1")
   assert.deepEqual(turns.state("s1"), { running: false, error: "boom" })
   assert.equal(turns.isRunning("s1"), false)
-  // The lock is free again: a retry is allowed.
+
   assert.equal(turns.start("s1", async () => undefined), true)
   await turns.settled("s1")
-  // A fresh turn clears the previous error.
+
   assert.deepEqual(turns.state("s1"), { running: false })
 })
 

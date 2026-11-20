@@ -1,16 +1,3 @@
-// Worker jobs on disk (CONTRACT §5.1, PLAN §3.1).
-//
-//   <agentHome>/jobs/<id>/
-//     meta.json   { id, task, cwd, model, thinking, startedAt, pid, exitedAt?, code?, signal?, notifiedAt? }
-//     out.log     the worker's stdout+stderr
-//     pi/         the worker's own pi session dir (--session-dir)
-//
-// The rule that makes this survive a ctrl restart: state is *derived from the
-// disk on every read*. Nothing is remembered in memory, so closing ctrl is not
-// closing the jobs. A job whose process is gone and which never recorded an
-// exit was orphaned by a ctrl crash — that is `lost`, and we do not pretend it
-// is still running.
-
 import { randomBytes } from "node:crypto"
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs"
 import path from "node:path"
@@ -20,16 +7,14 @@ export const META_FILENAME = "meta.json"
 export const LOG_FILENAME = "out.log"
 export const PI_DIRNAME = "pi"
 
-/** `20261120T080102Z-a1b2c3` — sortable by time, unique enough for one user. */
 export const JOB_ID_PATTERN = /^\d{8}T\d{6}Z-[a-z0-9]{6}$/
 
-/** `job_status {full:true}` stops here; a whole pi log can be enormous. */
 export const MAX_OUTPUT_CHARS = 20_000
-/** How many trailing lines `job_status` shows by default. */
+
 export const DEFAULT_TAIL_LINES = 40
-/** How many jobs `/api/jobs` and `job_status` without an id report. */
+
 export const DEFAULT_LIST_LIMIT = 20
-/** `job_status` without an id lists this many, newest first. */
+
 export const DEFAULT_STATUS_LIST = 10
 
 export type JobState = "running" | "exited" | "failed" | "killed" | "lost"
@@ -45,15 +30,10 @@ export interface JobMeta {
   exitedAt?: string
   code?: number | null
   signal?: string | null
-  /**
-   * When ctrl woke the agent for this job's exit — written once, so a second
-   * exit event (the `exit` handler and `stop()` both finalise) never wakes
-   * twice, and a restart never wakes for something that already happened.
-   */
+
   notifiedAt?: string
 }
 
-/** A meta plus the state derived from it: what every reader actually wants. */
 export interface JobView extends JobMeta {
   state: JobState
   elapsedMs: number
@@ -75,7 +55,6 @@ export function isJobId(value: unknown): value is string {
   return typeof value === "string" && JOB_ID_PATTERN.test(value)
 }
 
-/** `20261120T080102Z` — UTC, so the id never depends on the machine's locale. */
 export function jobTimestamp(date: Date): string {
   const pad = (value: number) => String(value).padStart(2, "0")
   return [
@@ -110,12 +89,6 @@ export function jobPaths(agentHome: string, id: string): JobPaths {
   }
 }
 
-/**
- * `<jobs>/` and `<jobs>/<id>/` plus the `pi/` session dir.
- *
- * `EEXIST` is how a collision is noticed (two delegates in the same second);
- * the caller retries with a new id rather than reusing somebody's directory.
- */
 export function createJobPaths(agentHome: string, now: Date = new Date()): JobPaths {
   mkdirSync(jobsDir(agentHome), { recursive: true })
   for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -144,14 +117,13 @@ export function writeJobMeta(agentHome: string, meta: JobMeta): JobMeta {
   if (meta.code !== undefined) record.code = meta.code
   if (meta.signal !== undefined) record.signal = meta.signal
   if (typeof meta.notifiedAt === "string" && meta.notifiedAt !== "") record.notifiedAt = meta.notifiedAt
-  // Write-then-rename: a reader never sees half a meta.json.
+
   const tmp = `${paths.metaPath}.tmp`
   writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, "utf8")
   renameSync(tmp, paths.metaPath)
   return record
 }
 
-/** Undefined for a missing, unreadable or malformed meta.json — never throws. */
 export function readJobMeta(agentHome: string, id: string): JobMeta | undefined {
   if (!isJobId(id)) return undefined
   let raw: string
@@ -184,18 +156,12 @@ export function readJobMeta(agentHome: string, id: string): JobMeta | undefined 
   }
 }
 
-/** Merge a patch into meta.json; undefined when the job is gone. */
 export function updateJobMeta(agentHome: string, id: string, patch: Partial<Omit<JobMeta, "id">>): JobMeta | undefined {
   const meta = readJobMeta(agentHome, id)
   if (meta === undefined) return undefined
   return writeJobMeta(agentHome, { ...meta, ...patch })
 }
 
-/**
- * `process.kill(pid, 0)` is the only portable liveness probe: it sends no
- * signal. `EPERM` means the process exists but belongs to somebody else — a
- * worker we started as another user is still alive, so it counts as alive.
- */
 export function isProcessAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try {
@@ -206,16 +172,15 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-/** The state ladder of CONTRACT §5.1, derived from meta + a liveness probe. */
 export function deriveState(meta: JobMeta): JobState {
   const finished = typeof meta.exitedAt === "string" && meta.exitedAt !== ""
   if (finished) {
     if (typeof meta.signal === "string" && meta.signal !== "") return "killed"
     if (meta.code === 0) return "exited"
-    // A non-zero code, or an exit with neither code nor signal: not a success.
+
     return "failed"
   }
-  // No exit recorded. Alive ⇒ running; gone ⇒ ctrl died while it ran (`lost`).
+
   return isProcessAlive(meta.pid) ? "running" : "lost"
 }
 
@@ -227,12 +192,6 @@ export function elapsedMs(meta: JobMeta, now: number = Date.now()): number {
   return span > 0 ? span : 0
 }
 
-/** One job as the rest of the code sees it; undefined when it is not there. */
-/**
- * Read a job, waiting up to `waitMs` for a running worker to finish. The
- * engine caps a tool call at 10 s, so callers keep this well under that; the
- * point is to spend one tool call on "wait for it" instead of ten on polling.
- */
 export async function waitForJob(
   agentHome: string,
   id: string,
@@ -253,7 +212,6 @@ export function readJob(agentHome: string, id: string, now: number = Date.now())
   return { ...meta, state: deriveState(meta), elapsedMs: elapsedMs(meta, now) }
 }
 
-/** Every job on disk, newest first; unreadable directories are skipped. */
 export function listJobIds(agentHome: string): string[] {
   let names: string[]
   try {
@@ -279,18 +237,16 @@ export function listJobs(
   return limit > 0 ? jobs.slice(0, limit) : jobs
 }
 
-/** How many workers are still running — the concurrency cap reads this. */
 export function countRunning(agentHome: string, now: number = Date.now()): number {
   return listJobs(agentHome, { limit: 0, now }).filter((job) => job.state === "running").length
 }
 
 export interface JobLog {
   text: string
-  /** True only when `full` was asked for and the log did not fit. */
+
   truncated: boolean
 }
 
-/** The tail of a job's output; a missing log is an empty log, not an error. */
 export function readJobLog(
   agentHome: string,
   id: string,
@@ -305,14 +261,13 @@ export function readJobLog(
   }
   if (opts.full === true) {
     if (raw.length <= MAX_OUTPUT_CHARS) return { text: raw, truncated: false }
-    // The end of the log is the part that says what happened.
+
     return { text: raw.slice(raw.length - MAX_OUTPUT_CHARS), truncated: true }
   }
   const lines = opts.lines !== undefined && Number.isFinite(opts.lines) ? Math.floor(opts.lines) : DEFAULT_TAIL_LINES
   return { text: tailLines(raw, lines), truncated: false }
 }
 
-/** Keep the last `lines` lines of a text body (the poll target). */
 export function tailLines(text: string, lines: number): string {
   if (!Number.isFinite(lines) || lines <= 0) return text
   const all = text.split("\n")

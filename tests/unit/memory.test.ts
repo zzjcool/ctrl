@@ -1,9 +1,3 @@
-// M1: the SQLite mirror and the search over it (MEMORY.md §4 §10).
-//
-// These tests own the layer below HTTP: schema, incremental import, the two
-// search regimes, the snippet window, and the tool the model sees. Nothing here
-// opens a socket — `/api/search` is exercised in tests/e2e/agent.test.ts.
-
 import assert from "node:assert/strict"
 import { appendFile, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
@@ -45,7 +39,6 @@ interface Draft {
   seq?: number
 }
 
-/** One events.jsonl line, in the shape pi-durable writes (seq included). */
 function line(event: Draft, index: number): string {
   const seq = event.seq ?? index
   return JSON.stringify({
@@ -68,7 +61,6 @@ async function appendLog(file: string, events: Draft[], offset: number): Promise
   await appendFile(file, body, "utf8")
 }
 
-/** The log every test starts from: one event of every type M1 touches. */
 const MIXED: Draft[] = [
   { type: "session_created", data: { cwd: "/w", model: "fake-model" } },
   { type: "user_message", data: { text: "帮我统计 .ts 文件的数量" } },
@@ -103,10 +95,6 @@ async function open(events: Draft[] = MIXED, opts: { dbPath?: string } = {}): Pr
   return { home, eventsFile, index, warnings }
 }
 
-// ---------------------------------------------------------------------------
-// schema (MEMORY.md §4)
-// ---------------------------------------------------------------------------
-
 test("memory.db is created next to the agent, with WAL, foreign keys and the whole §4 schema", async () => {
   const { home } = await tempAgent()
   const file = memoryDbPath(home)
@@ -134,7 +122,7 @@ test("memory.db is created next to the agent, with WAL, foreign keys and the who
     ]) {
       assert.ok(names.includes(table), `missing table ${table} (got ${names.join(", ")})`)
     }
-    // The FTS tables are contentless: the body is derived, never stored twice.
+
     const ftsSql = (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'events_fts'").get() as { sql: string }).sql
     assert.match(ftsSql, /tokenize='trigram'/)
     assert.match(ftsSql, /content=''/)
@@ -143,7 +131,6 @@ test("memory.db is created next to the agent, with WAL, foreign keys and the who
     assert.equal(String(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value), String(SCHEMA_VERSION))
     assert.equal(lastIndexedSeq(db), -1, "an empty mirror has indexed nothing")
 
-    // M2–M4 own these; M1 only guarantees they exist, empty.
     for (const table of ["turns", "memories", "summaries", "focus", "dream_runs"]) {
       assert.equal(Number(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()?.n), 0, `${table} is empty in M1`)
     }
@@ -166,10 +153,6 @@ test("opening an existing database twice keeps the schema and the mirrored rows"
     again.close()
   }
 })
-
-// ---------------------------------------------------------------------------
-// import (task M1 §3)
-// ---------------------------------------------------------------------------
 
 test("every event is mirrored; only the ones with text are indexed", async () => {
   const bag = await open()
@@ -198,7 +181,7 @@ test("import is idempotent: a second pass writes nothing and does not double the
     assert.equal(again.updated, 0)
     assert.equal(again.unchanged, MIXED.length)
     assert.equal(bag.index.stats().events, first.events)
-    // A duplicated posting would show up as two hits for the same seq.
+
     const hits = bag.index.search("文件", { limit: MAX_SEARCH_LIMIT })
     assert.deepEqual(hits.map((hit) => hit.seq), [1])
   } finally {
@@ -216,7 +199,6 @@ test("import is incremental, and a gap in the log advances to the highest seq se
     assert.equal(result.unchanged, MIXED.length)
     assert.equal(result.lastSeq, MIXED.length)
 
-    // seqs are normally dense, but the mirror must not stall on a hole.
     await appendLog(bag.eventsFile, [{ type: "user_message", data: { text: "跳号之后的一条" }, seq: 40 }], 40)
     result = bag.index.importEvents()
     assert.ok(result)
@@ -245,7 +227,6 @@ test("a torn tail is skipped, not fatal, and is picked up once it is whole", asy
     assert.equal(torn.added, 0)
     assert.equal(torn.lastSeq, MIXED.length - 1)
 
-    // Finish the line the way a retried append would and it indexes.
     await appendFile(bag.eventsFile, 'sage","ts":"2026-11-20T08:00:00.000Z","data":{"text":"补完的一行"}}\n', "utf8")
     const healed = bag.index.importEvents()
     assert.ok(healed)
@@ -277,10 +258,6 @@ test("the mirror is derived: deleting memory.db and importing again rebuilds it"
   }
 })
 
-// ---------------------------------------------------------------------------
-// search (task M1 §4)
-// ---------------------------------------------------------------------------
-
 test("a two-character Chinese query falls back to a substring scan", async () => {
   const bag = await open()
   try {
@@ -288,7 +265,7 @@ test("a two-character Chinese query falls back to a substring scan", async () =>
     assert.deepEqual(hits.map((hit) => hit.seq), [1])
     assert.equal(hits[0]?.type, "user_message")
     assert.match(hits[0]?.body ?? "", /统计/)
-    // 0 is the marker of the fallback: it has no bm25 score, unlike a trigram hit.
+
     assert.equal(hits[0]?.score, 0, "the fallback has no bm25 score")
   } finally {
     bag.index.close()
@@ -301,15 +278,10 @@ test("three or more Chinese characters go through the trigram index", async () =
     for (const query of ["文件的数量", "帮我统"]) {
       const hits = bag.index.search(query)
       assert.deepEqual(hits.map((hit) => hit.seq), [1], query)
-      // bm25 is smaller-is-better and strictly negative: a 0 here would mean
-      // the substring fallback answered instead (or the score was flattened),
-      // and relevance ranking would silently become "newest first".
+
       assert.ok((hits[0]?.score ?? 0) < 0, `bm25 score for ${query} was ${hits[0]?.score}`)
     }
 
-    // The score a caller sees is the bm25 value itself, not a rounded copy: a
-    // bm25 value is a tiny fraction, and integer coercion would flatten every
-    // hit to 0 and destroy the ranking.
     const db = openMemoryDb(memoryDbPath(bag.home))
     try {
       const raw = db
@@ -342,7 +314,7 @@ test("punctuation is content, not FTS5 syntax: `hw-` must not throw", async () =
   const bag = await open()
   try {
     const hits = bag.index.search("hw-")
-    // seq 4 (assistant_message), 5 (error) and 7 (the compaction summary).
+
     assert.deepEqual(hits.map((hit) => hit.seq).sort((a, b) => a - b), [4, 5, 7])
     assert.deepEqual(bag.index.search("==="), [], "a query with no match is empty, not an error")
     assert.deepEqual(bag.index.search('"""'), [], "quotes are escaped, not passed through")
@@ -413,7 +385,7 @@ test("the limit is clamped to 1..MAX_SEARCH_LIMIT", async () => {
 })
 
 test("a hit body is a 400-character window around the match", async () => {
-  const filler = "abcdefghij".repeat(80) // 800 characters
+  const filler = "abcdefghij".repeat(80)
   const body = `${filler}NEEDLE${filler}`
   const bag = await open([{ type: "user_message", data: { text: body } }])
   try {
@@ -428,17 +400,12 @@ test("a hit body is a 400-character window around the match", async () => {
   }
 })
 
-// ---------------------------------------------------------------------------
-// snippet / body helpers
-// ---------------------------------------------------------------------------
-
 test("snippet keeps 120 characters before the match and never exceeds the budget", () => {
   const body = `${"a".repeat(500)}TARGET${"b".repeat(500)}`
   const cut = snippet(body, "TARGET")
   assert.ok(Array.from(cut).length <= SNIPPET_LIMIT, `snippet is ${Array.from(cut).length} chars`)
   assert.match(cut, /TARGET/)
-  // The ellipsis is part of the 400-char budget, so the match sits 120 chars
-  // into the text after it.
+
   const withoutHead = cut.startsWith("…") ? cut.slice(1) : cut
   assert.equal(withoutHead.indexOf("TARGET"), SNIPPET_LEAD, "120 characters of context before the hit")
   assert.ok(cut.endsWith("…"), "the window is cut on both sides")
@@ -462,14 +429,9 @@ test("eventBody: one body per event type, and none for lifecycle noise", () => {
   assert.equal(eventBody("user_message", { text: "   " }), undefined, "blank text is not indexed")
   assert.equal(eventBody("user_message", {}), undefined)
 
-  // A worker's whole test log must not become one blob of index.
   const long = eventBody("tool_result", { output: "x".repeat(5_000) }) ?? ""
   assert.equal(Array.from(long).length, INDEX_BODY_LIMIT)
 })
-
-// ---------------------------------------------------------------------------
-// search_context (task M1 §5)
-// ---------------------------------------------------------------------------
 
 test("search_context renders one line per hit with time, seq and kind", async () => {
   const bag = await open()
@@ -568,7 +530,7 @@ test("the tool set is seven: the three job tools, search_context, focus_set, rem
 test("a database that will not open degrades to empty results instead of throwing", async () => {
   const { home, eventsFile } = await tempAgent()
   await writeLog(eventsFile, MIXED)
-  // A regular file where the database's parent directory should be.
+
   const blocker = path.join(home, "not-a-dir")
   await writeFile(blocker, "x", "utf8")
 
@@ -593,7 +555,7 @@ test("a database that will not open degrades to empty results instead of throwin
     const result = await tool.execute({ query: "hw-" }, fakeContext())
     assert.equal(result.ok, true, "a broken index must not break the turn")
     assert.match(result.output, /search_context is unavailable/)
-    // Still one warning: searching does not spam the log.
+
     assert.equal(warnings.length, 1)
   } finally {
     index.close()
@@ -608,10 +570,6 @@ test("time and kind helpers match the line the model reads", () => {
   assert.equal(eventKind("tool_result"), "tool_result")
   assert.equal(eventKind("compaction"), "compaction")
 })
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
 
 function fakeContext() {
   return { cwd: "/w", allowBash: false, timeoutMs: 10_000, maxOutputChars: 8_000 }

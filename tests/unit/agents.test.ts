@@ -1,9 +1,3 @@
-// An agent is a directory (CONTRACT §4, PLAN §3.1).
-//
-// These tests own the on-disk rules: the name charset, where a name may point,
-// what a fresh directory contains, and what `rm` means. Nothing here opens a
-// socket — the HTTP surface is tests/e2e/agent.test.ts.
-
 import assert from "node:assert/strict"
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -41,10 +35,6 @@ after(async () => {
   for (const root of roots) await rm(root, { recursive: true, force: true })
 })
 
-// ---------------------------------------------------------------------------
-// names and paths
-// ---------------------------------------------------------------------------
-
 test("agent names are lowercase, start alphanumeric, and fit in 32 chars", () => {
   for (const name of ["a", "main", "builder", "b2", "a-b_c", "x".repeat(32), "0day"]) {
     assert.equal(isAgentName(name), true, name)
@@ -68,13 +58,9 @@ test("root resolution is --root, then CTRL_ROOT, then ~/.ctrl", () => {
   assert.equal(resolveRoot(undefined, { CTRL_ROOT: "/tmp/two" }), "/tmp/two")
   const fallback = resolveRoot(undefined, {})
   assert.match(fallback, /\.ctrl$/)
-  // A blank flag is not an answer; the env still wins.
+
   assert.equal(resolveRoot("   ", { CTRL_ROOT: "/tmp/three" }), "/tmp/three")
 })
-
-// ---------------------------------------------------------------------------
-// ensure: serve-time open-or-create
-// ---------------------------------------------------------------------------
 
 test("a missing agent directory is created with agent.json and one log", async () => {
   const root = await freshRoot()
@@ -90,7 +76,6 @@ test("a missing agent directory is created with agent.json and one log", async (
   assert.equal(onDisk.model, "test/model")
   assert.equal(typeof onDisk.createdAt, "string")
 
-  // The log id is "main" and it starts with exactly one event.
   assert.equal(LOG_ID, "main")
   assert.equal(path.basename(logPath(ensured.home)), "events.jsonl")
   assert.match(logPath(ensured.home), /sessions\/main\/events\.jsonl$/)
@@ -101,7 +86,7 @@ test("a missing agent directory is created with agent.json and one log", async (
     assert.equal(events[0].data.cwd, "/work")
     assert.equal(events[0].data.model, "test/model")
   }
-  // Memory lives inside the agent, so a new name starts blank (CONTRACT §4).
+
   assert.equal(ensured.session.eventsFile, logPath(ensured.home))
 })
 
@@ -116,7 +101,7 @@ test("serving an existing agent opens its log instead of creating a new one", as
   assert.equal(second.meta.createdAt, createdAt, "agent.json is not rewritten")
   assert.equal(second.meta.model, "model/one")
   assert.equal(second.session.events().length, 2, "the log is the same log")
-  // The model recorded at creation wins over the flag (PLAN §5).
+
   assert.equal(second.session.meta().model, "model/one")
 })
 
@@ -128,7 +113,7 @@ test("a directory whose log went missing is healed, not fatal", async () => {
   const healed = ensureAgent({ root, name: "builder", cwd: "/work", model: "model/two" })
   assert.equal(healed.session.events().length, 1)
   assert.equal(healed.meta.model, "model/one", "agent.json survives the loss")
-  // The healed log records agent.json's model, since that is the agent's.
+
   assert.equal(healed.session.meta().model, "model/one")
 })
 
@@ -154,10 +139,6 @@ test("a malformed agent.json is ignored instead of thrown", async () => {
   }
 })
 
-// ---------------------------------------------------------------------------
-// list
-// ---------------------------------------------------------------------------
-
 test("list is creation-ordered, counts events, and ignores stray directories", async () => {
   const root = await freshRoot()
   const older = newAgent({ root, name: "builder", cwd: "/work", model: "m", now: new Date("2026-01-01T00:00:00Z") })
@@ -165,7 +146,6 @@ test("list is creation-ordered, counts events, and ignores stray directories", a
   const newer = newAgent({ root, name: "auditor", cwd: "/work", model: "m", now: new Date("2026-02-02T00:00:00Z") })
   assert.equal(newer.session.events().length, 1)
 
-  // Things that are not agents must not appear in the list.
   await writeFile(path.join(root, "agents", "notes.txt"), "x")
   await mkdir(path.join(root, "agents", "NotValid"), { recursive: true })
 
@@ -193,10 +173,6 @@ test("a fresh name starts blank: no memory, no log", async () => {
   await assert.rejects(stat(path.join(again.home, "memory", "index.jsonl")), "a blank agent has no memory log")
 })
 
-// ---------------------------------------------------------------------------
-// rm: archive by default, purge on request
-// ---------------------------------------------------------------------------
-
 test("rm archives the directory under trash/<name>-<stamp>/", async () => {
   const root = await freshRoot()
   const created = newAgent({ root, name: "builder", cwd: "/w", model: "m" })
@@ -206,7 +182,7 @@ test("rm archives the directory under trash/<name>-<stamp>/", async () => {
   assert.equal(trashStamp(new Date("2026-10-16T19:36:12Z")).length, 14)
   assert.equal(removed.to, path.join(root, "trash", `builder-${trashStamp(new Date("2026-10-16T19:36:12Z"))}`))
   await assert.rejects(stat(created.home), "the agent directory is gone from agents/")
-  // Archived means archived: the log travelled with the directory.
+
   const archived = JSON.parse(await readFile(path.join(removed.to ?? "", AGENT_FILENAME), "utf8"))
   assert.equal(archived.name, "builder")
   assert.equal((await readdir(removed.to ?? "")).includes("sessions"), true)
@@ -248,10 +224,6 @@ test("rm of a missing agent is a not-found, not a crash", async () => {
   assert.equal(DEFAULT_AGENT, "main")
 })
 
-// ---------------------------------------------------------------------------
-// what the model is told (CONTRACT §6)
-// ---------------------------------------------------------------------------
-
 test("the system prompt names the agent and says it has no hands", () => {
   const prompt = agentSystemPrompt({ name: "builder", cwd: "/srv/proj" })
   assert.equal(
@@ -259,8 +231,7 @@ test("the system prompt names the agent and says it has no hands", () => {
     "You are builder, a persistent agent with long-term memory. " +
       "You do not edit files or run commands yourself: delegate work to a pi worker with the delegate tool, " +
       "then report what it did. The log is your memory; there is no conversation. " +
-      // MEMORY.md §5: the window is not the memory, so the prompt names the one
-      // tool that reaches past it.
+
       "You can search your entire history with search_context(query) — use it when the user refers to something not in the recent context. " +
       "Your workspace is /srv/proj.",
   )

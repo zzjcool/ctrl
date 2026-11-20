@@ -1,10 +1,3 @@
-// One turn per session, started and not awaited (CONTRACT §8).
-//
-// A turn outlives the HTTP request that started it and outlives the tab that
-// was watching. The registry therefore holds the only mutable state about
-// "is something running right now", and it is deliberately in memory: crash
-// recovery is pi-durable's job, derived from the event log, not from here.
-
 import type { LlmClient, LlmCompleteRequest, LlmResponse } from "../engine/durable.ts"
 
 export interface TurnState {
@@ -26,11 +19,6 @@ interface TurnEntry {
 export class TurnRegistry {
   private readonly entries = new Map<string, TurnEntry>()
 
-  /**
-   * Claim the session's single turn slot and run it in the background.
-   * Returns false when a turn is already running — the caller turns that into
-   * 409. Never rejects: a failure is recorded on the turn, not thrown.
-   */
   start(sessionId: string, run: (signal: AbortSignal) => Promise<void>): boolean {
     const existing = this.entries.get(sessionId)
     if (existing?.running) return false
@@ -48,8 +36,7 @@ export class TurnRegistry {
       try {
         await run(controller.signal)
       } catch (error) {
-        // Errors live here and only here; the session log is pi-durable's to
-        // write (it already wrote one for a failed model call).
+
         entry.error = errorMessage(error)
       } finally {
         entry.running = false
@@ -58,7 +45,6 @@ export class TurnRegistry {
     return true
   }
 
-  /** Ask the running turn to stop. Returns false when nothing was running. */
   abort(sessionId: string): boolean {
     const entry = this.entries.get(sessionId)
     if (!entry?.running) return false
@@ -82,13 +68,11 @@ export class TurnRegistry {
     }
   }
 
-  /** Await the last turn of a session (tests and graceful shutdown). */
   async settled(sessionId: string): Promise<void> {
     const entry = this.entries.get(sessionId)
     if (entry) await entry.done
   }
 
-  /** Abort and await every running turn. */
   async shutdown(): Promise<void> {
     const running = [...this.entries.values()].filter((entry) => entry.running)
     for (const entry of running) {
@@ -99,10 +83,6 @@ export class TurnRegistry {
   }
 }
 
-/**
- * Inject the abort signal into every model call (CONTRACT §8): the engine does
- * not pass one, and wrapping `complete` is the whole trick — no engine change.
- */
 export function createAbortableLlm(base: LlmClient, signal: AbortSignal): LlmClient {
   return {
     model: base.model,

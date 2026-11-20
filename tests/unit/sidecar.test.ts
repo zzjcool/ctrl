@@ -1,9 +1,3 @@
-// `<sessionDir>/ctrl.json`: the workspace this agent works in (CONTRACT §4, §8).
-//
-// The rule that matters: a broken sidecar must never make a session
-// un-openable — it degrades to "unknown, use the cwd from the log". v3 dropped
-// the machine, so a v2 file must still be readable (its `machine` is ignored).
-
 import assert from "node:assert/strict"
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
