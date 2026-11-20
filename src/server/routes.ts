@@ -1,19 +1,18 @@
-// The nine routes of CONTRACT §10, and nothing else.
+// The routes of CONTRACT §7, and nothing else (v2: one named agent).
 //
 // Shape rules that matter to the page:
-//   * `POST /messages` answers 202 immediately; the turn runs in the background.
-//   * a second turn on the same session is 409, never a queue.
-//   * `GET /events?since=N` treats `N` as an index into the event array (seq is
-//     dense and 0-based, so the two coincide by construction).
+//   * `POST /api/agent/messages` answers 202 immediately; the turn runs on.
+//   * a second turn on the agent is 409, never a queue.
+//   * events has three paging modes with the priority `before` > `tail` > `since`,
+//     capped at 200 per call; `since` is a *seq*, never an array index.
+//   * there is no sessions route: the log id is "main" and nobody may ask for another.
 
 import type { IncomingMessage, ServerResponse } from "node:http"
 import {
   appendRecord,
   asAgentMemory,
   createMemoryStore,
-  createSession,
   detectResumePoint,
-  listSessions,
   openSession,
   repairSession,
   resolvePaths,
@@ -22,56 +21,93 @@ import {
 import type {
   LlmClient,
   MemoryKind,
+  Session,
   SessionEvent,
-  SessionMeta,
   ToolSpec,
 } from "../engine/durable.ts"
 import type { Executor } from "../exec/types.ts"
+import { LOG_ID } from "./agents.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
-import { isSessionId, readSidecar, writeSidecar } from "./sidecar.ts"
+import { readSidecar } from "./sidecar.ts"
 import { createAbortableLlm, type TurnRegistry } from "./turns.ts"
 
 export type MachineKind = "local" | "ssh"
 
 export interface AppContext {
-  home?: string
-  /** The machine this ctrl instance is bound to (one per session in v1). */
+  /** `<root>`: holds `agents/` and `trash/`. */
+  root: string
+  /** The agent name this process serves — its identity, not a title. */
+  agent: string
+  /** `<root>/agents/<name>` — pi-durable's home for this agent. */
+  agentHome: string
+  /** The machine the agent's hands are on, fixed at start (CONTRACT §2, D8). */
   machine: { name: string; kind: MachineKind }
   executor: Executor
-  /** Default working directory for new sessions (remote when kind is ssh). */
+  /** Default working directory when the sidecar has none yet. */
   workspace: string
   allowBash: boolean
   maxSteps: number
-  /** Model for new sessions when the request does not name one. */
+  /** Model for a log that has not recorded one yet. */
   defaultModel: string
   turns: TurnRegistry
   tools: ToolSpec[]
   env: NodeJS.ProcessEnv
   createLlm: (model: string) => LlmClient
-  /** Every machine the page may show in the chip: `local` plus ssh hosts. */
+  /** Every machine the page may show in the strip: `local` plus ssh hosts. */
   machines: string[]
 }
 
 const MEMORY_KINDS = new Set<MemoryKind>(["fact", "preference", "event", "skill"])
-const MAX_TITLE_CHARS = 60
-const PAGE_SIZE = 30
+/** CONTRACT §7: no call may return more than this many events. */
+export const MAX_EVENTS_PER_CALL = 200
 
-export interface SessionView extends SessionMeta {
-  machine: string
-  remoteCwd: string
+export interface EventPage {
+  events: SessionEvent[]
+  total: number
+  since: number
 }
 
-/** `since` is an event-array index, clamped into `[0, total]`. */
-export function sliceEvents(
-  events: SessionEvent[],
-  since: unknown,
-): { events: SessionEvent[]; total: number; since: number } {
+export interface EventQuery {
+  since?: unknown
+  tail?: unknown
+  before?: unknown
+}
+
+/**
+ * The stream (CONTRACT §7, PLAN §3.3).
+ *
+ *   since=N          events with seq >= N, at most 200
+ *   tail=T           the last T events
+ *   before=S&tail=T  the T events before seq S (paging up)
+ *
+ * Priority is `before` > `tail` > `since`. `since` in the answer is the seq of
+ * the first returned event; when there is nothing to return it stays where the
+ * caller already is (`since` mode) or is 0 (tail/before mode), which is what
+ * stops the page from asking "load earlier" forever.
+ */
+export function pageEvents(events: SessionEvent[], query: EventQuery): EventPage {
   const total = events.length
-  let requested = 0
-  if (typeof since === "string" && since.trim() !== "") requested = Number.parseInt(since, 10)
-  else if (typeof since === "number" && Number.isFinite(since)) requested = Math.floor(since)
-  const from = Number.isFinite(requested) && requested > 0 ? Math.min(Math.floor(requested), total) : 0
-  return { events: events.slice(from), total, since: from }
+  const before = intParam(query.before)
+  const tail = intParam(query.tail)
+  const since = intParam(query.since)
+
+  let picked: SessionEvent[]
+  if (before !== undefined) {
+    picked = limitTail(events.filter((event) => event.seq < before), tail ?? MAX_EVENTS_PER_CALL)
+  } else if (tail !== undefined) {
+    picked = limitTail(events, tail)
+  } else {
+    const from = since !== undefined && since > 0 ? since : 0
+    picked = events.filter((event) => event.seq >= from).slice(0, MAX_EVENTS_PER_CALL)
+  }
+
+  const first = picked[0]
+  if (first !== undefined) return { events: picked, total, since: first.seq }
+  // Nothing came back: report where the caller is, clamped into the log.
+  if (before === undefined && tail === undefined) {
+    return { events: [], total, since: Math.min(since !== undefined && since > 0 ? since : 0, total) }
+  }
+  return { events: [], total, since: 0 }
 }
 
 export async function handleApiRequest(
@@ -87,69 +123,40 @@ export async function handleApiRequest(
 
   try {
     if (method === "GET" && url.pathname === "/api/health") {
-      sendJson(response, 200, { status: "ok", machine: ctx.machine.name, kind: ctx.machine.kind })
+      sendJson(response, 200, {
+        status: "ok",
+        agent: ctx.agent,
+        machine: ctx.machine.name,
+        kind: ctx.machine.kind,
+      })
       return true
     }
 
     if (method === "GET" && url.pathname === "/api/machines") {
-      const machines = unique([ctx.machine.name, ...ctx.machines])
-        .map((name) => ({
-          name,
-          kind: name === "local" ? ("local" as const) : ("ssh" as const),
-          current: name === ctx.machine.name,
-        }))
+      const machines = unique([ctx.machine.name, ...ctx.machines]).map((name) => ({
+        name,
+        kind: name === "local" ? ("local" as const) : ("ssh" as const),
+        current: name === ctx.machine.name,
+      }))
       sendJson(response, 200, { machines })
       return true
     }
 
-    if (segments[1] === "sessions") {
-      const id = segments[2]
-      const action = segments[3]
-      if (id === undefined) {
-        if (method === "GET") {
-          const sessions = listSessions({ home: ctx.home }).slice(0, PAGE_SIZE).map((meta) => ({
-            ...meta,
-            title: titleOf(ctx.home, meta),
-          }))
-          sendJson(response, 200, { sessions })
-          return true
-        }
-        if (method === "POST") {
-          const body = await readJson(request)
-          const cwd = stringOrUndefined(body.cwd) ?? ctx.workspace
-          const model = stringOrUndefined(body.model)
-          const session = createSession({ ...(ctx.home !== undefined ? { home: ctx.home } : {}), cwd, model: model ?? ctx.defaultModel })
-          const meta = session.meta()
-          const sidecar = writeSidecar(ctx.home, session.sessionId, {
-            machine: ctx.machine.name,
-            remoteCwd: cwd,
-            createdAt: meta.createdAt,
-          })
-          sendJson(response, 201, {
-            session: { ...meta, machine: sidecar.machine, remoteCwd: sidecar.remoteCwd } satisfies SessionView,
-          })
-          return true
-        }
-        sendJson(response, 405, { error: `method ${method} not allowed` })
+    if (segments[1] === "agent") {
+      const action = segments[2]
+      if (segments[3] !== undefined) {
+        // `/api/agent/events/anything` is not a route, and neither is any
+        // other path with a tail on it.
+        sendJson(response, 404, { error: "not found" })
         return true
       }
-
-      if (!isSessionId(id)) throw new HttpError(400, "invalid session id")
-      const session = openSessionWith(ctx, id)
 
       if (action === undefined) {
         if (method !== "GET") {
           sendJson(response, 405, { error: `method ${method} not allowed` })
           return true
         }
-        repairSession(id, { home: ctx.home })
-        const events = session.events()
-        sendJson(response, 200, {
-          session: sessionView(ctx, meta(session)),
-          events,
-          resumePoint: detectResumePoint(events),
-          turn: ctx.turns.state(id),
-        })
+        sendJson(response, 200, describeAgent(ctx))
         return true
       }
 
@@ -158,8 +165,13 @@ export async function handleApiRequest(
           sendJson(response, 405, { error: `method ${method} not allowed` })
           return true
         }
-        const slice = sliceEvents(session.events(), url.searchParams.get("since"))
-        sendJson(response, 200, { ...slice, turn: ctx.turns.state(id) })
+        const log = openSession(LOG_ID, { home: ctx.agentHome })
+        const page = pageEvents(log.events(), {
+          since: url.searchParams.get("since"),
+          tail: url.searchParams.get("tail"),
+          before: url.searchParams.get("before"),
+        })
+        sendJson(response, 200, { ...page, turn: ctx.turns.state(LOG_ID) })
         return true
       }
 
@@ -171,9 +183,10 @@ export async function handleApiRequest(
         const body = await readJson(request)
         const text = typeof body.text === "string" ? body.text.trim() : ""
         if (text === "") throw new HttpError(400, "text must be a non-empty string")
-        const started = ctx.turns.start(id, (signal) => runTurn(ctx, session, text, signal))
-        if (!started) throw new HttpError(409, "a turn is already running for this session")
-        sendJson(response, 202, { accepted: true, turn: ctx.turns.state(id) })
+        const log = openSession(LOG_ID, { home: ctx.agentHome })
+        const started = ctx.turns.start(LOG_ID, (signal) => runTurn(ctx, log, text, signal))
+        if (!started) throw new HttpError(409, "a turn is already running for this agent")
+        sendJson(response, 202, { accepted: true, turn: ctx.turns.state(LOG_ID) })
         return true
       }
 
@@ -182,16 +195,17 @@ export async function handleApiRequest(
           sendJson(response, 405, { error: `method ${method} not allowed` })
           return true
         }
-        sendJson(response, 200, { aborted: ctx.turns.abort(id) })
+        sendJson(response, 200, { aborted: ctx.turns.abort(LOG_ID) })
         return true
       }
 
-      throw new HttpError(404, "not found")
+      sendJson(response, 404, { error: "not found" })
+      return true
     }
 
     if (segments[1] === "memory") {
       const id = segments[2]
-      const store = createMemoryStore(resolvePaths(ctx.home))
+      const store = createMemoryStore(resolvePaths(ctx.agentHome))
       if (id === undefined) {
         if (method === "GET") {
           const includeSuperseded = url.searchParams.get("all") === "1"
@@ -230,7 +244,7 @@ export async function handleApiRequest(
         if (!entry || entry.supersededBy) throw new HttpError(404, "memory not found")
         // Tombstone, not a rewrite: the append-only log stays the truth and the
         // store already hides superseded rows.
-        appendRecord(resolvePaths(ctx.home).memoryLog, { ...entry, supersededBy: `deleted:${id}` })
+        appendRecord(resolvePaths(ctx.agentHome).memoryLog, { ...entry, supersededBy: `deleted:${id}` })
         sendJson(response, 200, { deleted: id })
         return true
       }
@@ -254,57 +268,78 @@ export async function handleApiRequest(
 }
 
 // ---------------------------------------------------------------------------
+// `GET /api/agent` — everything the page's head needs, in one call
+// ---------------------------------------------------------------------------
+
+function describeAgent(ctx: AppContext): Record<string, unknown> {
+  repairSession(LOG_ID, { home: ctx.agentHome })
+  const log = openSession(LOG_ID, { home: ctx.agentHome })
+  const events = log.events()
+  const meta = log.meta()
+  const sidecar = readSidecar(ctx.agentHome, LOG_ID)
+  return {
+    agent: ctx.agent,
+    session: {
+      ...meta,
+      machine: sidecar?.machine ?? ctx.machine.name,
+      remoteCwd: sidecar?.remoteCwd ?? meta.cwd,
+    },
+    resumePoint: detectResumePoint(events),
+    turn: ctx.turns.state(LOG_ID),
+    machine: ctx.machine.name,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // A turn
 // ---------------------------------------------------------------------------
 
 /**
- * The whole body of a turn (PLAN §2.2). Runs detached from the request.
+ * The whole body of a turn (PLAN §3.3). Runs detached from the request.
  *
  * Failure policy: pi-durable already appended an `error` event for a failed
  * model call, so we must not append a second one. Anything else is recorded on
  * the TurnRegistry only — the log stays a transcript, not a stack trace.
  */
-async function runTurn(
-  ctx: AppContext,
-  session: ReturnType<typeof openSession>,
-  text: string,
-  signal: AbortSignal,
-): Promise<void> {
-  const sessionId = session.sessionId
-  const view = sessionView(ctx, meta(session))
-  const store = createMemoryStore(resolvePaths(ctx.home))
+async function runTurn(ctx: AppContext, log: Session, text: string, signal: AbortSignal): Promise<void> {
+  const store = createMemoryStore(resolvePaths(ctx.agentHome))
+  const meta = log.meta()
+  const sidecar = readSidecar(ctx.agentHome, LOG_ID)
+  const cwd = sidecar?.remoteCwd ?? meta.cwd
 
   let base: LlmClient
   try {
-    base = ctx.createLlm(view.model)
+    base = ctx.createLlm(meta.model !== "" ? meta.model : ctx.defaultModel)
   } catch (error) {
     // No client at all (no API key, say): the user has to see this one, and
     // there is no engine turn to write it for us.
-    session.appendError({ message: `LLM unavailable: ${errorMessage(error)}`, fatal: true })
+    log.appendError({ message: `LLM unavailable: ${errorMessage(error)}`, fatal: true })
     throw error
   }
 
-  const before = session.events().length
+  const before = log.events().length
   try {
     await runAgent({
-      sessionId,
+      sessionId: LOG_ID,
       input: text,
-      session,
+      session: log,
       llm: createAbortableLlm(base, signal),
       memory: asAgentMemory(store),
       tools: ctx.tools,
-      cwd: view.remoteCwd,
+      cwd,
       maxSteps: ctx.maxSteps,
       allowBash: ctx.allowBash,
-      systemPrompt: systemPromptFor(view.remoteCwd),
+      // Rebuilt every turn: a restarted ctrl may be on a different machine or
+      // a different directory, and the model must not be told the old one.
+      systemPrompt: agentSystemPrompt({ name: ctx.agent, machine: ctx.machine.name, cwd }),
     })
   } catch (error) {
     if (signal.aborted) {
       // The engine saw a failed request; say plainly what happened instead.
-      session.appendError({ message: "turn aborted by the user", fatal: false })
+      log.appendError({ message: "turn aborted by the user", fatal: false })
       return
     }
-    const alreadyLogged = session
+    const alreadyLogged = log
       .events()
       .slice(before)
       .some((event) => event.type === "error" && event.data.fatal)
@@ -313,61 +348,32 @@ async function runTurn(
   }
 }
 
-/**
- * `~` and relative paths resolve on the machine that runs the tools, so the
- * model is told that once, in the same words regardless of backend (§5).
- * The host name is deliberately absent (§7).
- */
-export function systemPromptFor(cwd: string): string {
-  return [
-    "You are a helpful assistant. Use tools when needed.",
-    "",
-    `The tools operate with this working directory: ${cwd}`,
-    "Relative paths are resolved against it. In a path, `~` means the home directory of the user",
-    "who runs the tools, which is not necessarily the home directory of the process.",
-    "",
-    "Every tool call is capped at about 10 seconds. A build, an install or a test suite must be",
-    "started with run_task and polled with task_output; do not wait for it inside one call.",
-  ].join("\n")
+/** CONTRACT §6, verbatim: the agent's name and where its hands are. */
+export function agentSystemPrompt(opts: { name: string; machine: string; cwd: string }): string {
+  return `You are ${opts.name}, a persistent agent. Your tools run on ${opts.machine}, working directory ${opts.cwd}. The log is your memory; there is no conversation.`
 }
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
-function meta(session: ReturnType<typeof openSession>): SessionMeta {
-  return session.meta()
+/**
+ * `slice(-0)` is the whole array, so a T of 0 (or a negative) must be handled
+ * as "nothing requested", never as a slice index.
+ */
+function limitTail(events: SessionEvent[], requested: number): SessionEvent[] {
+  const limit = Math.min(Math.floor(requested), MAX_EVENTS_PER_CALL)
+  if (limit <= 0) return []
+  return events.slice(-limit)
 }
 
-function sessionView(ctx: AppContext, value: SessionMeta): SessionView {
-  const sidecar = readSidecar(ctx.home, value.sessionId)
-  return {
-    ...value,
-    machine: sidecar?.machine ?? ctx.machine.name,
-    remoteCwd: sidecar?.remoteCwd ?? value.cwd,
-  }
-}
-
-function openSessionWith(ctx: AppContext, id: string): ReturnType<typeof openSession> {
-  return openSession(id, { home: ctx.home })
-}
-
-function titleOf(home: string | undefined, value: SessionMeta): string {
-  try {
-    const events = openSession(value.sessionId, { home }).events()
-    const first = events.find((event) => event.type === "user_message")
-    if (first && first.type === "user_message") {
-      const text = first.data.text.replace(/\s+/g, " ").trim()
-      if (text !== "") return text.length > MAX_TITLE_CHARS ? `${text.slice(0, MAX_TITLE_CHARS - 1)}…` : text
-    }
-  } catch {
-    // A corrupt or vanished session must not break the rail.
-  }
-  return value.sessionId
-}
-
-function stringOrUndefined(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined
+function intParam(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.floor(value)
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  if (!/^-?\d+$/.test(trimmed)) return undefined
+  const parsed = Number.parseInt(trimmed, 10)
+  return Number.isFinite(parsed) ? parsed : undefined
 }
 
 function unique(values: string[]): string[] {

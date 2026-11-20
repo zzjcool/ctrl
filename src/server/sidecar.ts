@@ -1,8 +1,10 @@
-// `<sessionDir>/ctrl.json` — the machine binding (CONTRACT §8, PLAN §2.6).
+// `<agentHome>/sessions/main/ctrl.json` — the machine binding (CONTRACT §4, §8).
 //
 // The event log belongs to pi-durable and ctrl adds no fields to it, so "which
-// machine was this session working on, and where" lives next to it instead.
-// Reading is best-effort by design: a corrupt sidecar must never make a session
+// machine are this agent's hands on, and where" lives next to it instead. In v2
+// the session id is always "main" and `home` is the agent's directory
+// (`<root>/agents/<name>`), so the file lands exactly where CONTRACT §4 draws it.
+// Reading is best-effort by design: a corrupt sidecar must never make an agent
 // un-openable, it just means we fall back to the cwd recorded in the log.
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
@@ -17,7 +19,7 @@ export interface SessionSidecar {
 
 export const SIDECAR_FILENAME = "ctrl.json"
 
-/** `<home>/sessions/<id>/ctrl.json` — pi-durable owns the directory, ctrl owns this file. */
+/** `<agentHome>/sessions/main/ctrl.json` — pi-durable owns the directory, ctrl owns this file. */
 export function sidecarPath(home: string | undefined, sessionId: string): string {
   if (!isSessionId(sessionId)) throw new Error(`invalid session id: ${sessionId}`)
   return path.join(resolvePaths(home).sessionDir(sessionId), SIDECAR_FILENAME)

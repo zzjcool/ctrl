@@ -1,7 +1,8 @@
 // node:http assembly: API routes plus the one page (CONTRACT §9).
 //
-// No framework, no middleware, no dependency. The process holds one
-// conversation log and one machine binding; that is the whole surface.
+// No framework, no middleware, no dependency. The process holds one named
+// agent — one log, one memory, one machine binding — and that is the whole
+// surface. There is nothing to switch to, so nothing here takes an id.
 
 import { readFileSync } from "node:fs"
 import { createServer } from "node:http"
@@ -9,13 +10,15 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http"
 import { homedir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { createChatCompletionsClient, DEFAULT_LLM_MODEL } from "../engine/durable.ts"
+import { createChatCompletionsClient } from "../engine/durable.ts"
 import type { LlmClient } from "../engine/durable.ts"
 import { LocalExecutor } from "../exec/local.ts"
 import { SshExecutor } from "../exec/ssh.ts"
 import { createTools } from "../tools/index.ts"
+import { DEFAULT_AGENT, LOG_ID, ensureAgent, resolveRoot } from "./agents.ts"
 import { sendJson, serveStatic } from "./http.ts"
 import { handleApiRequest, type AppContext, type MachineKind } from "./routes.ts"
+import { readSidecar, writeSidecar } from "./sidecar.ts"
 import { TurnRegistry } from "./turns.ts"
 
 export const DEFAULT_PORT = 7333
@@ -32,17 +35,19 @@ export const DEFAULT_REASONING_EFFORT = "max"
 export const DEFAULT_MAX_TOKENS = 8192
 
 export interface ServerConfig {
-  /** pi-durable home; defaults to ~/.pi-durable. */
-  home?: string
+  /** `<root>`: holds `agents/` and `trash/`. Defaults to CTRL_ROOT, then ~/.ctrl. */
+  root?: string
+  /** The agent to serve; its directory is created when missing. Defaults to `main`. */
+  agent?: string
   port?: number
   host?: string
   /** `local` or an ssh host alias from ~/.ssh/config. */
   machine?: string
-  /** Working directory new sessions start in (remote when kind is ssh). */
+  /** Working directory the agent's hands start in (remote when kind is ssh). */
   workspace?: string
   allowBash?: boolean
   maxSteps?: number
-  /** Model id for new sessions; falls back to PI_DURABLE_MODEL, then DEFAULT_MODEL. */
+  /** Model id for a new log; falls back to PI_DURABLE_MODEL, then DEFAULT_MODEL. */
   model?: string
   /** Sent as reasoning_effort; falls back to PI_DURABLE_REASONING_EFFORT, then "max". */
   reasoningEffort?: string
@@ -83,14 +88,32 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     ? Math.floor(config.maxSteps as number)
     : DEFAULT_MAX_STEPS
 
+  // One agent, resolved before anything else: `agents/<name>/` either exists
+  // (we open its log) or is created with agent.json and an empty log.
+  const root = resolveRoot(config.root, env)
+  const requestedAgent = config.agent?.trim()
+  const agentName = requestedAgent !== undefined && requestedAgent !== "" ? requestedAgent : DEFAULT_AGENT
+  const ensured = ensureAgent({ root, name: agentName, cwd: workspace, model })
+  // The machine binding lives next to the log, never inside it (CONTRACT §3).
+  // Restarting on another machine is a supported edit; switching mid-run is not.
+  writeSidecar(ensured.home, LOG_ID, {
+    machine: machineName,
+    remoteCwd: workspace,
+    createdAt: readSidecar(ensured.home, LOG_ID)?.createdAt ?? ensured.meta.createdAt,
+  })
+
   return {
-    ...(config.home !== undefined ? { home: config.home } : {}),
+    root,
+    agent: agentName,
+    agentHome: ensured.home,
     machine: { name: machineName, kind },
     executor,
     workspace,
     allowBash,
     maxSteps,
-    defaultModel: model,
+    // The log is the truth once it exists (PLAN §5); buildContext only picks
+    // the model for a log that is being created right now.
+    defaultModel: ensured.session.meta().model || model,
     turns: new TurnRegistry(),
     tools: createTools(executor, { allowBash }),
     env,
