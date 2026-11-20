@@ -11,8 +11,9 @@ import { fileURLToPath } from "node:url"
 import { createChatCompletionsClient } from "../engine/durable.ts"
 import type { LlmClient } from "../engine/durable.ts"
 import { DEFAULT_MAX_WORKERS, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER, JobRunner } from "../jobs/runner.ts"
+import { createMemoryIndex } from "../memory/index.ts"
 import { createTools } from "../tools/index.ts"
-import { DEFAULT_AGENT, LOG_ID, ensureAgent, resolveRoot } from "./agents.ts"
+import { DEFAULT_AGENT, LOG_ID, ensureAgent, logPath, resolveRoot } from "./agents.ts"
 import { sendJson, serveStatic } from "./http.ts"
 import { handleApiRequest, type AppContext } from "./routes.ts"
 import { readSidecar, writeSidecar } from "./sidecar.ts"
@@ -98,6 +99,15 @@ export function buildContext(config: ServerConfig = {}): AppContext {
   // The log is the truth once it exists (PLAN §5); buildContext only picks
   // the model for a log that is being created right now.
   const defaultModel = ensured.session.meta().model || model
+
+  // The memory mirror (MEMORY.md §4 §10): `<agentHome>/memory.db`, derived from
+  // the log. Opening it may fail — a broken or read-only database must not stop
+  // the server — so the index degrades and every search answers with nothing.
+  const memory = createMemoryIndex({ agentHome: ensured.home, eventsFile: logPath(ensured.home) })
+  // One incremental import at startup: a brand-new agent mirrors nothing, an
+  // older directory gets its whole log backfilled the first time it is opened.
+  memory.importEvents()
+
   const runner = new JobRunner({
     agentHome: ensured.home,
     piBin: config.piBin ?? DEFAULT_PI_BIN,
@@ -116,7 +126,8 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     defaultModel,
     jobs: runner,
     turns: new TurnRegistry(),
-    tools: createTools({ agentHome: ensured.home, runner }),
+    memory,
+    tools: createTools({ agentHome: ensured.home, runner, memory }),
     env,
     createLlm:
       config.createLlm ??
@@ -165,6 +176,9 @@ export async function startServer(config: ServerConfig = {}): Promise<RunningSer
         server.closeAllConnections()
         server.close(() => resolve())
       })
+      // The mirror is a derived cache: close it last, and never fail a shutdown
+      // over it.
+      ctx.memory.close()
     },
   }
 }

@@ -412,7 +412,13 @@ test("job_status reports what the worker did, and /api/jobs agrees", async () =>
   assert.equal(job.task, "count the .ts files under src")
   assert.equal(typeof job.startedAt, "string")
   assert.ok(job.elapsedMs >= 250, `the worker's runtime is measured (got ${job.elapsedMs})`)
-  assert.deepEqual(Object.keys(job).sort(), ["code", "elapsedMs", "id", "startedAt", "state", "task"])
+  // CONTRACT §7's six fields, plus the worker's output tail that a delegate card
+  // shows once the log is non-empty (src/web/public/app.js reads job.output).
+  assert.deepEqual(
+    Object.keys(job).filter((key) => key !== "output").sort(),
+    ["code", "elapsedMs", "id", "startedAt", "state", "task"],
+  )
+  assert.match(String(job.output ?? ""), /found 42 files/, "the summary carries the tail of the worker's log")
 
   const log = await readFile(path.join(fixture.root, "agents", AGENT, "jobs", delegatedJob, "out.log"), "utf8")
   assert.match(log, /args: -p count the \.ts files under src --provider any-endpoint --model fake-model --thinking max/)
@@ -555,6 +561,65 @@ test("memory is the agent's own, with tombstone semantics", async () => {
   assert.equal(gone.status, 404)
 })
 
+test("/api/search finds older turns through the SQLite mirror", async () => {
+  // A fresh turn in Chinese, so both search regimes are exercised for real:
+  // the trigram index (>=3 characters) and the substring fallback (2).
+  fixture.fake.reset()
+  fixture.fake.push({ content: "统计完了，一共 12 个文件" })
+  assert.equal((await send("帮我统计 .ts 文件的数量")).status, 202)
+  await settle()
+
+  const english = await api("GET", "/api/search?q=counting")
+  assert.equal(english.status, 200, english.text)
+  assert.equal(english.json.query, "counting")
+  assert.equal(english.json.count, english.json.hits.length, "count is the number of hits")
+  assert.ok(english.json.count >= 1, `expected a hit, got ${english.text}`)
+
+  const hit = english.json.hits[0]
+  assert.deepEqual(Object.keys(hit).sort(), ["body", "score", "seq", "ts", "type"])
+  assert.equal(typeof hit.seq, "number")
+  assert.match(hit.ts, /^\d{4}-\d{2}-\d{2}T/)
+  assert.equal(hit.type, "assistant_message")
+  assert.match(hit.body, /counting/, "the snippet carries the match")
+  assert.ok(hit.score <= 0, "bm25 orders by score ascending")
+
+  // Three or more characters: the trigram index. Two: the LIKE fallback.
+  const trigram = await api("GET", `/api/search?q=${encodeURIComponent("统计完了")}`)
+  assert.equal(trigram.status, 200, trigram.text)
+  assert.ok(trigram.json.count >= 1, trigram.text)
+
+  const substring = await api("GET", `/api/search?q=${encodeURIComponent("文件")}`)
+  assert.equal(substring.status, 200, substring.text)
+  assert.ok(substring.json.count >= 1, substring.text)
+  for (const found of substring.json.hits as Array<{ body: string }>) {
+    assert.ok(found.body.includes("文件"), "a snippet always contains what was searched for")
+  }
+
+  // Punctuation is not FTS5 syntax: `hw-` must answer, not 500.
+  const punctuation = await api("GET", `/api/search?q=${encodeURIComponent("hw-")}`)
+  assert.equal(punctuation.status, 200, punctuation.text)
+  assert.equal(punctuation.json.count, 0, "nothing in this narrative mentions hw-")
+
+  // limit is clamped and before pages up.
+  const page = await api("GET", `/api/search?q=${encodeURIComponent("统计完了")}&limit=1`)
+  assert.equal(page.status, 200, page.text)
+  assert.equal(page.json.hits.length, 1)
+  const older = await api(
+    "GET",
+    `/api/search?q=${encodeURIComponent("统计完了")}&limit=1&before=${page.json.hits[0].seq}`,
+  )
+  assert.equal(older.status, 200, older.text)
+  assert.ok((older.json.hits as Array<{ seq: number }>).every((row) => row.seq < page.json.hits[0].seq))
+
+  // MEMORY.md §4: the mirror is a file inside the agent's directory.
+  assert.ok((await stat(path.join(fixture.root, "agents", AGENT, "memory.db"))).isFile())
+
+  // A blank query is a caller error, not "search everything".
+  assert.equal((await api("GET", "/api/search?q=")).status, 400)
+  assert.equal((await api("GET", "/api/search?q=%20%20")).status, 400)
+  assert.equal((await api("POST", "/api/search?q=x")).status, 405)
+})
+
 test("restarting ctrl finds the same log, memory, workspace and jobs", async () => {
   const beforeRestart = await eventsStream("?since=0")
   const lastSeq = beforeRestart.events.at(-1)?.seq
@@ -599,6 +664,15 @@ test("restarting ctrl finds the same log, memory, workspace and jobs", async () 
   // Memory survived the restart too.
   const memories = await api("GET", "/api/memory")
   assert.equal(memories.status, 200)
+
+  // And so did the mirror: memory.db is derived, so a restarted ctrl opens it
+  // and answers the same search without re-scanning what it already has.
+  const search = await api("GET", "/api/search?q=counting")
+  assert.equal(search.status, 200, search.text)
+  assert.ok(search.json.count >= 1, "the mirror outlives the process")
+  const stillHere = await api("GET", `/api/search?q=${encodeURIComponent("still here")}`)
+  assert.equal(stillHere.status, 200, stillHere.text)
+  assert.ok(stillHere.json.count >= 1, "the turn after the restart is indexed too")
 })
 
 test("a model failure is logged once, by the engine, not twice", async () => {

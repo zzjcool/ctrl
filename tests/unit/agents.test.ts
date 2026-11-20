@@ -259,6 +259,9 @@ test("the system prompt names the agent and says it has no hands", () => {
     "You are builder, a persistent agent with long-term memory. " +
       "You do not edit files or run commands yourself: delegate work to a pi worker with the delegate tool, " +
       "then report what it did. The log is your memory; there is no conversation. " +
+      // MEMORY.md §5: the window is not the memory, so the prompt names the one
+      // tool that reaches past it.
+      "You can search your entire history with search_context(query) — use it when the user refers to something not in the recent context. " +
       "Your workspace is /srv/proj.",
   )
   assert.notEqual(

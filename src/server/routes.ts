@@ -30,6 +30,7 @@ import type {
 import type { JobRunner } from "../jobs/runner.ts"
 import { DEFAULT_LIST_LIMIT, listJobs, readJobLog } from "../jobs/store.ts"
 import type { JobView } from "../jobs/store.ts"
+import { clampLimit, type MemoryIndex } from "../memory/index.ts"
 import { LOG_ID } from "./agents.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
 import { readSidecar } from "./sidecar.ts"
@@ -50,6 +51,8 @@ export interface AppContext {
   /** Starts and stops pi workers; the only thing here that touches a process. */
   jobs: JobRunner
   turns: TurnRegistry
+  /** The SQLite mirror of the log (MEMORY.md §4); may be degraded, never absent. */
+  memory: MemoryIndex
   tools: ToolSpec[]
   env: NodeJS.ProcessEnv
   createLlm: (model: string) => LlmClient
@@ -133,6 +136,37 @@ export async function handleApiRequest(
       sendJson(response, 200, {
         jobs: listJobs(ctx.agentHome, { limit: DEFAULT_LIST_LIMIT }).map((job) => jobSummary(job, ctx.agentHome)),
       })
+      return true
+    }
+
+    if (url.pathname === "/api/search") {
+      if (method !== "GET") {
+        sendJson(response, 405, { error: `method ${method} not allowed` })
+        return true
+      }
+      const q = (url.searchParams.get("q") ?? "").trim()
+      // A blank query is a caller error, not "search everything": /api/search
+      // never dumps the log, it only ever answers a query.
+      if (q === "") {
+        throw new HttpError(400, "q must be a non-empty string (GET /api/search?q=<text>&limit=<1-20>&before=<seq>)")
+      }
+      const requested = url.searchParams.get("limit")
+      // One clamp for both paths: 1..20, default 8 (task M1 §6).
+      const limit = clampLimit(requested === null ? undefined : requested)
+      const before = intParam(url.searchParams.get("before"))
+      // The mirror is derived, so refresh it before answering: an event appended
+      // between turns (by hand, or by a turn that just ended) is searchable at
+      // once. A refresh that fails must not fail the read.
+      try {
+        ctx.memory.importEvents()
+      } catch {
+        // search answers from whatever the mirror already holds, or with nothing.
+      }
+      const hits = ctx.memory.search(q, {
+        limit,
+        ...(before !== undefined && before >= 0 ? { beforeSeq: before } : {}),
+      })
+      sendJson(response, 200, { query: q, hits, count: hits.length })
       return true
     }
 
@@ -310,13 +344,38 @@ export function jobSummary(job: JobView, agentHome?: string): Record<string, unk
 // ---------------------------------------------------------------------------
 
 /**
+ * One turn of the loop, plus the one thing that must happen after it: the
+ * mirror catches up with the log (MEMORY.md §11, M1).
+ *
+ * The import lives in `finally` because an aborted or failed turn still wrote
+ * events worth searching, and because a turn must never be held hostage by its
+ * index — `importAfterTurn` cannot throw.
+ */
+async function runTurn(ctx: AppContext, log: Session, text: string, signal: AbortSignal): Promise<void> {
+  try {
+    await runTurnOnce(ctx, log, text, signal)
+  } finally {
+    importAfterTurn(ctx)
+  }
+}
+
+/** Bring `memory.db` up to date after a turn; never throws, never delays a reply. */
+function importAfterTurn(ctx: AppContext): void {
+  try {
+    ctx.memory.importEvents()
+  } catch {
+    // The mirror is a cache: a failed import degrades search, not the turn.
+  }
+}
+
+/**
  * The whole body of a turn (PLAN §3.3). Runs detached from the request.
  *
  * Failure policy: pi-durable already appended an `error` event for a failed
  * model call, so we must not append a second one. Anything else is recorded on
  * the TurnRegistry only — the log stays a transcript, not a stack trace.
  */
-async function runTurn(ctx: AppContext, log: Session, text: string, signal: AbortSignal): Promise<void> {
+async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: AbortSignal): Promise<void> {
   const store = createMemoryStore(resolvePaths(ctx.agentHome))
   const meta = log.meta()
   const sidecar = readSidecar(ctx.agentHome, LOG_ID)
@@ -371,6 +430,10 @@ export function agentSystemPrompt(opts: { name: string; cwd: string }): string {
     `You are ${opts.name}, a persistent agent with long-term memory. ` +
     "You do not edit files or run commands yourself: delegate work to a pi worker with the delegate tool, " +
     "then report what it did. The log is your memory; there is no conversation. " +
+    // MEMORY.md §5: the window is not the memory. Names the one tool that
+    // reaches past it, so the model does not answer "I don't have that" from a
+    // short context.
+    "You can search your entire history with search_context(query) — use it when the user refers to something not in the recent context. " +
     `Your workspace is ${opts.cwd}.`
   )
 }
