@@ -1,9 +1,10 @@
 import type { DatabaseSync } from "node:sqlite"
 import { charLength, clipChars, isRecord } from "./events.ts"
 
-export const MEMORY_KINDS = ["fact", "preference", "decision", "event", "skill"] as const
+export const MEMORY_KINDS = ["fact", "preference", "decision", "event", "skill", "lesson"] as const
 export type MemoryKindName = (typeof MEMORY_KINDS)[number]
 export const DEFAULT_MEMORY_KIND: MemoryKindName = "fact"
+export const LESSON_KIND: MemoryKindName = "lesson"
 export const DEFAULT_IMPORTANCE = 0.5
 export const DEFAULT_CONFIDENCE = 0.8
 
@@ -59,6 +60,8 @@ export interface ListMemoriesOptions {
 
   query?: string
   limit?: number
+
+  kind?: string
 
   includeSuperseded?: boolean
   now?: Date
@@ -147,7 +150,9 @@ export function getMemory(db: DatabaseSync, id: string): MemoryRow | undefined {
 export function listMemories(db: DatabaseSync, opts: ListMemoriesOptions = {}): MemoryRow[] {
   const limit = clampLimit(opts.limit)
   const query = (opts.query ?? "").trim()
-  const rows = selectRows(db, opts.includeSuperseded === true)
+  const kind = (opts.kind ?? "").trim()
+  const wanted = kind === "" ? undefined : kind
+  const rows = selectRows(db, opts.includeSuperseded === true).filter((row) => wanted === undefined || row.kind === wanted)
   if (query === "") {
     return sortByWeight(rows, opts.now ?? new Date()).slice(0, limit)
   }

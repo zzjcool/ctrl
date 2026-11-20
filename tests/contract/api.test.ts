@@ -390,6 +390,21 @@ test("focus, memories and dreams answer with an empty shape instead of 404", asy
   assert.deepEqual(dreams.json, { runs: [] })
 })
 
+test("memories can be filtered by kind, and only by a kind that exists", async () => {
+  const lessons = await api("GET", "/api/memories?kind=lesson")
+  assert.equal(lessons.status, 200, lessons.text)
+  assert.deepEqual(lessons.json, { memories: [], count: 0 })
+  assert.deepEqual(Object.keys(lessons.json).sort(), ["count", "memories"])
+
+  const unfiltered = await api("GET", "/api/memories")
+  assert.equal(unfiltered.status, 200, unfiltered.text)
+  assert.deepEqual(unfiltered.json, { memories: [], count: 0 })
+
+  const bogus = await api("GET", "/api/memories?kind=nonsense")
+  assert.equal(bogus.status, 400, bogus.text)
+  assert.match(bogus.text, /kind must be/)
+})
+
 test("machines and sessions are always 404", async () => {
   assert.equal((await api("GET", "/api/machines")).status, 404)
   assert.equal((await api("GET", "/api/machines/box")).status, 404)

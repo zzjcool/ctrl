@@ -2,6 +2,7 @@ import type { DatabaseSync } from "node:sqlite"
 import type { AgentMemory, MemoryEntry, MemoryHit, MemoryKind, MemoryQuery } from "../engine/durable.ts"
 import {
   DEFAULT_MEMORY_LIMIT,
+  LESSON_KIND,
   addMemory,
   isMemoryKind,
   memoryScore,
@@ -10,6 +11,8 @@ import {
 } from "./memories.ts"
 
 const ENGINE_KINDS: readonly MemoryKind[] = ["fact", "preference", "event", "skill"]
+
+export const LESSON_RECALL_BOOST = 1.2
 
 export interface AgentMemoryInput {
   kind: MemoryKind
@@ -63,15 +66,17 @@ export function createSqliteAgentMemory(opts: SqliteAgentMemoryOptions): AgentMe
       const limit = Math.max(1, Math.min(query.limit ?? defaultLimit, 100))
       const rows = searchMemories(db, query.text, {
 
-        limit: query.kinds === undefined ? limit : limit * 3,
+        limit: limit * 3,
         ...(query.includeSuperseded === true ? { includeSuperseded: true } : {}),
         now: at,
       })
       const kinds = query.kinds === undefined ? undefined : new Set(query.kinds.filter(isEngineKind))
       return rows
         .filter((row) => kinds === undefined || kinds.has(engineKind(row.kind)))
+        .map((row) => ({ row, score: memoryScore(row, at) * (row.kind === LESSON_KIND ? LESSON_RECALL_BOOST : 1) }))
+        .sort((a, b) => b.score - a.score)
         .slice(0, limit)
-        .map((row) => ({ entry: toEntry(row), score: memoryScore(row, at) }))
+        .map((hit) => ({ entry: toEntry(hit.row), score: hit.score }))
     },
   }
 }

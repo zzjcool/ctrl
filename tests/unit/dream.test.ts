@@ -3,8 +3,8 @@ import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { after, test } from "node:test"
-import type { DatabaseSync } from "node:sqlite"
-import { openMemoryDb } from "../../src/memory/db.ts"
+import { DatabaseSync } from "node:sqlite"
+import { SCHEMA_VERSION, openMemoryDb, schemaVersion } from "../../src/memory/db.ts"
 import {
   DREAM_MAX_CHARS,
   DREAM_MAX_EVENTS,
@@ -352,6 +352,58 @@ test("an empty payload is a successful dream with nothing to keep", async () => 
   }
 })
 
+test("the retro pass lands lessons and dream_runs records how many", async () => {
+  const opened = await bag()
+  const { llm } = scriptedDreamLlm([
+    JSON.stringify({ memories: [{ text: "做梦抽出来的事实" }] }),
+    JSON.stringify({
+      lessons: [
+        { text: "交活前跑一次全量测试", scope: "code", confidence: 0.7 },
+        { text: "并行派发后立刻收割", scope: "delegate", confidence: 0.6 },
+      ],
+    }),
+  ])
+  const result = await runDream({ db: opened.db, agentHome: opened.agentHome, events: CONVERSATION, llm, now: opened.now })
+  try {
+    assert.equal(result.error, undefined, `unexpected error: ${result.error}`)
+    assert.equal(result.lessons, 2)
+    const runs = listDreamRuns(opened.db)
+    assert.equal(runs.length, 1)
+    assert.equal(runs[0]?.lessons, result.lessons, "the run row says what the result says")
+    assert.equal(runs[0]?.added, 1, "lessons do not inflate the memory counter")
+    assert.equal(listMemories(opened.db, { kind: "lesson" }).length, 2)
+  } finally {
+    opened.db.close()
+  }
+})
+
+test("a memory database from before lessons gains the column on open", async () => {
+  const home = await tempHome()
+  const file = path.join(home, "memory.db")
+  const legacy = new DatabaseSync(file)
+  legacy.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+  legacy.prepare("INSERT INTO meta(key, value) VALUES ('schema_version', '2')").run()
+  legacy.exec(
+    "CREATE TABLE dream_runs (id TEXT PRIMARY KEY, started_at TEXT, ended_at TEXT, from_seq INTEGER, to_seq INTEGER, " +
+      "added INTEGER, merged INTEGER, superseded INTEGER, summary_id TEXT, error TEXT)",
+  )
+  legacy.close()
+
+  const db = openMemoryDb(file)
+  try {
+    assert.equal(schemaVersion(db), SCHEMA_VERSION)
+    db.prepare(
+      "INSERT INTO dream_runs(id, started_at, ended_at, from_seq, to_seq, added, merged, superseded) " +
+        "VALUES ('old', 'x', 'y', 0, 1, 1, 0, 0)",
+    ).run()
+    const runs = listDreamRuns(db)
+    assert.equal(runs.length, 1)
+    assert.equal(runs[0]?.lessons, 0, "an old run reads as zero lessons")
+  } finally {
+    db.close()
+  }
+})
+
 test("the batch is at most 40 events or 12 000 characters", () => {
   const many = log(...Array.from({ length: 60 }, () => ({ type: "user_message", data: { text: "hello" } })))
   const capped = dreamBatch(many, -1)
@@ -539,6 +591,7 @@ function emptyDream(): DreamResult {
     focus: 0,
     profileRewritten: false,
     batchEvents: 0,
+    lessons: 0,
   }
 }
 

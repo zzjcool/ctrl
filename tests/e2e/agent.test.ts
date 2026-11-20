@@ -660,8 +660,9 @@ test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.
   assert.equal(runs[0]?.error, undefined)
   assert.deepEqual(
     Object.keys(runs[0] ?? {}).sort(),
-    ["added", "endedAt", "fromSeq", "id", "merged", "startedAt", "superseded", "toSeq"],
+    ["added", "endedAt", "fromSeq", "id", "lessons", "merged", "startedAt", "superseded", "toSeq"],
   )
+  assert.equal(runs[0]?.lessons, 0, "the script left no lessons")
 
   const afterDream = await api("GET", "/api/memories")
   assert.ok(

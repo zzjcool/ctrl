@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 export const MEMORY_DB_FILENAME = "memory.db"
 
 export function memoryDbPath(agentHome: string): string {
@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS dream_runs (
   added INTEGER,
   merged INTEGER,
   superseded INTEGER,
+  lessons INTEGER,
   summary_id TEXT,
   error TEXT
 );
@@ -135,6 +136,7 @@ export function openMemoryDb(file: string): DatabaseSync {
 
 function migrate(db: DatabaseSync): void {
   ensureProposalsTable(db)
+  ensureDreamLessonsColumn(db)
   const stored = readMeta(db, META_SCHEMA_VERSION)
   if (stored === undefined) {
     writeMeta(db, META_SCHEMA_VERSION, String(SCHEMA_VERSION))
@@ -151,6 +153,12 @@ function migrate(db: DatabaseSync): void {
 
 export function ensureProposalsTable(db: DatabaseSync): void {
   db.exec(PROPOSALS_DDL)
+}
+
+export function ensureDreamLessonsColumn(db: DatabaseSync): void {
+  const columns = db.prepare("PRAGMA table_info(dream_runs)").all() as Array<Record<string, unknown>>
+  if (columns.some((row) => String(row.name ?? "") === "lessons")) return
+  db.exec("ALTER TABLE dream_runs ADD COLUMN lessons INTEGER")
 }
 
 export function readMeta(db: DatabaseSync, key: string): string | undefined {

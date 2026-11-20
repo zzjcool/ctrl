@@ -171,9 +171,14 @@ async function handleMemoriesRoot(
 ): Promise<void> {
   if (method === "GET") {
     const query = (url.searchParams.get("query") ?? "").trim()
+    const kind = (url.searchParams.get("kind") ?? "").trim()
+    if (kind !== "" && !isMemoryKind(kind)) {
+      throw new HttpError(400, "kind must be fact, preference, decision, event, skill, or lesson")
+    }
     const limit = intParam(url.searchParams.get("limit"))
     const rows = listMemories(db, {
       ...(query !== "" ? { query } : {}),
+      ...(kind !== "" ? { kind } : {}),
       includeSuperseded: url.searchParams.get("all") === "1",
       ...(limit !== undefined ? { limit } : {}),
     })
@@ -185,7 +190,7 @@ async function handleMemoriesRoot(
     const text = typeof body.text === "string" ? body.text.trim() : ""
     if (text === "") throw new HttpError(400, "text must be a non-empty string")
     if (body.kind !== undefined && !isMemoryKind(body.kind)) {
-      throw new HttpError(400, "kind must be fact, preference, decision, event, or skill")
+      throw new HttpError(400, "kind must be fact, preference, decision, event, skill, or lesson")
     }
     if (body.tags !== undefined && (!Array.isArray(body.tags) || body.tags.some((tag) => typeof tag !== "string"))) {
       throw new HttpError(400, "tags must be an array of strings")

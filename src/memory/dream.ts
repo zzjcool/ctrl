@@ -12,6 +12,7 @@ import {
   supersedeMemory,
   type MemoryRow,
 } from "./memories.ts"
+import { RETRO_MAX_TOKENS, applyLessons, buildRetroPrompt, parseRetroPayload } from "./retro.ts"
 
 export const META_LAST_DREAM_SEQ = "last_dream_seq"
 export const META_LAST_DREAM_AT = "last_dream_at"
@@ -87,6 +88,8 @@ export interface DreamContext {
   maxEvents?: number
   maxChars?: number
 
+  warn?: (message: string) => void
+
   force?: boolean
 }
 
@@ -104,6 +107,7 @@ export interface DreamResult {
   focus: number
   profileRewritten: boolean
   batchEvents: number
+  lessons: number
 
   skipped?: boolean
   error?: string
@@ -369,6 +373,7 @@ export async function runDream(ctx: DreamContext): Promise<DreamResult> {
     focus: 0,
     profileRewritten: false,
     batchEvents: batch.events.length,
+    lessons: 0,
   }
 
   const openFocus = listFocus(ctx.db, { limit: 10 })
@@ -451,7 +456,34 @@ export async function runDream(ctx: DreamContext): Promise<DreamResult> {
     return finishWithError(ctx, result, `dream write failed: ${errorMessage(error)}`, now)
   }
 
+  await runRetro(ctx, batch, result, now)
   return result
+}
+
+async function runRetro(ctx: DreamContext, batch: DreamBatch, result: DreamResult, now: () => Date): Promise<void> {
+  if (batch.events.length === 0) return
+  try {
+    const response = await ctx.llm.complete({
+      messages: [{ role: "user", content: buildRetroPrompt(batch) }],
+      maxTokens: RETRO_MAX_TOKENS,
+      ...(ctx.signal !== undefined ? { signal: ctx.signal } : {}),
+    })
+    const lessons = parseRetroPayload(typeof response?.text === "string" ? response.text : "")
+    if (lessons.length === 0) return
+    const written = applyLessons(ctx.db, lessons, { sourceSeqs: [batch.fromSeq, batch.toSeq], now: now() })
+    result.lessons = written.created + written.merged
+    recordRun(ctx.db, result, now())
+  } catch (error) {
+    warn(ctx, `dream retro failed: ${errorMessage(error)}`)
+  }
+}
+
+function warn(ctx: DreamContext, message: string): void {
+  if (ctx.warn !== undefined) {
+    ctx.warn(message)
+    return
+  }
+  process.stderr.write(`${message}\n`)
 }
 
 function finishWithError(ctx: DreamContext, result: DreamResult, message: string, now: () => Date): DreamResult {
@@ -467,8 +499,8 @@ function finishWithError(ctx: DreamContext, result: DreamResult, message: string
 
 function recordRun(db: DatabaseSync, result: DreamResult, at: Date): void {
   db.prepare(
-    "INSERT OR REPLACE INTO dream_runs(id, started_at, ended_at, from_seq, to_seq, added, merged, superseded, summary_id, error) " +
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+    "INSERT OR REPLACE INTO dream_runs(id, started_at, ended_at, from_seq, to_seq, added, merged, superseded, lessons, " +
+      "summary_id, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
   ).run(
     result.id,
     result.startedAt,
@@ -478,6 +510,7 @@ function recordRun(db: DatabaseSync, result: DreamResult, at: Date): void {
     result.added,
     result.merged,
     result.superseded,
+    result.lessons,
     result.error ?? null,
   )
 }
@@ -511,6 +544,7 @@ export interface DreamRunRow {
   added: number
   merged: number
   superseded: number
+  lessons: number
   error?: string
 }
 
@@ -535,6 +569,7 @@ export function listDreamRuns(db: DatabaseSync, opts: { limit?: number } = {}): 
       added: number(row.added) ?? 0,
       merged: number(row.merged) ?? 0,
       superseded: number(row.superseded) ?? 0,
+      lessons: number(row.lessons) ?? 0,
       ...(text(row.error) !== undefined ? { error: text(row.error) as string } : {}),
     }
   })
@@ -589,6 +624,7 @@ export class DreamController {
           focus: 0,
           profileRewritten: false,
           batchEvents: 0,
+          lessons: 0,
           error: errorMessage(error),
         }
       } finally {
