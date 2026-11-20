@@ -797,3 +797,23 @@ test("the jobs API renders the stream instead of leaking raw pi JSON", async () 
   assert.match(output, /assistant: done/)
 })
 
+
+test("a huge worker log is read from its tail instead of the whole file", async () => {
+  const work = await scratchDir("ctrl-jobs-big-")
+  const id = "20260101T000000Z-big001"
+  const paths = jobPaths(agentHome, id)
+  await mkdir(paths.dir, { recursive: true })
+  await writeFile(paths.metaPath, JSON.stringify({ id, state: "exited", startedAt: new Date().toISOString() }))
+  const filler = "x".repeat(1024)
+  const head = Array.from({ length: 5000 }, (_, i) => `${i} ${filler}`).join("\n")
+  await writeFile(paths.logPath, `${head}\nlast line\n`)
+
+  const started = Date.now()
+  const log = readJobLog(agentHome, id, { full: true })
+  const elapsed = Date.now() - started
+
+  assert.ok(elapsed < 500, `reading a 5MB log took ${elapsed}ms`)
+  assert.match(log.text, /last line/)
+  assert.equal(log.truncated, true)
+  await rm(work, { recursive: true, force: true })
+})

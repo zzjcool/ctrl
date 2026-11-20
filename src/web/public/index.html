@@ -17,7 +17,7 @@
         <div class="status" aria-label="状态">
           <span class="status-item" title="这条日志里的事件总数">
             <span class="status-key">events</span>
-            <span class="status-value is-mono" id="status-events">0</span>
+            <span class="status-value is-mono" id="status-events">—</span>
           </span>
           <span class="status-item">
             <span class="status-key">最后活动</span>
@@ -87,6 +87,13 @@
         </section>
 
         <div class="rows" id="rows"></div>
+
+        <div class="jump-dock">
+          <button class="jump-pill" id="jump-pill" type="button" hidden title="跳到最新一条">
+            <span class="jump-pill-count" id="jump-pill-count" aria-live="polite"></span>
+            <span class="jump-pill-label">回到最新 ↓</span>
+          </button>
+        </div>
       </main>
 
       <aside class="aside" id="aside" aria-label="focus 面板">
