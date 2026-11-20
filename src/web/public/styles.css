@@ -1717,6 +1717,42 @@ body {
   .drawer-all input {
     font-size: 16px;
   }
+
+  .status {
+    gap: 4px 12px;
+    font-size: 11.5px;
+  }
+
+  .status-value.is-mono {
+    font-size: 11px;
+  }
+
+  #status-window-item,
+  #status-memory-item {
+    display: none;
+  }
+
+  .tool-args {
+    padding: 0 9px 6px;
+    font-size: 10.5px;
+    line-height: 1.5;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .tool-head {
+    padding: 5px 9px;
+    gap: 6px;
+  }
+
+  .tool-out summary {
+    padding: 4px 9px;
+  }
+
+  .row {
+    gap: 8px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
