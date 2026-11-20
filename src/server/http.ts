@@ -34,10 +34,10 @@ export function sendText(response: ServerResponse, status: number, value: string
   response.end(value)
 }
 
-export async function readJson(
+export async function readBody(
   request: IncomingMessage,
   opts: { maxBytes?: number } = {},
-): Promise<Record<string, unknown>> {
+): Promise<Buffer> {
   const maxBytes = opts.maxBytes ?? MAX_BODY_BYTES
   const chunks: Buffer[] = []
   let bytes = 0
@@ -47,10 +47,18 @@ export async function readJson(
     if (bytes > maxBytes) throw new HttpError(413, `request body too large (limit ${maxBytes} bytes)`)
     chunks.push(buffer)
   }
-  if (bytes === 0) return {}
+  return Buffer.concat(chunks)
+}
+
+export async function readJson(
+  request: IncomingMessage,
+  opts: { maxBytes?: number } = {},
+): Promise<Record<string, unknown>> {
+  const body = await readBody(request, opts)
+  if (body.byteLength === 0) return {}
   let parsed: unknown
   try {
-    parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+    parsed = JSON.parse(body.toString("utf8"))
   } catch {
     throw new HttpError(400, "invalid JSON request body")
   }

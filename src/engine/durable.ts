@@ -42,6 +42,7 @@ export type {
   JsonSchema,
   LlmClient,
   LlmCompleteRequest,
+  LlmContentPart,
   LlmMessage,
   LlmResponse,
   LlmToolCall,

@@ -301,6 +301,46 @@ body {
   font-weight: 600;
 }
 
+.user-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  padding-left: 1.15em;
+}
+
+.user-image {
+  display: block;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--panel);
+  line-height: 0;
+}
+
+.user-image img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-height: 240px;
+  max-width: min(100%, 320px);
+  object-fit: contain;
+}
+
+.user-image:hover {
+  border-color: var(--accent);
+}
+
+.user-file {
+  display: inline-block;
+  padding: 3px 9px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-faint);
+}
+
 .row-agent .prose {
   margin: 0 0 8px;
   white-space: pre-wrap;
@@ -1001,6 +1041,32 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.btn-attach {
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-body);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.btn-attach:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+.attach-input {
+  display: none;
+}
+
+.composer.is-dragging .composer-input {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 .btn-send {

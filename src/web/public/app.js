@@ -1,3 +1,4 @@
+import { IMAGE_MAX_BYTES, isImageType, mediaName, mediaUrl, splitImageMarkers } from "./images.js"
 import { renderMarkdown } from "./markdown.js"
 
 const API = "/api/agent"
@@ -9,6 +10,7 @@ const MEMORIES_API = "/api/memories"
 
 const PROPOSALS_API = "/api/proposals"
 const HEALTH_API = "/api/health"
+const UPLOAD_API = "/api/agent/images"
 
 const TAIL = 100
 const POLL_RUNNING_MS = 700
@@ -142,6 +144,8 @@ const els = {
   loadBtn: document.getElementById("load-earlier"),
   composer: document.getElementById("composer"),
   input: document.getElementById("input"),
+  attach: document.getElementById("attach"),
+  file: document.getElementById("file"),
   send: document.getElementById("send"),
   hint: document.getElementById("composer-hint"),
   toast: document.getElementById("toast"),
@@ -805,6 +809,27 @@ function finishCard(card, data, ts) {
   card.details.hidden = false
 }
 
+function imageThumb(file) {
+  const name = mediaName(file)
+  const link = el("a", "user-image")
+  if (!name) {
+    const chip = el("span", "user-file", String(file).split("/").pop() || String(file))
+    chip.title = String(file)
+    return chip
+  }
+  link.href = mediaUrl(file)
+  link.target = "_blank"
+  link.rel = "noopener"
+  link.title = String(file)
+  const img = document.createElement("img")
+  img.src = link.href
+  img.alt = "图片"
+  img.loading = "lazy"
+  img.decoding = "async"
+  link.appendChild(img)
+  return link
+}
+
 function buildRow(event) {
   const date = toDate(event.ts) || new Date()
   const type = String(event.type || "")
@@ -833,10 +858,19 @@ function buildRow(event) {
         break
       }
       row.classList.add("row-user")
-      const line = el("p", "user-text")
-      line.appendChild(el("span", "user-mark", "›"))
-      line.appendChild(document.createTextNode(text))
-      body.appendChild(line)
+      const parsed = splitImageMarkers(text)
+      if (!parsed.text && parsed.images.length === 0) return null
+      if (parsed.text) {
+        const line = el("p", "user-text")
+        line.appendChild(el("span", "user-mark", "›"))
+        line.appendChild(document.createTextNode(parsed.text))
+        body.appendChild(line)
+      }
+      if (parsed.images.length > 0) {
+        const strip = el("div", "user-images")
+        for (const file of parsed.images) strip.appendChild(imageThumb(file))
+        body.appendChild(strip)
+      }
       break
     }
     case "assistant_message": {
@@ -1792,7 +1826,97 @@ function updateComposer() {
   els.input.placeholder = running
     ? "它在跑…（先点停止，Enter 不会开新的一轮）"
     : "说点什么…（Enter 发送，Shift+Enter 换行）"
-  els.hint.textContent = running ? "运行中 · 停止不会中断已经在跑的工具" : "Enter 发送 · Shift+Enter 换行"
+  els.hint.textContent = running
+    ? "运行中 · 停止不会中断已经在跑的工具"
+    : "Enter 发送 · Shift+Enter 换行 · 粘图/拖图/选图"
+}
+
+function insertSnippet(snippet) {
+  const input = els.input
+  const start = typeof input.selectionStart === "number" ? input.selectionStart : input.value.length
+  const end = typeof input.selectionEnd === "number" ? input.selectionEnd : start
+  const head = input.value.slice(0, start)
+  const tail = input.value.slice(end)
+  const lead = head === "" || /[ \t\n]$/.test(head) ? "" : " "
+  const trail = tail === "" || /^[ \t\n]/.test(tail) ? "" : " "
+  input.value = `${head}${lead}${snippet}${trail}${tail}`
+  const caret = head.length + lead.length + snippet.length
+  if (typeof input.setSelectionRange === "function") input.setSelectionRange(caret, caret)
+  autosize()
+  input.focus()
+}
+
+async function uploadImage(file) {
+  const response = await fetch(UPLOAD_API, {
+    method: "POST",
+    headers: { "content-type": String(file.type || "") },
+    body: file,
+  })
+  const raw = await response.text()
+  let data = null
+  if (raw) {
+    try {
+      data = JSON.parse(raw)
+    } catch {
+      data = null
+    }
+  }
+  if (!response.ok) {
+    const message = data && typeof data.error === "string" ? data.error : `HTTP ${response.status}`
+    const error = new Error(message)
+    error.status = response.status
+    throw error
+  }
+  if (!data || typeof data.path !== "string") throw new Error("上传没有返回路径")
+  return data
+}
+
+async function attachFiles(list) {
+  const files = Array.from(list || []).filter((file) => file && isImageType(file.type))
+  if (files.length === 0) {
+    toast("只支持 PNG / JPEG / WebP 图片")
+    return
+  }
+  for (const file of files) {
+    if (Number(file.size) > IMAGE_MAX_BYTES) {
+      toast(`${file.name || "图片"} 超过 5 MB`)
+      continue
+    }
+    try {
+      const saved = await uploadImage(file)
+      insertSnippet(`[image:${saved.path}]`)
+    } catch (error) {
+      toast(`上传失败：${messageOf(error)}`)
+    }
+  }
+}
+
+function pastedImages(data) {
+  const files = []
+  if (!data) return files
+  if (data.files && data.files.length) {
+    for (const file of data.files) files.push(file)
+    return files
+  }
+  if (data.items) {
+    for (const item of data.items) {
+      if (item && item.kind === "file" && String(item.type || "").startsWith("image/")) {
+        const file = item.getAsFile ? item.getAsFile() : null
+        if (file) files.push(file)
+      }
+    }
+  }
+  return files
+}
+
+function droppedImages(event) {
+  const data = event.dataTransfer
+  const files = []
+  if (!data || !data.files) return files
+  for (const file of data.files) {
+    if (file && isImageType(file.type)) files.push(file)
+  }
+  return files
 }
 
 async function sendMessage() {
@@ -2001,6 +2125,45 @@ function bind() {
   })
 
   els.input.addEventListener("input", autosize)
+
+  els.input.addEventListener("paste", (event) => {
+    const images = pastedImages(event.clipboardData).filter((file) => isImageType(file.type))
+    if (images.length === 0) return
+    event.preventDefault()
+    void attachFiles(images)
+  })
+
+  els.attach.addEventListener("click", () => {
+    els.file.value = ""
+    els.file.click()
+  })
+
+  els.file.addEventListener("change", () => {
+    void attachFiles(els.file.files)
+  })
+
+  els.composer.addEventListener("dragover", (event) => {
+    event.preventDefault()
+    els.composer.classList.add("is-dragging")
+  })
+
+  els.composer.addEventListener("dragleave", () => {
+    els.composer.classList.remove("is-dragging")
+  })
+
+  els.composer.addEventListener("drop", (event) => {
+    els.composer.classList.remove("is-dragging")
+    const data = event.dataTransfer
+    const carriesFiles = Boolean(data && Array.from(data.types || []).includes("Files"))
+    if (!carriesFiles) return
+    event.preventDefault()
+    const images = droppedImages(event)
+    if (images.length === 0) {
+      toast("只支持 PNG / JPEG / WebP 图片")
+      return
+    }
+    void attachFiles(images)
+  })
   els.input.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" || event.shiftKey || event.isComposing) return
     if (event.metaKey || event.ctrlKey || event.altKey) return

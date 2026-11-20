@@ -18,6 +18,7 @@ import {
 } from "../../src/memory/index.ts"
 import { createSearchContextTool, eventKind, formatEventTime } from "../../src/memory/tools.ts"
 import { JobRunner } from "../../src/jobs/runner.ts"
+import { ImageAttachments } from "../../src/media/attachments.ts"
 import { createTools } from "../../src/tools/index.ts"
 
 const dirs: string[] = []
@@ -504,14 +505,20 @@ test("a long tool result is flattened to one line in the transcript", async () =
   }
 })
 
-test("the tool set is seven: the three job tools, search_context, focus_set, remember and recall", async () => {
+test("the tool set is eight: the three job tools, search_context, focus_set, remember, recall and view_image", async () => {
   const bag = await open()
   try {
     const runner = new JobRunner({ agentHome: bag.home, model: "fake-model", thinking: "max" })
-    const tools = createTools({ agentHome: bag.home, runner, memory: bag.index })
+    const tools = createTools({
+      agentHome: bag.home,
+      runner,
+      memory: bag.index,
+      sessionId: "main",
+      attachments: new ImageAttachments(),
+    })
     assert.deepEqual(
       tools.map((tool) => tool.name),
-      ["delegate", "job_status", "job_stop", "search_context", "focus_set", "remember", "recall"],
+      ["delegate", "job_status", "job_stop", "search_context", "focus_set", "remember", "recall", "view_image"],
     )
 
     const search = tools.find((tool) => tool.name === "search_context")

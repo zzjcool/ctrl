@@ -22,6 +22,8 @@ import { MAX_PROPOSAL_LIMIT, listProposals } from "../memory/proposals.ts"
 import { createRecordingLlm, todayTokensByKind, usageSummary } from "../memory/usage.ts"
 import type { UsageKind } from "../memory/usage.ts"
 import { DEFAULT_CONTEXT_BUDGET } from "../memory/window.ts"
+import { ImageAttachments } from "../media/attachments.ts"
+import { createImageLlm } from "../media/images.ts"
 import { SelfEditGate } from "../selfedit/gate.ts"
 import { createTools } from "../tools/index.ts"
 import { DEFAULT_AGENT, LOG_ID, ensureAgent, logPath, resolveRoot } from "./agents.ts"
@@ -36,6 +38,7 @@ import {
 } from "./heartbeat.ts"
 import type { Heartbeat } from "./heartbeat.ts"
 import { sendJson, serveStatic } from "./http.ts"
+import { MEDIA_PREFIX, serveMedia } from "./media-routes.ts"
 import { dreamOnce, handleApiRequest, runTurn, type AppContext } from "./routes.ts"
 import { readSidecar, writeSidecar } from "./sidecar.ts"
 import { TurnRegistry } from "./turns.ts"
@@ -198,15 +201,16 @@ export function buildContext(config: ServerConfig = {}): AppContext {
 
     dreams: undefined as unknown as DreamController,
     selfEdit: undefined as unknown as SelfEditGate,
+    attachments: new ImageAttachments(),
     tools: [],
     env,
     createLlm:
       config.createLlm ??
       ((requested: string, kind: UsageKind = "turn") =>
-        createRecordingLlm(createChatCompletionsClient({ model: requested || model, env, reasoningEffort, maxTokens }), {
-          db: memory.handle(),
-          kind,
-        })),
+        createRecordingLlm(
+          createImageLlm(createChatCompletionsClient({ model: requested || model, env, reasoningEffort, maxTokens })),
+          { db: memory.handle(), kind },
+        )),
   }
 
   ctx.selfEdit = new SelfEditGate({
@@ -221,7 +225,14 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     warn: (message) => process.stderr.write(`ctrl: ${message}\n`),
   })
 
-  ctx.tools = createTools({ agentHome: ensured.home, runner, memory, selfEdit: ctx.selfEdit })
+  ctx.tools = createTools({
+    agentHome: ensured.home,
+    runner,
+    memory,
+    selfEdit: ctx.selfEdit,
+    sessionId: LOG_ID,
+    attachments: ctx.attachments,
+  })
 
   ctx.dreams = new DreamController({
     run: () => dreamOnce(ctx),
@@ -442,6 +453,11 @@ async function handleRequest(
   try {
     if (await handleApiRequest(request, response, ctx)) return
     const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname
+
+    if (pathname.startsWith(MEDIA_PREFIX)) {
+      await serveMedia(request, response, pathname, ctx.agentHome)
+      return
+    }
 
     await serveStatic(request, response, pathname, publicDir)
   } catch (error) {

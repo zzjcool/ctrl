@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http"
 import { appendRecord, createMemoryStore, resolvePaths } from "../engine/durable.ts"
 import type { AgentMemory, LlmClient, MemoryKind, SessionEvent, ToolSpec } from "../engine/durable.ts"
 import type { JobRunner } from "../jobs/runner.ts"
+import type { ImageAttachments } from "../media/attachments.ts"
 import type { DreamController } from "../memory/dream.ts"
 import type { MemoryIndex } from "../memory/index.ts"
 import type { UsageKind } from "../memory/usage.ts"
@@ -36,6 +37,7 @@ export interface AppContext {
   dreams: DreamController
   agentMemory: AgentMemory
   selfEdit: SelfEditGate
+  attachments: ImageAttachments
   tools: ToolSpec[]
   env: NodeJS.ProcessEnv
   createLlm: (model: string, kind?: UsageKind) => LlmClient

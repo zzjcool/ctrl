@@ -160,6 +160,11 @@ function request(port: number, method: string, requestPath: string, body?: unkno
 
 const AGENT = "tester"
 
+const PNG_1X1 = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+  "base64",
+)
+
 const FAKE_PI_SOURCE = `#!/bin/sh
 printf 'args: %s\\n' "$*"
 sleep 0.3
@@ -242,6 +247,37 @@ after(async () => {
 
 function api(method: string, requestPath: string, body?: unknown): Promise<Reply> {
   return request(fixture.running.port, method, requestPath, body)
+}
+
+function uploadImage(bytes: Buffer, contentType: string): Promise<Reply> {
+  return new Promise<Reply>((resolve, reject) => {
+    const req = httpRequest(
+      {
+        host: "127.0.0.1",
+        port: fixture.running.port,
+        method: "POST",
+        path: "/api/agent/images",
+        headers: { "content-type": contentType, "content-length": bytes.byteLength },
+      },
+      (response) => {
+        const chunks: Buffer[] = []
+        response.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)))
+        response.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8")
+          let json: unknown
+          try {
+            json = JSON.parse(text)
+          } catch {
+            json = undefined
+          }
+          resolve({ status: response.statusCode ?? 0, headers: response.headers, text, json })
+        })
+      },
+    )
+    req.on("error", reject)
+    req.write(bytes)
+    req.end()
+  })
 }
 
 interface Stream {
@@ -935,4 +971,90 @@ test("the page is served, and only from the public directory", async () => {
   assert.ok(!escape.text.includes("\"name\": \"pi-ctrl\""))
 
   assert.equal((await api("GET", "/api/nope")).status, 404)
+})
+
+test("a screenshot travels as a marker in the log and as content parts on the wire", async () => {
+  const uploaded = await uploadImage(PNG_1X1, "image/png")
+  assert.equal(uploaded.status, 200, uploaded.text)
+  const file = String(uploaded.json.path)
+  assert.ok(file.startsWith(path.join(fixture.root, "agents", AGENT, "media")))
+
+  fixture.fake.reset()
+  fixture.fake.push({ content: "这是一张 1x1 的白色 PNG" })
+
+  const sent = await send(`这是什么图？[image:${file}]`)
+  assert.equal(sent.status, 202, sent.text)
+  const snapshot = await settle()
+
+  const userMessages = snapshot.events.filter(
+    (event): event is Extract<SessionEvent, { type: "user_message" }> => event.type === "user_message",
+  )
+  assert.equal(userMessages.at(-1)?.data.text, `这是什么图？[image:${file}]`, "the log stays text")
+
+  const body = fixture.fake.bodies.at(-1) as { messages: Array<{ role: string; content: unknown }> } | undefined
+  const marked = body?.messages.find((message) => message.role === "user" && Array.isArray(message.content))
+  assert.ok(marked, "the model must receive parts, not the raw marker")
+  assert.deepEqual(marked.content, [
+    { type: "text", text: "这是什么图？" },
+    { type: "image_url", image_url: { url: `data:image/png;base64,${PNG_1X1.toString("base64")}` } },
+  ])
+
+  const replies = snapshot.events.filter(
+    (event): event is Extract<SessionEvent, { type: "assistant_message" }> => event.type === "assistant_message",
+  )
+  assert.equal(replies.at(-1)?.data.text, "这是一张 1x1 的白色 PNG")
+
+  const preview = await api("GET", `/media/${encodeURIComponent(path.basename(file))}`)
+  assert.equal(preview.status, 200, preview.text)
+  assert.equal(preview.headers["content-type"], "image/png")
+})
+
+test("view_image attaches a file to the log, and refuses a path outside its reach", async () => {
+  const uploaded = await uploadImage(PNG_1X1, "image/png")
+  assert.equal(uploaded.status, 200, uploaded.text)
+  const file = String(uploaded.json.path)
+
+  fixture.fake.reset()
+  fixture.fake.push({ toolCalls: [{ name: "view_image", arguments: { path: file } }] })
+  fixture.fake.push({ content: "看到了：一张 1x1 的图" })
+
+  const sent = await send("把那张图看一遍")
+  assert.equal(sent.status, 202, sent.text)
+  const snapshot = await settle()
+
+  const results = snapshot.events.filter(
+    (event): event is Extract<SessionEvent, { type: "tool_result" }> => event.type === "tool_result",
+  )
+  const result = results.at(-1)
+  assert.equal(result?.data.name, "view_image")
+  assert.equal(result?.data.ok, true)
+  assert.equal(result?.data.output, `attached ${file} — you will see it on the next step`)
+
+  const attached = snapshot.events.filter(
+    (event) => event.type === "user_message" && event.data.text === `[image:${file}]`,
+  )
+  assert.equal(attached.length, 1, "the tool appends exactly one marker message")
+  assert.ok((attached[0]?.seq ?? 0) > (result?.seq ?? 0), "the attachment lands after the tool result")
+
+  const body = fixture.fake.bodies.at(-1) as { messages: Array<{ role: string; content: unknown }> } | undefined
+  const parts = (body?.messages ?? []).filter((message) => message.role === "user" && Array.isArray(message.content))
+  assert.deepEqual(parts.at(-1)?.content, [
+    { type: "image_url", image_url: { url: `data:image/png;base64,${PNG_1X1.toString("base64")}` } },
+  ])
+
+  fixture.fake.reset()
+  fixture.fake.push({ toolCalls: [{ name: "view_image", arguments: { path: "/etc/passwd" } }] })
+  fixture.fake.push({ content: "那张看不了" })
+  const refused = await send("看看 /etc/passwd")
+  assert.equal(refused.status, 202, refused.text)
+  const second = await settle()
+  const refusedResults = second.events.filter(
+    (event): event is Extract<SessionEvent, { type: "tool_result" }> => event.type === "tool_result",
+  )
+  assert.equal(refusedResults.at(-1)?.data.ok, false)
+  assert.match(JSON.stringify(refusedResults.at(-1)?.data.output), /must live under/)
+  assert.equal(
+    second.events.filter((event) => event.type === "user_message" && event.data.text === "[image:/etc/passwd]").length,
+    0,
+  )
 })

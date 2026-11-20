@@ -8,13 +8,15 @@ import {
   runAgent,
 } from "../engine/durable.ts"
 import type { LlmClient, Session, SessionSink } from "../engine/durable.ts"
+import { attachmentSink } from "../media/attachments.ts"
+import { MAX_IMAGE_BYTES, imageType, saveImage } from "../media/images.ts"
 import type { UsageKind } from "../memory/usage.ts"
 import { lastDreamAt, readProfile } from "../memory/dream.ts"
 import { listFocus, openFocusCount } from "../memory/focus.ts"
 import { liveMemoryCount } from "../memory/memories.ts"
 import { compressWindow, windowInfo } from "../memory/window.ts"
 import { LOG_ID } from "./agents.ts"
-import { HttpError, readJson, sendJson } from "./http.ts"
+import { HttpError, readBody, readJson, sendJson } from "./http.ts"
 import { conversationEvents, errorMessage, JOB_MESSAGE_KIND, methodNotAllowed, notFound, pageEvents } from "./routes.ts"
 import type { AppContext } from "./routes.ts"
 import { createAbortableLlm } from "./turns.ts"
@@ -48,6 +50,11 @@ export async function handleAgentRoutes(
 
   if (action === "messages") {
     await acceptMessage(request, response, ctx, method)
+    return
+  }
+
+  if (action === "images") {
+    await acceptImage(request, response, ctx, method)
     return
   }
 
@@ -99,6 +106,26 @@ async function acceptMessage(
   const started = ctx.turns.start(LOG_ID, (signal) => runTurn(ctx, log, text, signal))
   if (!started) throw new HttpError(409, "a turn is already running for this agent")
   sendJson(response, 202, { accepted: true, turn: ctx.turns.state(LOG_ID) })
+}
+
+async function acceptImage(
+  request: IncomingMessage,
+  response: ServerResponse,
+  ctx: AppContext,
+  method: string,
+): Promise<void> {
+  if (method !== "POST") {
+    methodNotAllowed(response, method)
+    return
+  }
+  const contentType = imageType(request.headers["content-type"])
+  if (contentType === undefined) {
+    throw new HttpError(415, "content-type must be image/png, image/jpeg or image/webp")
+  }
+  const bytes = await readBody(request, { maxBytes: MAX_IMAGE_BYTES })
+  if (bytes.byteLength === 0) throw new HttpError(400, "image body is empty")
+  const saved = saveImage({ agentHome: ctx.agentHome, contentType, bytes })
+  sendJson(response, 200, saved)
 }
 
 function sendAbort(response: ServerResponse, ctx: AppContext, method: string): void {
@@ -231,7 +258,10 @@ async function runTurnOnce(
   }
 
   const before = log.events().length
-  const session = origin === "wake" ? jobLifecycleSession(log) : log
+  const sink = origin === "wake" ? jobLifecycleSession(log) : log
+  const session = attachmentSink(sink, ctx.attachments, (text) => {
+    log.appendUserMessage(text)
+  })
   try {
     await runAgent({
       sessionId: LOG_ID,
