@@ -38,7 +38,15 @@ import type {
 import type { JobRunner } from "../jobs/runner.ts"
 import { DEFAULT_LIST_LIMIT, listJobs, readJobLog } from "../jobs/store.ts"
 import type { JobView } from "../jobs/store.ts"
-import { listDreamRuns, lastDreamAt, runDream, type DreamController, type DreamLlm, type DreamResult } from "../memory/dream.ts"
+import {
+  listDreamRuns,
+  lastDreamAt,
+  readProfile,
+  runDream,
+  type DreamController,
+  type DreamLlm,
+  type DreamResult,
+} from "../memory/dream.ts"
 import { completeFocus, isFocusState, listFocus, openFocusCount, upsertFocus, type FocusItem } from "../memory/focus.ts"
 import { clampLimit, type MemoryIndex } from "../memory/index.ts"
 import {
@@ -611,7 +619,12 @@ async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: 
       allowBash: false,
       // Rebuilt every turn: a restarted ctrl may be in a different directory,
       // and the model must not be told the old one.
-      systemPrompt: agentSystemPrompt({ name: ctx.agent, cwd }),
+      systemPrompt: buildSystemPrompt({
+        name: ctx.agent,
+        cwd,
+        agentHome: ctx.agentHome,
+        db: ctx.memory.handle(),
+      }),
     })
   } catch (error) {
     if (signal.aborted) {
@@ -629,6 +642,29 @@ async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: 
 }
 
 /** CONTRACT §6, verbatim: the agent's name and what it is (and is not). */
+/**
+ * The prompt the agent actually runs with (MEMORY.md §5): identity + the
+ * curated profile + what it currently cares about. Profile and focus are
+ * rebuilt every turn so a dream that ran between turns lands immediately.
+ */
+export function buildSystemPrompt(opts: {
+  name: string
+  cwd: string
+  agentHome: string
+  db?: DatabaseSync
+}): string {
+  const parts = [agentSystemPrompt({ name: opts.name, cwd: opts.cwd })]
+  const profile = readProfile(opts.agentHome) ?? ""
+  if (profile !== "") parts.push(`# What you know about this person\n${profile}`)
+  if (opts.db !== undefined) {
+    const focus = listFocus(opts.db, { limit: 5 })
+    if (focus.length > 0) {
+      parts.push(`# Focus\n${focus.map((item) => `- [${item.state}] ${item.text}`).join("\n")}`)
+    }
+  }
+  return parts.join("\n\n")
+}
+
 export function agentSystemPrompt(opts: { name: string; cwd: string }): string {
   return (
     `You are ${opts.name}, a persistent agent with long-term memory. ` +
