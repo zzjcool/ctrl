@@ -5,6 +5,9 @@ const JOBS_API = "/api/jobs"
 const FOCUS_API = "/api/focus"
 const MEMORIES_API = "/api/memories"
 
+const PROPOSALS_API = "/api/proposals"
+const HEALTH_API = "/api/health"
+
 const TAIL = 100
 const POLL_RUNNING_MS = 700
 const POLL_IDLE_MS = 2500
@@ -22,6 +25,18 @@ const MEMORY_LIMIT = 20
 const MEMORY_SEARCH_MS = 320
 
 const AGENT_SNAPSHOT_MS = 5000
+
+const PROPOSAL_TASK_CHARS = 60
+
+const PROPOSAL_DIFF_MAX_LINES = 3000
+
+const PROPOSAL_RESTART_MS = 800
+
+const PROPOSAL_HEALTH_MAX_TRIES = 150
+
+const PROPOSAL_TEST_KEYS = ["typecheck", "unit", "e2e", "contract"]
+
+const PROPOSAL_STATUSES = ["open", "applied", "discarded"]
 
 const state = {
   name: "",
@@ -77,6 +92,30 @@ const state = {
   memories: [],
   memoriesLoaded: false,
   memoriesError: "",
+
+  proposals: [],
+
+  proposalsLoaded: false,
+
+  proposalsError: false,
+
+  proposalsSignature: "",
+
+  proposalDrawerOpen: false,
+
+  proposalDetailId: "",
+
+  proposalDetail: null,
+
+  proposalDiff: "",
+
+  proposalDetailError: "",
+
+  proposalBusy: false,
+
+  proposalApplyState: "",
+
+  proposalNote: "",
 }
 
 const els = {
@@ -126,6 +165,18 @@ const els = {
   memoryList: document.getElementById("memory-list"),
   memoryEmpty: document.getElementById("memory-empty"),
   memoryError: document.getElementById("memory-error"),
+  proposalCount: document.getElementById("proposal-count"),
+  proposalList: document.getElementById("proposal-list"),
+  proposalEmpty: document.getElementById("proposal-empty"),
+  proposalError: document.getElementById("proposal-error"),
+  proposalDrawer: document.getElementById("proposal-drawer"),
+  proposalTitle: document.getElementById("proposal-title"),
+  proposalBadge: document.getElementById("proposal-badge"),
+  proposalClose: document.getElementById("proposal-close"),
+  proposalBody: document.getElementById("proposal-body"),
+  proposalApply: document.getElementById("proposal-apply"),
+  proposalDiscard: document.getElementById("proposal-discard"),
+  proposalNote: document.getElementById("proposal-note"),
 }
 
 function el(tag, className, text) {
@@ -1283,6 +1334,451 @@ async function deleteMemory(id) {
   }
 }
 
+function normalizeProposalStatus(value) {
+  const raw = typeof value === "string" ? value.trim().toLowerCase() : ""
+  return PROPOSAL_STATUSES.includes(raw) ? raw : ""
+}
+
+function proposalStateText(stateName) {
+  if (stateName === "ok") return "通过"
+  if (stateName === "fail") return "失败"
+  return "未知"
+}
+
+function readTestResult(value) {
+  if (!value || typeof value !== "object") return null
+  const output = typeof value.output === "string" ? value.output : ""
+  return { ok: value.ok === true, output }
+}
+
+function readProposalTests(value) {
+  const source = value && typeof value === "object" ? value : null
+  const tests = {}
+  for (const key of PROPOSAL_TEST_KEYS) tests[key] = readTestResult(source ? source[key] : null)
+  return tests
+}
+
+function readProposal(item) {
+  if (!item || typeof item !== "object") return null
+  const id = item.id === undefined || item.id === null ? "" : String(item.id).trim()
+  if (!id) return null
+  const endedAt = item.endedAt ?? item.ended_at ?? null
+  return {
+    id,
+    branch: typeof item.branch === "string" ? item.branch : "",
+    base: typeof item.base === "string" ? item.base : "",
+    task: typeof item.task === "string" ? item.task : "",
+    summary: typeof item.summary === "string" ? item.summary : "",
+    diffstat: typeof item.diffstat === "string" ? item.diffstat : "",
+    status: normalizeProposalStatus(item.status),
+    createdAt: typeof item.createdAt === "string" ? item.createdAt : String(item.created_at ?? ""),
+    endedAt: typeof endedAt === "string" ? endedAt : "",
+    tests: readProposalTests(item.tests),
+  }
+}
+
+function proposalTime(proposal) {
+  const date = toDate(proposal.createdAt)
+  return date ? date.getTime() : Number.NEGATIVE_INFINITY
+}
+
+function compareProposals(a, b) {
+  const at = proposalTime(a)
+  const bt = proposalTime(b)
+  if (at !== bt) return bt - at
+  return b.id.localeCompare(a.id)
+}
+
+function readProposals(data) {
+  const list = data && Array.isArray(data.proposals) ? data.proposals : null
+  if (!list) return null
+  const proposals = []
+  for (const item of list) {
+    const proposal = readProposal(item)
+    if (proposal) proposals.push(proposal)
+  }
+  proposals.sort(compareProposals)
+  return proposals
+}
+
+function proposalTestState(result) {
+  if (!result) return "unknown"
+  return result.ok ? "ok" : "fail"
+}
+
+function proposalsSignature(proposals) {
+  const parts = []
+  for (const proposal of proposals) {
+    const marks = PROPOSAL_TEST_KEYS.map((key) => {
+      const stateName = proposalTestState(proposal.tests[key])
+      return stateName === "unknown" ? "-" : stateName === "ok" ? "1" : "0"
+    }).join("")
+    parts.push(
+      [proposal.id, proposal.status, proposal.branch, proposal.createdAt, proposal.endedAt, proposal.diffstat, marks].join("\u0001"),
+    )
+  }
+  return parts.join("\u0002")
+}
+
+function shortProposalTask(text) {
+  const line = oneLine(text)
+  if (!line) return "（没写任务）"
+  return line.length > PROPOSAL_TASK_CHARS ? `${line.slice(0, PROPOSAL_TASK_CHARS)}…` : line
+}
+
+function proposalItemEl(proposal) {
+  const row = el("li", "proposal-item")
+  row.dataset.id = proposal.id
+  row.dataset.status = proposal.status || "unknown"
+  row.tabIndex = 0
+  row.setAttribute("role", "button")
+  const full = oneLine(proposal.task) || proposal.id
+  row.title = proposal.createdAt ? `${full}\n${absoluteTime(proposal.createdAt)}` : full
+
+  const head = el("div", "proposal-line")
+  const badge = el("span", "proposal-badge", proposal.status || "—")
+  badge.dataset.status = proposal.status || "unknown"
+  head.append(badge, el("span", "proposal-task", shortProposalTask(proposal.task)))
+
+  const meta = el("div", "proposal-line")
+  meta.appendChild(el("span", "proposal-branch", proposal.branch || "（没有分支）"))
+  const dots = el("span", "proposal-dots")
+  const labels = []
+  for (const key of PROPOSAL_TEST_KEYS) {
+    const stateName = proposalTestState(proposal.tests[key])
+    const dot = el("span", "proposal-dot")
+    dot.dataset.state = stateName
+    dot.title = `${key}: ${proposalStateText(stateName)}`
+    dots.appendChild(dot)
+    labels.push(`${key} ${proposalStateText(stateName)}`)
+  }
+  dots.setAttribute("aria-label", labels.join(" · "))
+  meta.appendChild(dots)
+
+  const stat = el("div", "proposal-diffstat", proposal.diffstat || "（没有 diffstat）")
+  row.append(head, meta, stat)
+  return row
+}
+
+function renderProposals() {
+  els.proposalList.textContent = ""
+  for (const proposal of state.proposals) els.proposalList.appendChild(proposalItemEl(proposal))
+  const count = state.proposals.length
+  els.proposalCount.textContent = String(Math.max(0, count))
+  els.proposalEmpty.hidden = !(state.proposalsLoaded && !state.proposalsError && count === 0)
+  els.proposalError.hidden = !state.proposalsError
+}
+
+function applyProposals(data) {
+  const proposals = readProposals(data)
+  if (!proposals) {
+    noteProposalsFailure()
+    return false
+  }
+  const wasError = state.proposalsError
+  const signature = proposalsSignature(proposals)
+  const changed = wasError || signature !== state.proposalsSignature
+  state.proposals = proposals
+  state.proposalsSignature = signature
+  state.proposalsLoaded = true
+  state.proposalsError = false
+  if (changed) {
+    renderProposals()
+    syncProposalFoot()
+  } else {
+    els.proposalError.hidden = true
+  }
+  return true
+}
+
+function noteProposalsFailure() {
+  if (state.proposalsError) return
+  state.proposalsError = true
+  renderProposals()
+}
+
+let proposalsBusy = false
+
+async function refreshProposals() {
+  if (proposalsBusy) return false
+  proposalsBusy = true
+  try {
+    return applyProposals(await request(PROPOSALS_API))
+  } catch {
+    noteProposalsFailure()
+    return false
+  } finally {
+    proposalsBusy = false
+  }
+}
+
+function findProposal(id) {
+  if (!id) return null
+  return state.proposals.find((proposal) => proposal.id === id) || null
+}
+
+function currentProposal() {
+  return state.proposalDetail || findProposal(state.proposalDetailId)
+}
+
+function proposalTestsAllOk(proposal) {
+  if (!proposal) return false
+  for (const key of PROPOSAL_TEST_KEYS) {
+    if (proposalTestState(proposal.tests[key]) !== "ok") return false
+  }
+  return true
+}
+
+function proposalCanApply(proposal) {
+  return Boolean(proposal) && proposal.status === "open" && proposalTestsAllOk(proposal)
+}
+
+function proposalApplyTitle(proposal) {
+  if (!proposal) return "提案还没加载完"
+  if (proposal.status === "applied") return "已经应用过了"
+  if (proposal.status === "discarded") return "已经丢弃了"
+  if (proposal.status !== "open") return "状态不明，不能应用"
+  if (!proposalTestsAllOk(proposal)) return "四个测试还没全绿，先让它改到全绿"
+  return "合并这条分支并重启服务"
+}
+
+function clipLines(text, max) {
+  const lines = String(text ?? "").split("\n")
+  if (lines.length <= max) return { text: lines.join("\n"), truncated: 0 }
+  return { text: lines.slice(0, max).join("\n"), truncated: lines.length - max }
+}
+
+function proposalMetaRow(key, value) {
+  const row = el("div", "proposal-meta-row")
+  row.append(el("span", "proposal-meta-key", key), el("span", "proposal-meta-value", value))
+  return row
+}
+
+function proposalTestEl(key, result) {
+  const stateName = proposalTestState(result)
+  const box = el("div", "proposal-test")
+  box.dataset.state = stateName
+
+  const head = el("div", "proposal-test-head")
+  head.append(el("span", "proposal-test-name", key), el("span", "proposal-test-state", proposalStateText(stateName)))
+  box.appendChild(head)
+
+  if (result && result.output) {
+    const details = document.createElement("details")
+    details.className = "proposal-out"
+    const summary = document.createElement("summary")
+    summary.textContent = result.ok ? "输出" : "失败输出"
+    const clip = clipLines(result.output, PROPOSAL_DIFF_MAX_LINES)
+    details.append(summary, el("pre", "proposal-pre", clip.text.trim() ? clip.text : "（空）"))
+    if (clip.truncated > 0) details.appendChild(el("p", "proposal-cut", `还有 ${clip.truncated} 行没显示`))
+    box.appendChild(details)
+  }
+  return box
+}
+
+function renderProposalBody(proposal) {
+  els.proposalBody.textContent = ""
+  if (!proposal) {
+    const note = state.proposalDetailError ? `拉不到提案：${state.proposalDetailError}` : "加载中…"
+    els.proposalBody.appendChild(el("p", "proposal-hint", note))
+    return
+  }
+
+  els.proposalBody.appendChild(el("p", "proposal-task-full", proposal.task || "（没写任务）"))
+
+  const meta = el("div", "proposal-meta")
+  meta.appendChild(proposalMetaRow("branch", proposal.branch || "—"))
+  meta.appendChild(proposalMetaRow("base", proposal.base || "—"))
+  meta.appendChild(proposalMetaRow("created", proposal.createdAt ? absoluteTime(proposal.createdAt) : "—"))
+  if (proposal.endedAt) meta.appendChild(proposalMetaRow("ended", absoluteTime(proposal.endedAt)))
+  if (proposal.summary) meta.appendChild(proposalMetaRow("summary", proposal.summary))
+  els.proposalBody.appendChild(meta)
+
+  const tests = el("section", "proposal-tests")
+  tests.appendChild(el("h3", "proposal-sub", "tests"))
+  for (const key of PROPOSAL_TEST_KEYS) tests.appendChild(proposalTestEl(key, proposal.tests[key]))
+  els.proposalBody.appendChild(tests)
+
+  const diffBox = el("section", "proposal-diff-wrap")
+  diffBox.appendChild(el("h3", "proposal-sub", "diff"))
+  const clip = clipLines(state.proposalDiff, PROPOSAL_DIFF_MAX_LINES)
+  diffBox.appendChild(el("pre", "proposal-diff", clip.text.trim() ? clip.text : "（没有 diff）"))
+  if (clip.truncated > 0) {
+    diffBox.appendChild(
+      el("p", "proposal-cut", `diff 太长，只显示前 ${PROPOSAL_DIFF_MAX_LINES} 行（还有 ${clip.truncated} 行没显示）`),
+    )
+  }
+  els.proposalBody.appendChild(diffBox)
+}
+
+function syncProposalFoot() {
+  const proposal = currentProposal()
+  const restarting = state.proposalApplyState === "restarting"
+  const applied = state.proposalApplyState === "applied"
+  const busy = state.proposalBusy
+  const canApply = proposalCanApply(proposal)
+
+  els.proposalApply.disabled = !canApply || busy || restarting || applied
+  els.proposalApply.textContent = restarting ? "重启中…" : applied ? "已应用" : busy ? "应用中…" : "应用"
+  els.proposalApply.title = proposalApplyTitle(proposal)
+
+  const canDiscard = Boolean(proposal) && proposal.status === "open" && !busy && !restarting
+  els.proposalDiscard.disabled = !canDiscard
+  els.proposalDiscard.title = canDiscard ? "删掉这条提案的分支，代码不合进来" : "只有 open 的提案能丢弃"
+
+  els.proposalNote.textContent = state.proposalNote
+  els.proposalBadge.textContent = proposal ? proposal.status || "…" : "…"
+  els.proposalBadge.dataset.status = proposal && proposal.status ? proposal.status : "unknown"
+}
+
+function renderProposalDrawer() {
+  const proposal = currentProposal()
+  els.proposalTitle.textContent = proposal ? `提案 ${proposal.id}` : "提案"
+  renderProposalBody(proposal)
+  syncProposalFoot()
+}
+
+async function loadProposalDetail(id) {
+  try {
+    const data = await request(`${PROPOSALS_API}/${encodeURIComponent(id)}`)
+    if (state.proposalDetailId !== id) return false
+    const detail = data && data.proposal ? readProposal(data.proposal) : null
+    state.proposalDetail = detail
+    state.proposalDiff = data && typeof data.diff === "string" ? data.diff : ""
+    state.proposalDetailError = ""
+  } catch (error) {
+    if (state.proposalDetailId !== id) return false
+    state.proposalDetailError = messageOf(error)
+  }
+  renderProposalDrawer()
+  return true
+}
+
+function openProposalDrawer(id) {
+  if (!id) return
+  if (state.drawerOpen) closeDrawer()
+  state.proposalDrawerOpen = true
+  state.proposalDetailId = id
+  state.proposalDetail = null
+  state.proposalDiff = ""
+  state.proposalDetailError = ""
+  state.proposalApplyState = ""
+  state.proposalNote = ""
+  stopHealthWatch()
+  els.proposalDrawer.hidden = false
+  renderProposalDrawer()
+  void loadProposalDetail(id)
+}
+
+function closeProposalDrawer() {
+  state.proposalDrawerOpen = false
+  state.proposalDetailId = ""
+  state.proposalDetail = null
+  state.proposalDiff = ""
+  state.proposalDetailError = ""
+  state.proposalApplyState = ""
+  state.proposalNote = ""
+  stopHealthWatch()
+  els.proposalDrawer.hidden = true
+}
+
+let healthTimer = 0
+
+function stopHealthWatch() {
+  window.clearTimeout(healthTimer)
+  healthTimer = 0
+}
+
+function scheduleHealthWatch(attempt) {
+  stopHealthWatch()
+  healthTimer = window.setTimeout(() => {
+    healthTimer = 0
+    void checkHealth(attempt)
+  }, PROPOSAL_RESTART_MS)
+}
+
+async function checkHealth(attempt) {
+  const id = state.proposalDetailId
+  let reachable = false
+  try {
+    const data = await request(HEALTH_API)
+    reachable = Boolean(data) && data.status !== "down"
+  } catch {
+    reachable = false
+  }
+  if (!id || state.proposalApplyState !== "restarting") return
+  if (reachable && attempt > 1) {
+    state.proposalApplyState = "applied"
+    state.proposalNote = "已应用"
+    stopHealthWatch()
+    syncProposalFoot()
+    void refreshProposals()
+    if (state.proposalDrawerOpen && state.proposalDetailId === id) void loadProposalDetail(id)
+    return
+  }
+  if (attempt >= PROPOSAL_HEALTH_MAX_TRIES) {
+    state.proposalApplyState = ""
+    state.proposalNote = "重启后一直没等到健康检查，刷新页面试试"
+    stopHealthWatch()
+    syncProposalFoot()
+    return
+  }
+  scheduleHealthWatch(attempt + 1)
+}
+
+async function applyProposal(id) {
+  if (!id || state.proposalBusy) return
+  const proposal = currentProposal()
+  if (!proposalCanApply(proposal)) return
+  state.proposalBusy = true
+  state.proposalNote = "正在应用…"
+  syncProposalFoot()
+  try {
+    const data = await request(`${PROPOSALS_API}/${encodeURIComponent(id)}/apply`, { method: "POST", body: {} })
+    if (data && data.applied === false) throw new Error("后端没有应用成功")
+    state.proposalNote = "服务正在重启"
+    if (data && data.restarting === false) {
+      state.proposalApplyState = "applied"
+      state.proposalNote = "已应用"
+      void refreshProposals()
+    } else {
+      state.proposalApplyState = "restarting"
+      scheduleHealthWatch(1)
+    }
+  } catch (error) {
+    state.proposalApplyState = ""
+    state.proposalNote = ""
+    toast(`应用失败：${messageOf(error)}`)
+  } finally {
+    state.proposalBusy = false
+    syncProposalFoot()
+  }
+}
+
+async function discardProposal(id) {
+  if (!id || state.proposalBusy) return
+  const proposal = currentProposal()
+  if (!proposal || proposal.status !== "open") return
+  const preview = oneLine(proposal.task).slice(0, 80) || id
+  if (!window.confirm(`丢弃这条提案？\n\n${preview}\n\n它对应的分支会被删掉，代码不会合进来。`)) return
+  state.proposalBusy = true
+  syncProposalFoot()
+  try {
+    const data = await request(`${PROPOSALS_API}/${encodeURIComponent(id)}/discard`, { method: "POST", body: {} })
+    const updated = data && data.proposal ? readProposal(data.proposal) : null
+    if (updated && state.proposalDetailId === id) state.proposalDetail = updated
+    state.proposalNote = "已丢弃"
+    state.proposalApplyState = ""
+  } catch (error) {
+    toast(`丢弃失败：${messageOf(error)}`)
+  } finally {
+    state.proposalBusy = false
+    void refreshProposals()
+    if (state.proposalDetailId === id && state.proposalDrawerOpen) void loadProposalDetail(id)
+    syncProposalFoot()
+  }
+}
+
 function openDrawer() {
   state.drawerOpen = true
   els.drawer.hidden = false
@@ -1435,9 +1931,10 @@ async function pollOnce() {
   const wasRunning = Boolean(state.turn && state.turn.running)
   let next = POLL_IDLE_MS
   try {
-    const [data, jobsData] = await Promise.all([
+    const [data, jobsData, proposalsData] = await Promise.all([
       api(`/events?since=${since}`),
       request(JOBS_API).catch(() => null),
+      request(PROPOSALS_API).catch(() => null),
     ])
     state.errors = 0
     setConnected(true)
@@ -1452,6 +1949,9 @@ async function pollOnce() {
     if (total !== null) state.eventCount = Math.max(state.eventCount, total, state.since)
 
     applyJobs(jobsData)
+
+    if (proposalsData) applyProposals(proposalsData)
+    else noteProposalsFailure()
 
     refreshPanel()
 
@@ -1503,6 +2003,7 @@ async function tryLoadAgent() {
     state.loaded = true
     if (state.eventCount > 0) await loadTail()
     await refreshJobs()
+    await refreshProposals()
     void refreshFocus()
     renderDream()
     updateHead()
@@ -1622,11 +2123,51 @@ function bind() {
     void deleteMemory(row.dataset.id)
   })
 
+  const openProposalFrom = (target) => {
+    if (!(target instanceof Element)) return
+    const row = target.closest("li.proposal-item")
+    if (!row || !row.dataset.id) return
+    const selection = window.getSelection ? String(window.getSelection() || "") : ""
+    if (selection) return
+    openProposalDrawer(row.dataset.id)
+  }
+
+  els.proposalList.addEventListener("click", (event) => {
+    openProposalFrom(event.target)
+  })
+
+  els.proposalList.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return
+    event.preventDefault()
+    openProposalFrom(event.target)
+  })
+
+  els.proposalClose.addEventListener("click", () => {
+    closeProposalDrawer()
+  })
+
+  els.proposalDrawer.addEventListener("click", (event) => {
+    if (event.target === els.proposalDrawer) closeProposalDrawer()
+  })
+
+  els.proposalApply.addEventListener("click", () => {
+    void applyProposal(state.proposalDetailId)
+  })
+
+  els.proposalDiscard.addEventListener("click", () => {
+    void discardProposal(state.proposalDetailId)
+  })
+
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return
     if (state.drawerOpen) {
       event.preventDefault()
       closeDrawer()
+      return
+    }
+    if (state.proposalDrawerOpen) {
+      event.preventDefault()
+      closeProposalDrawer()
       return
     }
     if (document.body.classList.contains("panel-open")) setPanelOpen(false)
@@ -1689,6 +2230,7 @@ async function boot() {
   autosize()
   renderFocus()
   renderWorkers([])
+  renderProposals()
   renderDream()
   updateHead()
   updateEmpty()

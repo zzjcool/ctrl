@@ -123,6 +123,16 @@
           </section>
 
           <section class="panel-block">
+            <h2 class="panel-title">
+              <span>变更</span>
+              <span class="panel-count is-mono" id="proposal-count">0</span>
+            </h2>
+            <ul class="proposal-list" id="proposal-list"></ul>
+            <p class="panel-note" id="proposal-empty" hidden>还没有提案。让它改点什么，提案会出现在这里。</p>
+            <p class="panel-note is-fail" id="proposal-error" hidden>变更拉不到：后端可能还没接上。</p>
+          </section>
+
+          <section class="panel-block">
             <h2 class="panel-title"><span>memory</span></h2>
             <p class="panel-note" id="dream-line">还没做过梦</p>
           </section>
@@ -179,6 +189,22 @@
           <ul class="memory-list" id="memory-list"></ul>
           <p class="panel-note" id="memory-empty" hidden>没有记忆。</p>
           <p class="panel-note is-fail" id="memory-error" hidden></p>
+        </div>
+      </div>
+
+      <div class="drawer drawer-proposal" id="proposal-drawer" role="dialog" aria-modal="true" aria-label="提案" hidden>
+        <div class="drawer-box proposal-box">
+          <div class="drawer-head">
+            <span class="drawer-title" id="proposal-title">提案</span>
+            <span class="proposal-badge is-mono" id="proposal-badge"></span>
+            <button class="drawer-close" id="proposal-close" type="button" aria-label="关闭">✕</button>
+          </div>
+          <div class="proposal-body" id="proposal-body"></div>
+          <div class="proposal-foot">
+            <button class="btn-apply" id="proposal-apply" type="button" disabled>应用</button>
+            <button class="btn-discard" id="proposal-discard" type="button" disabled>丢弃</button>
+            <span class="proposal-note" id="proposal-note"></span>
+          </div>
         </div>
       </div>
     </div>
