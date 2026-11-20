@@ -109,8 +109,11 @@ started and polled, not awaited. `run_task` returns immediately with an address;
 
 - One session = one machine. Chosen at start: `--machine local` or
   `--machine <ssh-host>` (read from `~/.ssh/config`).
-- The agent never sees a host name in tool signatures. Switching machines =
+- The agent never sees a host name in tool **parameters**. Switching machines =
   a new session (v1). A visible `use_machine` tool is a later revision.
+- The one exception is the address `run_task` returns (`hw-nj/<id>`): it is an
+  opaque handle the model must echo to `task_output`, not a selector it can
+  choose from.
 - The page shows the machine in one chip; every tool card carries the same
   machine label, so the human always knows where the side effect landed.
 
@@ -132,6 +135,10 @@ One page, four parts: conversation, composer (with machine chip), session rail,
 status strip. Tool calls render inline as cards: name, machine, duration, exit
 status, collapsed output. No machine panel, no terminal panel, no dashboard.
 
+The "recovered" badge shows when `resumePoint.kind !== "clean"` **and** the
+session has at least one event — a brand-new session reports `empty`, which is
+not a recovery.
+
 ## 10. HTTP API (frozen)
 
 | Method + path | Behaviour |
@@ -139,7 +146,7 @@ status, collapsed output. No machine panel, no terminal panel, no dashboard.
 | `GET /api/health` | `{ status, machine, kind }` |
 | `GET /api/machines` | `{ machines: [{ name, kind, current }] }` |
 | `GET /api/sessions` | newest 30 + `title` |
-| `POST /api/sessions` | `{ cwd?, model? }` → 201 |
+| `POST /api/sessions` | `{ cwd?, model? }` → 201 `{ session }` (meta + `machine` + `remoteCwd`) |
 | `GET /api/sessions/:id` | `{ session, events, resumePoint, turn }` |
 | `GET /api/sessions/:id/events?since=N` | `{ events, total, since, turn }` ← the stream |
 | `POST /api/sessions/:id/messages` | `{ text }` → 202; busy → 409 |
@@ -173,3 +180,14 @@ status, collapsed output. No machine panel, no terminal panel, no dashboard.
 - **R2** — product surface = one conversation page; milestones page-first.
 - **R3** — personal scope, remote-as-workdir, SSH-only, tool set narrowed to
   pi-durable's plus the long-task pair. Product/competitive framing dropped.
+- **R4** — v1 implemented and verified (`typecheck`, 52 unit, 10 e2e, live SSH
+  against `hw-nj`). Accepted during implementation:
+  1. `Executor.readTask` returns a string, so the exit code is appended by the
+     executor as `[exit N]` (an explicit marker separates it from output).
+  2. `POST /api/sessions` answers the same shape as a session detail, because
+     the sidecar fields are needed by the page immediately.
+  3. A session that cannot even construct an LLM client records one
+     `error` event (`LLM unavailable: …`); other failures stay in the turn
+     registry so the log never gets two errors for one cause.
+  4. `abort` stops the model call, not a tool already executing; long work is
+     `run_task`, and `task_output { kill: true }` is how it is stopped.
