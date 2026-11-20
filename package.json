@@ -16,7 +16,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/unit/*.test.ts",
     "test:e2e": "node --experimental-strip-types --test tests/e2e/*.test.ts",
-    "test:all": "npm run typecheck && npm test && npm run test:e2e",
+    "test:contract": "node --experimental-strip-types --test tests/contract/*.test.ts",
+    "test:all": "npm run typecheck && npm test && npm run test:contract && npm run test:e2e",
     "ctrl": "node --experimental-strip-types src/cli/index.ts"
   },
   "keywords": [

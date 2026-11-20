@@ -1,0 +1,461 @@
+import assert from "node:assert/strict"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { createServer, request as httpRequest } from "node:http"
+import type { IncomingMessage, ServerResponse } from "node:http"
+import type { AddressInfo } from "node:net"
+import { tmpdir } from "node:os"
+import path from "node:path"
+import { after, before, test } from "node:test"
+import type { SessionEvent } from "../../src/engine/durable.ts"
+import { startServer, type RunningServer } from "../../src/server/server.ts"
+
+interface FakeToolCall {
+  name: string
+  arguments: Record<string, unknown>
+}
+
+interface FakeReply {
+  content?: string
+  toolCalls?: FakeToolCall[]
+  delayMs?: number
+}
+
+interface FakeRequestBody {
+  messages: Array<{ role: string; content: string }>
+  tools?: Array<{ type: string; function: { name: string } }>
+}
+
+interface FakeLlm {
+  url: string
+  bodies: FakeRequestBody[]
+  push(reply: FakeReply): void
+  reset(): void
+  close(): Promise<void>
+}
+
+async function startFakeLlm(): Promise<FakeLlm> {
+  const queue: FakeReply[] = []
+  const timers = new Set<ReturnType<typeof setTimeout>>()
+  const bodies: FakeRequestBody[] = []
+  let requests = 0
+
+  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
+    if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
+      response.writeHead(404).end()
+      return
+    }
+    const chunks: Buffer[] = []
+    request.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)))
+    request.on("end", () => {
+      requests += 1
+      try {
+        bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as FakeRequestBody)
+      } catch {
+
+      }
+      const reply = queue.shift() ?? { content: "(no further script)" }
+      const sendReply = () => {
+        if (response.destroyed || response.writableEnded) return
+        const toolCalls = reply.toolCalls?.map((call, index) => ({
+          id: `call-${requests}-${index}`,
+          type: "function",
+          function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+        }))
+        const payload = {
+          id: `chatcmpl-${requests}`,
+          object: "chat.completion",
+          created: 1_700_000_000,
+          model: "fake-model",
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: "assistant",
+                content: reply.content ?? "",
+                ...(toolCalls && toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+              },
+              finish_reason: toolCalls && toolCalls.length > 0 ? "tool_calls" : "stop",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }
+        response.writeHead(200, { "content-type": "application/json" })
+        response.end(JSON.stringify(payload))
+      }
+      if (reply.delayMs && reply.delayMs > 0) {
+        const timer = setTimeout(() => {
+          timers.delete(timer)
+          sendReply()
+        }, reply.delayMs)
+        timers.add(timer)
+      } else {
+        sendReply()
+      }
+    })
+  })
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const port = (server.address() as AddressInfo).port
+  return {
+    url: `http://127.0.0.1:${port}/v1`,
+    bodies,
+    push: (reply) => {
+      queue.push(reply)
+    },
+    reset: () => {
+      queue.length = 0
+      bodies.length = 0
+    },
+    close: async () => {
+      for (const timer of timers) clearTimeout(timer)
+      timers.clear()
+      server.closeAllConnections()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    },
+  }
+}
+
+interface Reply {
+  status: number
+  text: string
+  json: any
+}
+
+function request(port: number, method: string, requestPath: string, body?: unknown): Promise<Reply> {
+  return new Promise<Reply>((resolve, reject) => {
+    const payload = body === undefined ? undefined : JSON.stringify(body)
+    const req = httpRequest(
+      {
+        host: "127.0.0.1",
+        port,
+        method,
+        path: requestPath,
+        headers:
+          payload === undefined
+            ? {}
+            : { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
+      },
+      (response) => {
+        const chunks: Buffer[] = []
+        response.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)))
+        response.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8")
+          let json: unknown
+          try {
+            json = JSON.parse(text)
+          } catch {
+            json = undefined
+          }
+          resolve({ status: response.statusCode ?? 0, text, json })
+        })
+      },
+    )
+    req.on("error", reject)
+    if (payload !== undefined) req.write(payload)
+    req.end()
+  })
+}
+
+const AGENT = "contract"
+
+const FAKE_PI_SOURCE = `#!/bin/sh
+printf 'contract worker reporting in\\n'
+exit 0
+`
+
+interface Fixture {
+  running: RunningServer
+  fake: FakeLlm
+  root: string
+  workspace: string
+  binDir: string
+  piBin: string
+}
+
+let fixture: Fixture
+
+async function startCtrl(opts: { baseUrl: string; root: string; workspace: string; piBin: string }): Promise<RunningServer> {
+  return await startServer({
+    root: opts.root,
+    agent: AGENT,
+    workspace: opts.workspace,
+    port: 0,
+    host: "127.0.0.1",
+    maxSteps: 6,
+    dream: false,
+    piBin: opts.piBin,
+    piProvider: "any-endpoint",
+    maxWorkers: 3,
+    env: {
+      ...process.env,
+      PI_DURABLE_API_KEY: "{{SECRET_contract_key}}",
+      PI_DURABLE_BASE_URL: opts.baseUrl,
+      PI_DURABLE_MODEL: "fake-model",
+    },
+  })
+}
+
+before(async () => {
+  const fake = await startFakeLlm()
+  const root = await mkdtemp(path.join(tmpdir(), "ctrl-contract-root-"))
+  const workspace = await mkdtemp(path.join(tmpdir(), "ctrl-contract-work-"))
+  const binDir = await mkdtemp(path.join(tmpdir(), "ctrl-contract-bin-"))
+  const piBin = path.join(binDir, "pi")
+  await writeFile(piBin, FAKE_PI_SOURCE, { mode: 0o755 })
+  const running = await startCtrl({ baseUrl: fake.url, root, workspace, piBin })
+  fixture = { running, fake, root, workspace, binDir, piBin }
+})
+
+after(async () => {
+  await fixture.running.close()
+  await fixture.fake.close()
+  await rm(fixture.root, { recursive: true, force: true })
+  await rm(fixture.workspace, { recursive: true, force: true })
+  await rm(fixture.binDir, { recursive: true, force: true })
+})
+
+function api(method: string, requestPath: string, body?: unknown): Promise<Reply> {
+  return request(fixture.running.port, method, requestPath, body)
+}
+
+interface Stream {
+  events: SessionEvent[]
+  total: number
+  since: number
+  turn: { running: boolean; error?: string; aborted?: boolean; startedAt?: string }
+}
+
+async function eventsStream(query = ""): Promise<Stream> {
+  const reply = await api("GET", `/api/agent/events${query}`)
+  assert.equal(reply.status, 200, reply.text)
+  return reply.json as Stream
+}
+
+async function settle(timeoutMs = 10_000): Promise<Stream> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const snapshot = await eventsStream("?tail=1")
+    if (!snapshot.turn.running) return snapshot
+    if (Date.now() > deadline) throw new Error("turn did not finish in time")
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+
+async function send(text: string): Promise<Reply> {
+  return await api("POST", "/api/agent/messages", { text })
+}
+
+async function eventCount(): Promise<number> {
+  return (await eventsStream("?tail=1")).total
+}
+
+async function settledJobs(timeoutMs = 15_000): Promise<Array<Record<string, any>>> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const reply = await api("GET", "/api/jobs")
+    assert.equal(reply.status, 200, reply.text)
+    const jobs = reply.json.jobs as Array<Record<string, any>>
+    if (jobs.length > 0 && jobs.every((job) => job.state !== "running")) return jobs
+    if (Date.now() > deadline) throw new Error(`jobs never settled: ${JSON.stringify(jobs)}`)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
+const ALLOWED_EVENT_TYPES = [
+  "assistant_message",
+  "assistant_pending",
+  "compaction",
+  "error",
+  "memory_recall",
+  "memory_write",
+  "session_created",
+  "tool_call",
+  "tool_result",
+  "user_message",
+]
+
+test("GET /api/agent is exactly agent, session, resumePoint, turn, memory and context", async () => {
+  const reply = await api("GET", "/api/agent")
+  assert.equal(reply.status, 200, reply.text)
+  assert.deepEqual(Object.keys(reply.json).sort(), [
+    "agent",
+    "context",
+    "memory",
+    "resumePoint",
+    "session",
+    "turn",
+  ])
+  assert.equal(reply.json.agent, AGENT)
+  assert.deepEqual(Object.keys(reply.json.session).sort(), [
+    "createdAt",
+    "cwd",
+    "eventCount",
+    "lastSeq",
+    "model",
+    "sessionId",
+    "updatedAt",
+  ])
+  assert.equal(reply.json.session.sessionId, "main")
+  assert.equal(reply.json.session.cwd, fixture.workspace)
+  assert.equal(reply.json.session.eventCount, 1)
+  assert.equal(reply.json.session.lastSeq, 0)
+  assert.deepEqual(reply.json.resumePoint, { kind: "clean" })
+  assert.deepEqual(reply.json.turn, { running: false })
+  assert.deepEqual(Object.keys(reply.json.memory).sort(), ["focusOpen", "lastDreamAt", "memories"])
+  assert.deepEqual(reply.json.memory, { memories: 0, focusOpen: 0, lastDreamAt: null })
+  assert.deepEqual(Object.keys(reply.json.context).sort(), ["chars", "windowStart"])
+  assert.equal(reply.json.context.windowStart, 0)
+  assert.equal(reply.json.context.chars, 0)
+})
+
+test("focus, memories and dreams answer with an empty shape instead of 404", async () => {
+  const focus = await api("GET", "/api/focus")
+  assert.equal(focus.status, 200, focus.text)
+  assert.deepEqual(focus.json, { items: [] })
+
+  const memories = await api("GET", "/api/memories")
+  assert.equal(memories.status, 200, memories.text)
+  assert.deepEqual(memories.json, { memories: [], count: 0 })
+
+  const dreams = await api("GET", "/api/dreams")
+  assert.equal(dreams.status, 200, dreams.text)
+  assert.deepEqual(dreams.json, { runs: [] })
+})
+
+test("machines and sessions are always 404", async () => {
+  assert.equal((await api("GET", "/api/machines")).status, 404)
+  assert.equal((await api("GET", "/api/machines/box")).status, 404)
+  assert.equal((await api("POST", "/api/machines", {})).status, 404)
+  assert.equal((await api("DELETE", "/api/machines/box")).status, 404)
+  assert.equal((await api("GET", "/api/sessions")).status, 404)
+  assert.equal((await api("POST", "/api/sessions", { cwd: fixture.workspace })).status, 404)
+  assert.equal((await api("GET", "/api/sessions/main")).status, 404)
+  assert.equal((await api("GET", "/api/sessions/main/events?since=0")).status, 404)
+  assert.equal((await api("POST", "/api/sessions/main/messages", { text: "hi" })).status, 404)
+  assert.equal((await api("DELETE", "/api/sessions/main")).status, 404)
+  assert.equal((await api("GET", "/api/agents")).status, 404)
+})
+
+test("a message is accepted once with 202, refused with 409 while a turn runs and refused with 400 when empty", async () => {
+  fixture.fake.reset()
+  fixture.fake.push({ content: "still thinking", delayMs: 400 })
+
+  const accepted = await send("first")
+  assert.equal(accepted.status, 202, accepted.text)
+  assert.equal(accepted.json.accepted, true)
+  assert.equal(accepted.json.turn.running, true)
+  assert.equal(typeof accepted.json.turn.startedAt, "string")
+
+  const busy = await send("second")
+  assert.equal(busy.status, 409, busy.text)
+  assert.match(busy.json.error, /already running/)
+
+  await settle()
+
+  assert.equal((await send("   ")).status, 400)
+  assert.equal((await api("POST", "/api/agent/messages", {})).status, 400)
+  assert.equal((await api("POST", "/api/agent/messages", { text: 42 })).status, 400)
+  assert.equal((await api("GET", "/api/agent/messages")).status, 405)
+})
+
+test("the model is offered exactly seven tools under fixed names", async () => {
+  fixture.fake.reset()
+  fixture.fake.push({ content: "no tool needed" })
+  assert.equal((await send("which tools do you have?")).status, 202)
+  await settle()
+
+  const body = fixture.fake.bodies.at(-1)
+  assert.ok(body, "the fake model saw a request")
+  const names = (body.tools ?? []).map((tool) => tool.function.name)
+  assert.equal(names.length, 7)
+  assert.deepEqual(names.slice().sort(), [
+    "delegate",
+    "focus_set",
+    "job_status",
+    "job_stop",
+    "recall",
+    "remember",
+    "search_context",
+  ])
+})
+
+test("a delegated turn logs only the durable pi event types", async () => {
+  fixture.fake.reset()
+  fixture.fake.push({ toolCalls: [{ name: "delegate", arguments: { task: "say hello" } }] })
+  fixture.fake.push({ content: "the worker said hello" })
+  assert.equal((await send("delegate the greeting")).status, 202)
+  await settle()
+
+  const whole = await eventsStream("?since=0")
+  assert.ok(whole.total < 200, "the whole log has to fit on one page here")
+  assert.equal(whole.events[0]?.type, "session_created")
+  const types = new Set(whole.events.map((event) => event.type))
+  for (const type of types) {
+    assert.ok(ALLOWED_EVENT_TYPES.includes(type), `unexpected event type ${type}`)
+  }
+  assert.ok(types.has("user_message"))
+  assert.ok(types.has("assistant_message"))
+  assert.ok(types.has("tool_call"))
+  assert.ok(types.has("tool_result"))
+  whole.events.forEach((event, index) => assert.equal(event.seq, index))
+})
+
+test("GET /api/jobs reports exactly id, state, task, startedAt, elapsedMs and the optional code and output", async () => {
+  const jobs = await settledJobs()
+  assert.equal(jobs.length, 1)
+  const job = jobs[0] as Record<string, any>
+  const allowedKeys = ["id", "state", "task", "startedAt", "elapsedMs", "code", "output"]
+  for (const key of Object.keys(job)) assert.ok(allowedKeys.includes(key), `unexpected job key ${key}`)
+  assert.deepEqual(Object.keys(job).sort(), ["code", "elapsedMs", "id", "output", "startedAt", "state", "task"])
+  assert.equal(job.state, "exited")
+  assert.equal(job.code, 0)
+  assert.equal(job.task, "say hello")
+  assert.equal(typeof job.startedAt, "string")
+  assert.equal(typeof job.elapsedMs, "number")
+  assert.match(String(job.output), /contract worker reporting in/)
+  assert.equal((await api("POST", "/api/jobs", {})).status, 405)
+})
+
+test("event paging caps at 200, since returns the first seq and before outranks tail", async () => {
+  let guard = 0
+  while ((await eventCount()) < 210) {
+    guard += 1
+    assert.ok(guard <= 300, "the log never grew past 210 events")
+    fixture.fake.push({ content: `filler ${guard}` })
+    const reply = await send(`filler ${guard}`)
+    assert.equal(reply.status, 202, reply.text)
+    await settle()
+  }
+
+  const firstPage = await eventsStream("?since=0")
+  assert.equal(firstPage.events.length, 200)
+  assert.equal(firstPage.since, 0)
+  assert.equal(firstPage.events[0]?.seq, 0)
+
+  const capped = await eventsStream("?tail=100000")
+  const total = capped.total
+  assert.ok(total >= 210, `expected a long log, got ${total}`)
+  assert.equal(capped.events.length, 200)
+  assert.equal(capped.since, total - 200)
+  assert.deepEqual(
+    capped.events.map((event) => event.seq),
+    Array.from({ length: 200 }, (_, index) => total - 200 + index),
+  )
+
+  const fromSeq = await eventsStream("?since=150")
+  assert.equal(fromSeq.total, total)
+  assert.equal(fromSeq.since, 150)
+  assert.equal(fromSeq.events[0]?.seq, 150)
+
+  const shortTail = await eventsStream("?tail=3")
+  assert.deepEqual(shortTail.events.map((event) => event.seq), [total - 3, total - 2, total - 1])
+
+  const beforeWins = await eventsStream("?before=50&tail=3&since=1000")
+  assert.deepEqual(beforeWins.events.map((event) => event.seq), [47, 48, 49])
+  assert.equal(beforeWins.since, 47)
+  assert.equal(beforeWins.total, total)
+
+  const empty = await eventsStream("?before=0")
+  assert.deepEqual(empty.events, [])
+  assert.equal(empty.since, 0)
+})
