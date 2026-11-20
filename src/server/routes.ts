@@ -8,8 +8,14 @@
 //   * there is no sessions route: the log id is "main" and nobody may ask for another.
 //   * `/api/jobs` is read straight from disk, so a delegate card keeps updating
 //     long after the turn that started the worker has ended.
+//   * the memory routes (MEMORY.md §10.1 M4) are `/api/focus`, `/api/memories`,
+//     `/api/dreams` and `/api/dream`; deleting a memory or a focus item is a
+//     soft write, never a physical delete.
+//   * a broken memory database never takes the server down: search answers
+//     empty, the memory routes answer 503, and turns keep running.
 
 import type { IncomingMessage, ServerResponse } from "node:http"
+import type { DatabaseSync } from "node:sqlite"
 import {
   appendRecord,
   asAgentMemory,
@@ -30,7 +36,18 @@ import type {
 import type { JobRunner } from "../jobs/runner.ts"
 import { DEFAULT_LIST_LIMIT, listJobs, readJobLog } from "../jobs/store.ts"
 import type { JobView } from "../jobs/store.ts"
+import { listDreamRuns, lastDreamAt, runDream, type DreamController, type DreamLlm, type DreamResult } from "../memory/dream.ts"
+import { completeFocus, isFocusState, listFocus, openFocusCount, upsertFocus, type FocusItem } from "../memory/focus.ts"
 import { clampLimit, type MemoryIndex } from "../memory/index.ts"
+import {
+  addMemory,
+  isMemoryKind,
+  liveMemoryCount,
+  listMemories,
+  tombstoneMemory,
+  type MemoryRow,
+} from "../memory/memories.ts"
+import { DEFAULT_CONTEXT_BUDGET, compressWindow, windowInfo } from "../memory/window.ts"
 import { LOG_ID } from "./agents.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
 import { readSidecar } from "./sidecar.ts"
@@ -53,6 +70,10 @@ export interface AppContext {
   turns: TurnRegistry
   /** The SQLite mirror of the log (MEMORY.md §4); may be degraded, never absent. */
   memory: MemoryIndex
+  /** Characters the model's transcript may cost before M2 compresses it. */
+  contextBudget: number
+  /** The background dream (M3): one at a time, idle-gated, manually triggerable. */
+  dreams: DreamController
   tools: ToolSpec[]
   env: NodeJS.ProcessEnv
   createLlm: (model: string) => LlmClient
@@ -167,6 +188,137 @@ export async function handleApiRequest(
         ...(before !== undefined && before >= 0 ? { beforeSeq: before } : {}),
       })
       sendJson(response, 200, { query: q, hits, count: hits.length })
+      return true
+    }
+
+    if (segments[1] === "focus") {
+      const db = requireMemoryDb(ctx)
+      const id = segments[2]
+      if (segments[3] !== undefined) {
+        sendJson(response, 404, { error: "not found" })
+        return true
+      }
+      if (id === undefined) {
+        if (method === "GET") {
+          const items = listFocus(db, {
+            includeDone: url.searchParams.get("all") === "1",
+            limit: intParam(url.searchParams.get("limit")) ?? undefined,
+          })
+          sendJson(response, 200, { items: items.map(focusView) })
+          return true
+        }
+        if (method === "POST") {
+          const body = await readJson(request)
+          const text = typeof body.text === "string" ? body.text.trim() : undefined
+          const updateId = typeof body.id === "string" ? body.id.trim() : undefined
+          if ((text === undefined || text === "") && (updateId === undefined || updateId === "")) {
+            throw new HttpError(400, "text is required (or an id to update)")
+          }
+          if (body.state !== undefined && !isFocusState(body.state)) {
+            throw new HttpError(400, "state must be one of open, doing, blocked, done")
+          }
+          const item = upsertFocus(db, {
+            ...(updateId !== undefined && updateId !== "" ? { id: updateId } : {}),
+            ...(text !== undefined && text !== "" ? { text } : {}),
+            ...(body.state !== undefined ? { state: String(body.state) } : {}),
+            source: "user",
+          })
+          sendJson(response, 200, { item: focusView(item) })
+          return true
+        }
+        sendJson(response, 405, { error: `method ${method} not allowed` })
+        return true
+      }
+
+      if (method === "DELETE") {
+        const item = completeFocus(db, id)
+        if (item === undefined) throw new HttpError(404, "focus item not found")
+        sendJson(response, 200, { item: focusView(item) })
+        return true
+      }
+      sendJson(response, 405, { error: `method ${method} not allowed` })
+      return true
+    }
+
+    if (segments[1] === "memories") {
+      const db = requireMemoryDb(ctx)
+      const id = segments[2]
+      if (segments[3] !== undefined) {
+        sendJson(response, 404, { error: "not found" })
+        return true
+      }
+      if (id === undefined) {
+        if (method === "GET") {
+          const query = (url.searchParams.get("query") ?? "").trim()
+          const rows = listMemories(db, {
+            ...(query !== "" ? { query } : {}),
+            includeSuperseded: url.searchParams.get("all") === "1",
+            ...(intParam(url.searchParams.get("limit")) !== undefined
+              ? { limit: intParam(url.searchParams.get("limit")) as number }
+              : {}),
+          })
+          sendJson(response, 200, { memories: rows.map(memoryView), count: rows.length })
+          return true
+        }
+        if (method === "POST") {
+          const body = await readJson(request)
+          const text = typeof body.text === "string" ? body.text.trim() : ""
+          if (text === "") throw new HttpError(400, "text must be a non-empty string")
+          if (body.kind !== undefined && !isMemoryKind(body.kind)) {
+            throw new HttpError(400, "kind must be fact, preference, decision, event, or skill")
+          }
+          if (body.tags !== undefined && (!Array.isArray(body.tags) || body.tags.some((tag) => typeof tag !== "string"))) {
+            throw new HttpError(400, "tags must be an array of strings")
+          }
+          if (body.importance !== undefined && (typeof body.importance !== "number" || !Number.isFinite(body.importance))) {
+            throw new HttpError(400, "importance must be a number between 0 and 1")
+          }
+          const written = addMemory(db, {
+            text,
+            ...(body.kind !== undefined ? { kind: String(body.kind) } : {}),
+            ...(Array.isArray(body.tags) ? { tags: body.tags as string[] } : {}),
+            ...(typeof body.importance === "number" ? { importance: body.importance } : {}),
+          })
+          sendJson(response, 201, { memory: memoryView(written.memory) })
+          return true
+        }
+        sendJson(response, 405, { error: `method ${method} not allowed` })
+        return true
+      }
+
+      if (method === "DELETE") {
+        if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new HttpError(400, "invalid memory id")
+        // A tombstone, never a physical delete (MEMORY.md §10.1).
+        const row = tombstoneMemory(db, id)
+        if (row === undefined) throw new HttpError(404, "memory not found")
+        sendJson(response, 200, { deleted: id })
+        return true
+      }
+      sendJson(response, 405, { error: `method ${method} not allowed` })
+      return true
+    }
+
+    if (url.pathname === "/api/dreams") {
+      if (method !== "GET") {
+        sendJson(response, 405, { error: `method ${method} not allowed` })
+        return true
+      }
+      const db = requireMemoryDb(ctx)
+      const limit = intParam(url.searchParams.get("limit"))
+      sendJson(response, 200, { runs: listDreamRuns(db, limit !== undefined ? { limit } : {}) })
+      return true
+    }
+
+    if (url.pathname === "/api/dream") {
+      if (method !== "POST") {
+        sendJson(response, 405, { error: `method ${method} not allowed` })
+        return true
+      }
+      requireMemoryDb(ctx)
+      // The claim happens synchronously, so this check cannot race a start.
+      if (ctx.dreams.running) throw new HttpError(409, "a dream is already running")
+      void ctx.dreams.start()
+      sendJson(response, 202, { started: true })
       return true
     }
 
@@ -305,6 +457,8 @@ function describeAgent(ctx: AppContext): Record<string, unknown> {
   const events = log.events()
   const meta = log.meta()
   const sidecar = readSidecar(ctx.agentHome, LOG_ID)
+  const db = ctx.memory.handle()
+  const window = windowInfo(events)
   return {
     agent: ctx.agent,
     session: {
@@ -315,6 +469,31 @@ function describeAgent(ctx: AppContext): Record<string, unknown> {
     },
     resumePoint: detectResumePoint(events),
     turn: ctx.turns.state(LOG_ID),
+    // MEMORY.md §10.1 M4: the panel's numbers, in the one call it already polls.
+    // A degraded database answers with zeros rather than failing the page.
+    memory: {
+      memories: db === undefined ? 0 : safeCount(() => liveMemoryCount(db)),
+      focusOpen: db === undefined ? 0 : safeCount(() => openFocusCount(db)),
+      lastDreamAt: db === undefined ? null : (safeMeta(() => lastDreamAt(db)) ?? null),
+    },
+    context: { windowStart: window.windowStart, chars: window.chars },
+  }
+}
+
+/** A count that a broken table must not turn into a 500 for the page. */
+function safeCount(read: () => number): number {
+  try {
+    return read()
+  } catch {
+    return 0
+  }
+}
+
+function safeMeta(read: () => string | undefined): string | undefined {
+  try {
+    return read()
+  } catch {
+    return undefined
   }
 }
 
@@ -391,6 +570,22 @@ async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: 
     throw error
   }
 
+  // MEMORY.md §5 §10.1 M2: bring the window back under the budget *before* the
+  // engine reads it. This is the only compactor: the engine's own is switched
+  // off below (`compactThreshold: MAX_SAFE_INTEGER`). compressWindow never
+  // throws and never blocks the turn — a failed summary means the turn runs
+  // with the window it already has.
+  try {
+    await compressWindow(log, {
+      llm: createAbortableLlm(base, signal),
+      budget: ctx.contextBudget,
+      ...(ctx.memory.handle() !== undefined ? { db: ctx.memory.handle() } : {}),
+      signal,
+    })
+  } catch {
+    // Belt and braces: nothing about a summary may stop a turn.
+  }
+
   const before = log.events().length
   try {
     await runAgent({
@@ -402,6 +597,9 @@ async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: 
       tools: ctx.tools,
       cwd,
       maxSteps: ctx.maxSteps,
+      // MEMORY.md §10.1: ctrl decides when to compress (see above), so the
+      // engine's own threshold is pushed out of reach.
+      compactThreshold: Number.MAX_SAFE_INTEGER,
       // ctrl has no hands (CONTRACT §2): the engine still takes the flag, but
       // nothing in the tool set can reach it.
       allowBash: false,
@@ -463,4 +661,62 @@ function intParam(value: unknown): number | undefined {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+// ---------------------------------------------------------------------------
+// focus / memories / dreams — the M4 routes' two shapes and one guard
+// ---------------------------------------------------------------------------
+
+/** MEMORY.md §10.1: exactly the five fields the panel reads. */
+function focusView(item: FocusItem): Record<string, unknown> {
+  return { id: item.id, text: item.text, state: item.state, updatedAt: item.updatedAt, seq: item.seq ?? null }
+}
+
+/** MEMORY.md §4's columns, in the model's casing; `supersededBy` is the tombstone chain. */
+function memoryView(row: MemoryRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    kind: row.kind,
+    text: row.text,
+    tags: row.tags,
+    importance: row.importance,
+    confidence: row.confidence,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    ...(row.supersededBy !== undefined ? { supersededBy: row.supersededBy } : {}),
+    ...(row.sourceFrom !== undefined ? { sourceFrom: row.sourceFrom } : {}),
+    ...(row.sourceTo !== undefined ? { sourceTo: row.sourceTo } : {}),
+  }
+}
+
+/**
+ * The memories/focus/dream tables live in the same database as the mirror.
+ * When it could not be opened the server still serves turns and the page —
+ * these four routes are the only ones that answer 503.
+ */
+function requireMemoryDb(ctx: AppContext): DatabaseSync {
+  const db = ctx.memory.handle()
+  if (db === undefined) throw new HttpError(503, `memory database unavailable${ctx.memory.error !== undefined ? `: ${ctx.memory.error}` : ""}`)
+  return db
+}
+
+/**
+ * One dream, built from the live context (MEMORY.md §10.1 M3): the log as it is
+ * now, the database, and a client created lazily.
+ *
+ * `createLlm` throws when there is no API key; creating the client inside
+ * `complete` means that failure lands in runDream's error path and is recorded
+ * in `dream_runs` like any other failed dream.
+ */
+export async function dreamOnce(ctx: AppContext): Promise<DreamResult> {
+  const db = requireMemoryDb(ctx)
+  const log = openSession(LOG_ID, { home: ctx.agentHome })
+  const model = log.meta().model !== "" ? log.meta().model : ctx.defaultModel
+  const llm: DreamLlm = {
+    complete: async (request) => {
+      const client = ctx.createLlm(model)
+      return await client.complete(request)
+    },
+  }
+  return await runDream({ db, agentHome: ctx.agentHome, events: log.events(), llm })
 }

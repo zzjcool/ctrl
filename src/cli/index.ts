@@ -4,6 +4,7 @@
 //   node --experimental-strip-types src/cli/index.ts --agent builder
 //   node --experimental-strip-types src/cli/index.ts agent new builder --model workbuddy/deepseek-v4.1-flash
 //   node --experimental-strip-types src/cli/index.ts agent list
+//   node --experimental-strip-types src/cli/index.ts dream --agent builder
 //
 // There is no `--home`, no session id and no `--machine` anywhere: an agent is
 // a directory under `--root`, and work happens in the pi workers it delegates
@@ -11,14 +12,20 @@
 
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
+import { createChatCompletionsClient } from "../engine/durable.ts"
+import { runDream } from "../memory/dream.ts"
+import { createMemoryIndex } from "../memory/index.ts"
+import { DEFAULT_CONTEXT_BUDGET } from "../memory/window.ts"
 import {
   DEFAULT_AGENT,
   AgentError,
   agentHome,
+  ensureAgent,
   isAgentName,
   listAgents,
   logPath,
   newAgent,
+  openAgentLog,
   removeAgent,
   resolveRoot,
 } from "../server/agents.ts"
@@ -32,7 +39,7 @@ import {
 } from "../server/server.ts"
 import { DEFAULT_MAX_WORKERS, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER } from "../jobs/runner.ts"
 
-export type Mode = "serve" | "agent-list" | "agent-new" | "agent-rm" | "help" | "version"
+export type Mode = "serve" | "agent-list" | "agent-new" | "agent-rm" | "dream" | "help" | "version"
 
 interface Flags {
   mode: Mode
@@ -50,6 +57,8 @@ interface Flags {
   /** How many workers may run at once. */
   maxWorkers: number
   maxSteps: number
+  /** Characters of transcript the model sees before M2 compresses (MEMORY.md §10.1). */
+  contextBudget?: number
   /** Undefined means "let the server resolve": PI_DURABLE_MODEL, then the default. */
   model?: string
   reasoningEffort?: string
@@ -68,6 +77,7 @@ Usage:
   ctrl agent list [--root <dir>] [--json]
   ctrl agent new <name> [--model <id>] [--root <dir>] [--json]
   ctrl agent rm <name> [--root <dir>] [--purge]
+  ctrl dream [--agent <name>] [--root <dir>] [--json]
 
 Serve options:
   --agent <name>     the agent to serve (default ${DEFAULT_AGENT}); its directory
@@ -78,6 +88,9 @@ Serve options:
   --pi-provider <p>  provider a worker passes to pi (default ${DEFAULT_PI_PROVIDER})
   --max-workers <n>  how many workers may run at once (default ${DEFAULT_MAX_WORKERS})
   --max-steps <n>    tool-loop budget per turn (default ${DEFAULT_MAX_STEPS})
+  --context-budget <n>
+                     characters of transcript the model sees before the oldest
+                     half is compressed into a summary (default ${DEFAULT_CONTEXT_BUDGET})
   --model <id>       model for a brand-new log (default workbuddy/deepseek-v4.1-flash,
                      or $PI_DURABLE_MODEL); afterwards the log decides
   --reasoning-effort <level>
@@ -87,6 +100,10 @@ Serve options:
   --host <addr>      address to bind (default ${DEFAULT_HOST})
   --help             show this message
   --version          show the version
+
+Dream:
+  ctrl dream         run one consolidation pass now (MEMORY.md §7): read the new
+                     events, write memories/focus, rewrite profile.md if needed
 
 Agent commands:
   list               every agent under <root>/agents
@@ -123,6 +140,9 @@ export function parseArgs(argv: string[]): Flags {
       throw new UsageError(`unknown agent subcommand: ${sub}`)
     }
     flags.mode = `agent-${sub}` as Mode
+  } else if (first === "dream") {
+    rest.shift()
+    flags.mode = "dream"
   } else if (first !== undefined && !first.startsWith("-")) {
     // An optional `serve` subcommand, so `ctrl` and `ctrl serve` both work.
     if (first !== "serve") throw new UsageError(`unknown command: ${first}`)
@@ -181,6 +201,9 @@ export function parseArgs(argv: string[]): Flags {
         break
       case "--max-steps":
         flags.maxSteps = integer(value(), "--max-steps", 1, 200)
+        break
+      case "--context-budget":
+        flags.contextBudget = integer(value(), "--context-budget", 1_000, 1_000_000)
         break
       case "--model":
         flags.model = word(value(), "--model")
@@ -287,6 +310,8 @@ async function main(argv: string[]): Promise<number> {
       return newCommand(flags)
     case "agent-rm":
       return removeCommand(flags)
+    case "dream":
+      return await dreamCommand(flags)
     case "serve":
       return serveCommand(flags)
   }
@@ -383,6 +408,79 @@ function report(error: unknown): number {
 }
 
 // ---------------------------------------------------------------------------
+// ctrl dream (MEMORY.md §7 §10.1 M3)
+// ---------------------------------------------------------------------------
+
+/**
+ * One dream, by hand.
+ *
+ * Same code path the idle timer takes (`runDream`): the batch is everything
+ * after `meta.last_dream_seq`, the model is the agent's own, and the writes go
+ * through the same transaction. A failure is reported on stderr and in
+ * `dream_runs`, and exits 1 without touching the data.
+ */
+async function dreamCommand(flags: Flags): Promise<number> {
+  let ensured
+  try {
+    const root = rootOf(flags)
+    ensured = ensureAgent({
+      root,
+      name: flags.agent,
+      cwd: flags.workspace ?? process.cwd(),
+      model: resolveModel(flags),
+    })
+  } catch (error) {
+    return report(error)
+  }
+
+  // The index owns the one connection to memory.db; the dream writes through it.
+  const memory = createMemoryIndex({ agentHome: ensured.home, eventsFile: logPath(ensured.home) })
+  try {
+    const db = memory.handle()
+    if (db === undefined) {
+      process.stderr.write(`ctrl: memory database unavailable: ${memory.error ?? "not open"}\n`)
+      return 1
+    }
+    // Catch the mirror up first: the dream's idle check reads last_indexed_seq,
+    // and a manual run should never dream about a log the index has not seen.
+    memory.importEvents()
+
+    const log = openAgentLog(ensured.home)
+    const model = log.meta().model !== "" ? log.meta().model : resolveModel(flags)
+    const llm = {
+      complete: async (request: Parameters<ReturnType<typeof createChatCompletionsClient>["complete"]>[0]) => {
+        const client = createChatCompletionsClient({
+          model,
+          env: process.env,
+          ...(flags.reasoningEffort !== undefined ? { reasoningEffort: flags.reasoningEffort } : {}),
+        })
+        return await client.complete(request)
+      },
+    }
+
+    const result = await runDream({ db, agentHome: ensured.home, events: log.events(), llm })
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
+    } else if (result.error !== undefined) {
+      process.stderr.write(`ctrl: dream failed: ${result.error}\n`)
+    } else if (result.skipped === true) {
+      process.stdout.write(`nothing new since seq ${result.fromSeq} — no dream needed\n`)
+    } else {
+      process.stdout.write(
+        `dream ${result.id}\n` +
+          `  events: ${result.batchEvents} (seq ${result.fromSeq}..${result.toSeq})\n` +
+          `  memories: +${result.added} added, ${result.merged} merged, ${result.superseded} superseded\n` +
+          `  focus: ${result.focus} item(s) updated\n` +
+          `  profile: ${result.profileRewritten ? "rewritten (old version in profile.history/)" : "unchanged"}\n`,
+      )
+    }
+    return result.error === undefined ? 0 : 1
+  } finally {
+    memory.close()
+  }
+}
+
+// ---------------------------------------------------------------------------
 // ctrl [serve]
 // ---------------------------------------------------------------------------
 
@@ -410,6 +508,7 @@ async function serveCommand(flags: Flags): Promise<number> {
       piProvider: flags.piProvider,
       maxWorkers: flags.maxWorkers,
       maxSteps: flags.maxSteps,
+      ...(flags.contextBudget !== undefined ? { contextBudget: flags.contextBudget } : {}),
       ...(flags.model !== undefined ? { model: flags.model } : {}),
       ...(flags.reasoningEffort !== undefined ? { reasoningEffort: flags.reasoningEffort } : {}),
     })
@@ -434,6 +533,7 @@ async function serveCommand(flags: Flags): Promise<number> {
       `  model: ${model}\n` +
       `  pi bin: ${running.ctx.jobs.piBin} (provider ${running.ctx.jobs.piProvider || "default"})\n` +
       `  max workers: ${running.ctx.jobs.maxWorkers}\n` +
+      `  context budget: ${running.ctx.contextBudget} chars\n` +
       `  directory: ${running.ctx.agentHome}\n`,
   )
 

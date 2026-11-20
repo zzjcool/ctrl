@@ -8,14 +8,17 @@
 import { createServer } from "node:http"
 import type { IncomingMessage, Server, ServerResponse } from "node:http"
 import { fileURLToPath } from "node:url"
-import { createChatCompletionsClient } from "../engine/durable.ts"
+import { createChatCompletionsClient, openSession } from "../engine/durable.ts"
 import type { LlmClient } from "../engine/durable.ts"
 import { DEFAULT_MAX_WORKERS, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER, JobRunner } from "../jobs/runner.ts"
+import { lastIndexedSeq } from "../memory/db.ts"
+import { DREAM_IDLE_MS, DREAM_TICK_MS, DreamController, lastDreamSeq } from "../memory/dream.ts"
 import { createMemoryIndex } from "../memory/index.ts"
+import { DEFAULT_CONTEXT_BUDGET } from "../memory/window.ts"
 import { createTools } from "../tools/index.ts"
 import { DEFAULT_AGENT, LOG_ID, ensureAgent, logPath, resolveRoot } from "./agents.ts"
 import { sendJson, serveStatic } from "./http.ts"
-import { handleApiRequest, type AppContext } from "./routes.ts"
+import { dreamOnce, handleApiRequest, type AppContext } from "./routes.ts"
 import { readSidecar, writeSidecar } from "./sidecar.ts"
 import { TurnRegistry } from "./turns.ts"
 
@@ -48,6 +51,14 @@ export interface ServerConfig {
   reasoningEffort?: string
   /** Completion cap per model call. */
   maxTokens?: number
+  /** Characters the model's transcript may cost before M2 compresses it. */
+  contextBudget?: number
+  /** Idle time before the background dream fires; defaults to DREAM_IDLE_MS (10 min). */
+  dreamIdleMs?: number
+  /** How often the idle check runs; defaults to DREAM_TICK_MS (60 s). */
+  dreamIntervalMs?: number
+  /** Turn the background dream off entirely (tests that must not call a model). */
+  dream?: boolean
   /** The `pi` binary a worker is spawned as. Defaults to `pi` on PATH. */
   piBin?: string
   /** Provider a worker is told to use; `pi -p` is ambiguous without one. */
@@ -81,6 +92,10 @@ export function buildContext(config: ServerConfig = {}): AppContext {
   const maxSteps = Number.isFinite(config.maxSteps) && (config.maxSteps ?? 0) > 0
     ? Math.floor(config.maxSteps as number)
     : DEFAULT_MAX_STEPS
+  const contextBudget =
+    Number.isFinite(config.contextBudget) && (config.contextBudget ?? 0) > 0
+      ? Math.floor(config.contextBudget as number)
+      : DEFAULT_CONTEXT_BUDGET
 
   // One agent, resolved before anything else: `agents/<name>/` either exists
   // (we open its log) or is created with agent.json and an empty log.
@@ -117,7 +132,7 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     thinking: reasoningEffort,
   })
 
-  return {
+  const ctx: AppContext = {
     root,
     agent: agentName,
     agentHome: ensured.home,
@@ -127,12 +142,59 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     jobs: runner,
     turns: new TurnRegistry(),
     memory,
+    contextBudget,
+    // Replaced right below, once the context object exists: a dream reads the
+    // log, the database and the turn registry — the same three things every
+    // request reads — so it is built from the finished context, not before it.
+    dreams: undefined as unknown as DreamController,
     tools: createTools({ agentHome: ensured.home, runner, memory }),
     env,
     createLlm:
       config.createLlm ??
       ((requested: string) =>
         createChatCompletionsClient({ model: requested || model, env, reasoningEffort, maxTokens })),
+  }
+
+  // MEMORY.md §10.1 M3: one dream at a time, at most every 60 s, only when the
+  // agent has been idle for ten minutes and the log has moved since the last
+  // dream. `startTimer()` is called by startServer, never by buildContext: a
+  // timer in a context a test builds and drops would outlive the test.
+  ctx.dreams = new DreamController({
+    run: () => dreamOnce(ctx),
+    hasWork: () => {
+      const db = memory.handle()
+      if (db === undefined) return false
+      try {
+        return lastIndexedSeq(db) > lastDreamSeq(db)
+      } catch {
+        return false
+      }
+    },
+    busy: () => ctx.turns.isRunning(LOG_ID),
+    lastActivity: () => lastActivityMs(ctx.agentHome),
+    idleMs:
+      Number.isFinite(config.dreamIdleMs) && (config.dreamIdleMs ?? 0) >= 0
+        ? Math.floor(config.dreamIdleMs as number)
+        : DREAM_IDLE_MS,
+    intervalMs:
+      Number.isFinite(config.dreamIntervalMs) && (config.dreamIntervalMs ?? 0) > 0
+        ? Math.floor(config.dreamIntervalMs as number)
+        : DREAM_TICK_MS,
+    warn: (message) => process.stderr.write(`${message}\n`),
+  })
+  return ctx
+}
+
+/** When something last happened in this agent's log, in ms; undefined when unknown. */
+function lastActivityMs(agentHome: string): number | undefined {
+  try {
+    const log = openSession(LOG_ID, { home: agentHome })
+    const last = log.events().at(-1)
+    if (last === undefined) return undefined
+    const at = Date.parse(last.ts)
+    return Number.isFinite(at) ? at : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -164,12 +226,24 @@ export async function startServer(config: ServerConfig = {}): Promise<RunningSer
   })
   const address = server.address()
   const port = typeof address === "object" && address !== null ? address.port : requestedPort
+  // MEMORY.md §7: a timer inside the process, plus one catch-up check at start —
+  // an agent that has been idle since ctrl was last closed gets its dream as
+  // soon as the server is up. Both are gated by the same idle rule, so a fresh
+  // agent never dreams about nothing.
+  if (config.dream !== false) {
+    ctx.dreams.startTimer()
+    ctx.dreams.tick()
+  }
   return {
     server,
     ctx,
     port,
     url: `http://${host}:${port}`,
     close: async () => {
+      // The dream's timer must not keep the process (or a test) alive, and a
+      // dream in flight must not be cut in half while the database closes.
+      ctx.dreams.stopTimer()
+      await ctx.dreams.settle()
       // Workers are detached on purpose: closing ctrl does not cancel a job.
       await ctx.turns.shutdown()
       await new Promise<void>((resolve) => {
