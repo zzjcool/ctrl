@@ -22,6 +22,37 @@ Three planes:
 
 One sentence: **the line stays here, the work goes there.**
 
+## 0.1 The page is the product (frozen, R2)
+
+ctrl ships **one page: a conversation**. Not an ops console, not a dashboard,
+not a terminal grid. If a feature cannot be shown inside the chat surface, it is
+not v1.
+
+The page has exactly four parts:
+
+1. **Conversation** — messages, inline tool cards, streaming by log tail.
+2. **Composer** — one input, plus a machine chip (`local` / `hw-nj` / …).
+3. **Session rail** — conversations from the durable log, newest first.
+4. **Status strip** — model, session id, event count, recovery badge.
+
+Everything remote appears **inside a tool card**, never in a separate panel:
+which machine ran it, how long, exit code, output (collapsed), stop button while
+it runs.
+
+### The session log is the stream (frozen)
+
+`runAgent()` is buffered today. ctrl does **not** add token streaming to
+pi-durable and does **not** reimplement the loop. Instead:
+
+- `POST /api/sessions/:id/messages` starts a turn in the background and returns
+  `202` immediately with the current event count.
+- The browser tails `GET /api/sessions/:id/events?since=<n>`.
+- Tool cards appear **as they are appended** — which is exactly when they become
+  durable. If the browser closes, the turn keeps running; reopening replays it.
+
+This is why recovery needs no extra machinery: the transport and the source of
+truth are the same file.
+
 ## 1. Layer ownership (frozen)
 
 | Layer | Product | Responsibility |
@@ -151,13 +182,27 @@ Recommendation: **A** for v1 (correctness over disk), revisit when repos get big
 - Never wait on a terminal from the agent loop without a deadline; the loop
   records `assistant_pending`/tool call before waiting.
 
-## 8. Web surface (D6)
+## 8. Web surface (D6, R2)
 
 - `node:http`, zero deps, loopback by default (`127.0.0.1:7333`), optional
   `--token`; no CORS, no cookies, no accounts.
-- Views: **chat**, **sessions**, **machines/terminals**, **memory**.
-- API: `/api/health`, `/api/sessions`, `/api/chat` (send), `/api/stream` (SSE),
-  `/api/machines`, `/api/terminals/:addr/read`, `/api/memory`.
+- **One page** (§0.1): conversation, composer with a machine chip, session rail,
+  status strip. No machine or terminal panel.
+- API:
+
+  | Method & path | Purpose |
+  | --- | --- |
+  | `GET /api/health` | liveness |
+  | `GET /api/sessions` · `POST /api/sessions` | rail |
+  | `GET /api/sessions/:id` | meta + full event list |
+  | `GET /api/sessions/:id/events?since=N` | **the stream** (poll, cheap) |
+  | `POST /api/sessions/:id/messages` | `202`; runs the turn in the background; `409` if a turn is already in flight |
+  | `POST /api/sessions/:id/abort` | stop the current turn |
+  | `GET /api/memory` · `POST /api/memory` · `DELETE /api/memory/:id` | memory |
+  | `GET /api/machines` | `machine.list` (M2) |
+  | `GET /api/tasks/:addr/stream` | SSE tail of a long task (M4 only) |
+
+- One turn per session at a time (a lock in the server, not in the browser).
 - Every herdr method exposed to the browser must be **whitelisted**; `machine.add`,
   `machine.rm`, `terminal.attach`, `terminal.kill` stay CLI-only in v1.
 - The web process is the only thing holding the `hc connect` pipe.
@@ -191,8 +236,29 @@ schema change is needed now.
 | D3 | remote workdir layout | `~/.ctrl/<sessionId>/` per session |
 | D-a | web auth: loopback only vs `--token` | loopback + optional token |
 | D-b | v1 scope: commands only vs also launch agents | commands only |
+| D-d | M1 starts from pi-durable's existing web app (re-skinned) vs a fresh UI | reuse its routes/loop, rewrite the page |
 | D-c | which LLM/provider | same as pi-durable (`workbuddy/hy4-preview-ioa`, key from `~/.pi/agent/auth.json`) |
 
-## 12. Revisions
+## 12. Milestones — product order (frozen, R2)
+
+The page comes first; the hands come second. Every milestone ends with something
+visible in the chat, not with a library.
+
+| # | Deliverable | Acceptance (visible in the page) |
+| --- | --- | --- |
+| **M1** | ctrl chat page: pi-durable loop behind it, local executor, log-tail streaming, tool cards | 打开页面聊一轮：消息逐条出现，工具卡片即时出现，刷新不丢 |
+| **M2** | herdr executor + machine chip + machine badge on every tool card | 选择 `hw-nj`，让它 `go build`，卡片上写着“hw-nj · 42s · exit 0” |
+| **M3** | write-through + manifest delta + lazy pull | 改一个文件只推一个；远端生成的 `go.sum` 本地能读到 |
+| **M4** | `run_task` long tasks + live tail + stop | 10 分钟构建有实时输出，可停止；关掉浏览器仍在跑 |
+| **M5** | crash resume + terminal reattach + cross-session memory | `kill -9` 后重开页面，对话完整，活终端能接上，死终端诚实报丢 |
+
+M1 must not import herdr at all. M2 must not require M3 for read-only work
+(`exec` + `read` only). This keeps every step shippable.
+
+## 13. Revisions
 
 - **R1** — project started. Repo `zzjcool/ctrl`. Name story: the broken Ctrl key.
+- **R2** — product surface clarified by the owner: a single conversation page is
+  the product; herdr/pi-durable are the substrate. Milestone order flipped from
+  executor-first to page-first, and the log-tail streaming decision replaced a
+  token-streaming change to pi-durable.

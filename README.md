@@ -6,15 +6,13 @@
 **Ctrl 是一个持久对话的 agent 控制台。** 对话、记忆、会话日志留在本地；文件读写和命令执行发生在 herdr core 能到达的任何机器上——目标机不需要 node、不需要 agent、不需要装任何运行时。
 
 ```text
-本地 Mac                                   远端机器（hw-nj / 临时沙箱 / 任何 herdr 能到的）
-┌─────────────────────────────┐            ┌──────────────────────────────┐
-│ 浏览器                       │            │  go build / npm test / dev   │
-│   │                          │            │        ▲                     │
-│   ▼                          │            │        │                     │
-│ ctrl  ── 对话 / 记忆 / 事件   │            │   machine.exec               │
-│   │      (pi-durable)        │            │   file.read / file.write     │
-│   └── Executor ──── hc connect ── JSON-RPC ──►  terminal.run / wait / read │
-└─────────────────────────────┘            └──────────────────────────────┘
+浏览器（唯一的界面：一个对话页）
+   │  消息 / 工具卡片 / 机器 chip
+   ▼
+ctrl  ── 对话 + 记忆 + 事件（pi-durable 的 append-only 日志就是流）
+   │
+   └── Executor ──── hc connect（JSON-RPC）────►  远端机器
+                                                 go build / npm test / dev
 ```
 
 ## 它解决什么
@@ -26,7 +24,9 @@
 
 ## 现状
 
-**M0：立项。** 契约草案在 [docs/CONTRACT.md](docs/CONTRACT.md)，还有几个待确认的决策（标 🔴）。代码尚未开始。
+**M1 在即：先做那张对话页。** 契约见 [docs/CONTRACT.md](docs/CONTRACT.md)（§0.1 定义产品只有一张页面，§12 定义从页面到远端的顺序）。
+
+计划顺序：**页面 → 远程执行 → 同步 → 长任务 → 恢复**。每一步都以“能在页面上看见”为验收，不交付看不到的库。
 
 ## 和兄弟项目的关系
 
