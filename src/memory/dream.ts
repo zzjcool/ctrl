@@ -20,7 +20,7 @@ export const META_LAST_DREAM_AT = "last_dream_at"
 export const DREAM_MAX_EVENTS = 40
 export const DREAM_MAX_CHARS = 12_000
 
-export const DREAM_MAX_TOKENS = 1_500
+export const DREAM_MAX_TOKENS = 3_000
 
 export const DREAM_EXISTING_MEMORIES = 8
 
@@ -303,7 +303,12 @@ export function parseDreamPayload(text: string): DreamPayload | undefined {
     const id = typeof draft.id === "string" && draft.id.trim() !== "" ? draft.id.trim() : undefined
     const body = typeof draft.text === "string" && draft.text.trim() !== "" ? draft.text.trim() : undefined
     if (id === undefined && body === undefined) continue
-    const state = typeof draft.state === "string" ? draft.state.trim() : undefined
+    const state =
+      typeof draft.state === "string"
+        ? draft.state.trim()
+        : typeof draft.status === "string"
+          ? draft.status.trim()
+          : undefined
     focus.push({
       ...(body !== undefined ? { text: clipChars(body, 500) } : {}),
       ...(state !== undefined ? { state } : {}),
