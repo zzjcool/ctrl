@@ -1676,3 +1676,76 @@ body {
   opacity: 0.6;
   font-weight: 600;
 }
+
+.row-agent .prose h1,
+.row-agent .prose h2,
+.row-agent .prose h3,
+.row-agent .prose h4 {
+  margin: 14px 0 6px;
+  color: var(--fg);
+  font-weight: 620;
+  line-height: 1.35;
+}
+
+.row-agent .prose h1:first-child,
+.row-agent .prose h2:first-child,
+.row-agent .prose h3:first-child {
+  margin-top: 0;
+}
+
+.row-agent .prose h1 { font-size: 1.32em; }
+.row-agent .prose h2 { font-size: 1.18em; }
+.row-agent .prose h3 { font-size: 1.06em; }
+.row-agent .prose h4 { font-size: 0.98em; color: var(--fg-dim); }
+
+.row-agent .prose strong {
+  color: var(--fg);
+  font-weight: 640;
+}
+
+.row-agent .prose em {
+  font-style: italic;
+}
+
+.row-agent .prose ul,
+.row-agent .prose ol {
+  margin: 0 0 8px;
+  padding-left: 1.25em;
+}
+
+.row-agent .prose li {
+  margin: 2px 0;
+}
+
+.row-agent .prose li > ul,
+.row-agent .prose li > ol {
+  margin: 2px 0;
+}
+
+.row-agent .prose blockquote {
+  margin: 0 0 8px;
+  padding: 2px 0 2px 10px;
+  border-left: 2px solid var(--line-strong);
+  color: var(--fg-dim);
+}
+
+.row-agent .prose a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.row-agent .prose hr {
+  margin: 12px 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.row-agent .prose :not(pre) > code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--fg-body);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
