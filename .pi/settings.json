@@ -1,0 +1,11 @@
+{
+  "httpIdleTimeoutMs": 90000,
+  "retry": {
+    "enabled": true,
+    "maxRetries": 2,
+    "provider": {
+      "timeoutMs": 90000,
+      "maxRetries": 1
+    }
+  }
+}
