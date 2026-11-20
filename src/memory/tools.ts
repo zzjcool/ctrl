@@ -16,6 +16,7 @@ import type { JsonSchema, ToolResult, ToolSpec } from "../engine/durable.ts"
 import { errorMessage } from "./events.ts"
 import { FOCUS_STATES, isFocusState, upsertFocus, type FocusItem } from "./focus.ts"
 import { DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, type MemoryHit, type MemoryIndex } from "./index.ts"
+import { searchMemories, type MemoryRow } from "./memories.ts"
 
 /** `2026-11-20T07:52:56.123Z` → `2026-11-20 07:52:56`; anything else is left alone. */
 export function formatEventTime(ts: string): string {
@@ -41,10 +42,29 @@ export function pagingHint(oldestSeq: number): string {
   return `(older: search_context with before=${oldestSeq})`
 }
 
+/**
+ * A memory hit as one line — `memory` where an event would print its type, and
+ * the memory id in place of a seq (a memory is not a log position).
+ */
+export function renderMemoryHit(row: MemoryRow): string {
+  const at = formatEventTime(row.updatedAt !== "" ? row.updatedAt : row.createdAt)
+  return `[${at} memory ${row.id}] ${row.text.replace(/\s+/g, " ").trim()}`
+}
+
+/** How many memories ride along with an event search (they are conclusions, not pages). */
+export const MEMORY_RESULT_LIMIT = 3
+
 export interface SearchContextOptions {
   index: MemoryIndex
+  /**
+   * The `memories` table (`MemoryIndex.handle()`), so a search finds what the
+   * agent concluded and not only what was said. Undefined when degraded.
+   */
+  db?: DatabaseSync
   /** Override the default page size (tests). */
   defaultLimit?: number
+  /** Override how many memories are listed with a search (tests). */
+  memoryLimit?: number
 }
 
 function schema(properties: Record<string, unknown>, required: string[] = []): JsonSchema {
@@ -64,10 +84,11 @@ export function createSearchContextTool(opts: SearchContextOptions): ToolSpec {
   return {
     name: "search_context",
     description:
-      "Search your entire history — every past user message, reply, tool call and tool result — by substring, " +
-      "newest/most-relevant first. Use it when the user refers to something that is not in the recent context " +
-      "('what did we decide about X last week', 'the file you mentioned earlier'). " +
-      `Each hit is one line: [timestamp seq N kind] snippet. Page older results with before=<the smallest seq returned>.`,
+      "Search your entire history — every past user message, reply, tool call and tool result — and your memories, " +
+      "by substring, newest/most-relevant first. Use it when the user refers to something that is not in the recent " +
+      "context ('what did we decide about X last week', 'the file you mentioned earlier'). " +
+      "Each hit is one line: [timestamp seq N kind] snippet, or [timestamp memory id] for a memory. " +
+      `Page older results with before=<the smallest seq returned>.`,
     parameters: schema(
       {
         query: {
@@ -108,11 +129,18 @@ export function createSearchContextTool(opts: SearchContextOptions): ToolSpec {
         limit,
         ...(before !== undefined && before >= 0 ? { beforeSeq: before } : {}),
       })
-      if (hits.length === 0) return { ok: true, output: `no matches for "${query}"` }
+      // MEMORY.md §6: memories come first — a conclusion outranks the paragraph
+      // it was drawn from — and only on the first page, because `before` pages
+      // through events and a memory has no seq to page by.
+      const memories =
+        opts.db === undefined || (before !== undefined && before >= 0)
+          ? []
+          : searchMemories(opts.db, query, { limit: Math.max(1, opts.memoryLimit ?? MEMORY_RESULT_LIMIT) })
+      if (hits.length === 0 && memories.length === 0) return { ok: true, output: `no matches for "${query}"` }
 
-      const lines = hits.map(renderHit)
-      // Only when the page is full: a hint nobody can act on is noise. bm25
-      // ordering means the oldest hit is not the last one — take the minimum.
+      const lines = [...memories.map(renderMemoryHit), ...hits.map(renderHit)]
+      // Only when the event page is full: a hint nobody can act on is noise.
+      // bm25 ordering means the oldest hit is not the last one — take the minimum.
       if (hits.length >= limit) lines.push(pagingHint(Math.min(...hits.map((hit) => hit.seq))))
       return { ok: true, output: lines.join("\n") }
     },

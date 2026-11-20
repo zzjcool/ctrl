@@ -39,12 +39,15 @@ interface FakeLlm {
   requests: number
   push(reply: FakeReply): void
   reset(): void
+  /** The request bodies seen since the last reset, oldest first. */
+  bodies: Array<{ messages: Array<{ role: string; content: string }> }>
   close(): Promise<void>
 }
 
 async function startFakeLlm(): Promise<FakeLlm> {
   const queue: FakeReply[] = []
   const timers = new Set<ReturnType<typeof setTimeout>>()
+  const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = []
   let requests = 0
 
   const server = createServer((request: IncomingMessage, response: ServerResponse) => {
@@ -56,6 +59,11 @@ async function startFakeLlm(): Promise<FakeLlm> {
     request.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)))
     request.on("end", () => {
       requests += 1
+      try {
+        bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")))
+      } catch {
+        // A body that is not JSON is not a request this test reads.
+      }
       const reply = queue.shift() ?? { content: "(no further script)" }
       const send = () => {
         if (response.destroyed || response.writableEnded) return
@@ -109,7 +117,9 @@ async function startFakeLlm(): Promise<FakeLlm> {
     },
     reset: () => {
       queue.length = 0
+      bodies.length = 0
     },
+    bodies,
     close: async () => {
       for (const timer of timers) clearTimeout(timer)
       timers.clear()
@@ -745,6 +755,30 @@ test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.
   assert.equal((await api("DELETE", "/api/memories")).status, 405)
   assert.equal((await api("GET", "/api/dream")).status, 405)
   assert.equal((await api("GET", "/api/focus/x/y")).status, 404)
+})
+
+test("a dream-written memory is recalled into the next turn's prompt", async () => {
+  // The gap this test exists for: `remember`/`recall` must read the same table
+  // sleeping writes to. The dream above wrote 「做梦写下的记忆」 into SQLite;
+  // this turn asks about it and the recalled block must be in the system prompt.
+  fixture.fake.reset()
+  fixture.fake.push({ content: "那条记忆是做梦时写下的" })
+  assert.equal((await send("做梦写下的那条记忆是什么？")).status, 202)
+  const snapshot = await settle()
+
+  const recalls = snapshot.events.filter((event) => event.type === "memory_recall") as Extract<
+    SessionEvent,
+    { type: "memory_recall" }
+  >[]
+  const last = recalls.at(-1)
+  assert.ok(last, "the turn recorded a recall")
+  assert.ok(last.data.memoryIds.length > 0, `expected recalled ids, got ${JSON.stringify(last.data)}`)
+
+  const request = fixture.fake.bodies.at(-1)
+  assert.ok(request, "the fake model saw the request")
+  const system = request.messages.find((message) => message.role === "system")?.content ?? ""
+  assert.match(system, /Recalled memory:/, system)
+  assert.match(system, /做梦写下的记忆/, "the dream-written memory reaches the model")
 })
 
 test("restarting ctrl finds the same log, memory, workspace and jobs", async () => {

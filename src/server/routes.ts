@@ -18,7 +18,8 @@ import type { IncomingMessage, ServerResponse } from "node:http"
 import type { DatabaseSync } from "node:sqlite"
 import {
   appendRecord,
-  asAgentMemory,
+  // Only `/api/memory` still speaks pi-durable's own memory log (CONTRACT §7);
+  // the agent loop's memory is `ctx.agentMemory` (SQLite, MEMORY.md §2).
   createMemoryStore,
   detectResumePoint,
   openSession,
@@ -27,6 +28,7 @@ import {
   runAgent,
 } from "../engine/durable.ts"
 import type {
+  AgentMemory,
   LlmClient,
   MemoryKind,
   Session,
@@ -74,6 +76,8 @@ export interface AppContext {
   contextBudget: number
   /** The background dream (M3): one at a time, idle-gated, manually triggerable. */
   dreams: DreamController
+  /** `remember`/`recall` for the agent loop, over the `memories` table (M3/M4). */
+  agentMemory: AgentMemory
   tools: ToolSpec[]
   env: NodeJS.ProcessEnv
   createLlm: (model: string) => LlmClient
@@ -555,7 +559,6 @@ function importAfterTurn(ctx: AppContext): void {
  * the TurnRegistry only — the log stays a transcript, not a stack trace.
  */
 async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: AbortSignal): Promise<void> {
-  const store = createMemoryStore(resolvePaths(ctx.agentHome))
   const meta = log.meta()
   const sidecar = readSidecar(ctx.agentHome, LOG_ID)
   const cwd = sidecar?.cwd ?? meta.cwd
@@ -593,7 +596,10 @@ async function runTurnOnce(ctx: AppContext, log: Session, text: string, signal: 
       input: text,
       session: log,
       llm: createAbortableLlm(base, signal),
-      memory: asAgentMemory(store),
+      // MEMORY.md §2 §7: remember/recall read and write the SQLite `memories`
+      // table — the same table dreaming writes and the page reviews. (The old
+      // pi-durable memory log is now only what `/api/memory` still exposes.)
+      memory: ctx.agentMemory,
       tools: ctx.tools,
       cwd,
       maxSteps: ctx.maxSteps,

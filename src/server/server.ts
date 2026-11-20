@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url"
 import { createChatCompletionsClient, openSession } from "../engine/durable.ts"
 import type { LlmClient } from "../engine/durable.ts"
 import { DEFAULT_MAX_WORKERS, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER, JobRunner } from "../jobs/runner.ts"
+import { createSqliteAgentMemory } from "../memory/agent-memory.ts"
 import { lastIndexedSeq } from "../memory/db.ts"
 import { DREAM_IDLE_MS, DREAM_TICK_MS, DreamController, lastDreamSeq } from "../memory/dream.ts"
 import { createMemoryIndex } from "../memory/index.ts"
@@ -143,6 +144,13 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     turns: new TurnRegistry(),
     memory,
     contextBudget,
+    // MEMORY.md §2: the loop's remember/recall go to SQLite, so a dream-written
+    // memory is recalled by the next turn. A degraded database answers recall
+    // with nothing and keeps the turn alive.
+    agentMemory: createSqliteAgentMemory({
+      db: memory.handle(),
+      warn: (message) => process.stderr.write(`${message}\n`),
+    }),
     // Replaced right below, once the context object exists: a dream reads the
     // log, the database and the turn registry — the same three things every
     // request reads — so it is built from the finished context, not before it.

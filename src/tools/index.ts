@@ -40,7 +40,9 @@ export function memoryTools(): ToolSpec[] {
 export function createTools(opts: CreateToolsOptions): ToolSpec[] {
   return [
     ...createJobTools({ agentHome: opts.agentHome, runner: opts.runner }),
-    createSearchContextTool({ index: opts.memory }),
+    // The same handle serves both halves of a search: the event mirror and the
+    // memories table (MEMORY.md §6 — a hit says whether it is a memory or an event).
+    createSearchContextTool({ index: opts.memory, db: opts.memory.handle() }),
     createFocusSetTool({ db: opts.memory.handle() }),
     ...memoryTools(),
   ]

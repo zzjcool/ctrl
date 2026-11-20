@@ -12,11 +12,16 @@
 //     higher importance;
 //   * nothing is deleted: DELETE writes `superseded_by = "deleted:<id>"`.
 //
-// Search discipline: the corpus here is a few thousand hand-curated sentences,
-// not a log. A normalised substring scan in JS is exact for 1–2 character CJK
-// queries (which trigram FTS5 cannot answer at all, MEMORY.md §4) and it is
-// the same code for every query length. `memories_fts` is therefore left
-// unwritten on purpose until M5 needs ranking it can trust; see the report.
+// Search discipline is M1's, applied to a second table (MEMORY.md §4):
+//
+//   term >= 3 code points   FTS5 MATCH over `memories_fts` (trigram), quoted
+//   term  < 3 code points   substring scan (`LIKE`), because the trigram
+//                           tokenizer cannot answer 「编译」 at all
+//
+// `memories_fts` is contentless and derived from `memories`, so every write here
+// maintains it, and `ensureMemoryIndex` rebuilds it whenever the row counts
+// disagree (an older file, a hand-edited table) — the index is a cache of the
+// table, never the other way round.
 
 import type { DatabaseSync } from "node:sqlite"
 import { charLength, clipChars, isRecord } from "./events.ts"
@@ -35,6 +40,16 @@ export const MAX_MEMORY_LIMIT = 100
 export const TOMBSTONE_PREFIX = "deleted:"
 /** Recency half-life of the recall score, in days (MEMORY.md §5). */
 const RECENCY_HALF_LIFE_DAYS = 30
+/** Same threshold as the event index (MEMORY.md §4): below this, trigram cannot help. */
+export const TRIGRAM_MIN_CHARS = 3
+/**
+ * How many query terms one search derives. It is not a query count: all the
+ * terms ride in two statements (one FTS `OR`, one `LIKE` `OR`), so a sentence
+ * keeps all of its n-grams instead of losing the second half of itself.
+ */
+export const MAX_SEARCH_TERMS = 64
+/** Candidates pulled per term before ranking; the ranking is what decides. */
+const TERM_CANDIDATES = 40
 
 export interface MemoryRow {
   id: string
@@ -140,6 +155,8 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): AddMemoryRes
       stamp,
       duplicate.id,
     )
+    // Tags are searchable, so a merge must re-index the row.
+    reindexMemory(db, duplicate.id, { text: duplicate.text, tags: duplicate.tags })
     const row = getMemory(db, duplicate.id) ?? duplicate
     return { memory: row, created: false }
   }
@@ -161,6 +178,7 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): AddMemoryRes
     seqs[0] ?? null,
     seqs[1] ?? null,
   )
+  reindexMemory(db, id)
   return { memory: getMemory(db, id) as MemoryRow, created: true }
 }
 
@@ -181,15 +199,39 @@ export function listMemories(db: DatabaseSync, opts: ListMemoriesOptions = {}): 
   if (query === "") {
     return sortByWeight(rows, opts.now ?? new Date()).slice(0, limit)
   }
-  return rank(rows, query, opts.now ?? new Date()).slice(0, limit)
+  return matchRows(rows, query, opts.now ?? new Date()).slice(0, limit)
 }
 
-/** Relevance-filtered search — the dream writer's "top existing memories". */
+/**
+ * Relevance-filtered search — the dream writer's "top existing memories" and
+ * the recall adapter's whole query path.
+ *
+ * Candidates come from the same two regimes M1 uses (`memories_fts` for a term
+ * of three or more characters, `LIKE` below that); the ordering is MEMORY.md
+ * §5's keyword hits × importance × recency, computed by `rank`. A whole user
+ * message is fanned out into terms first (`searchTerms`), because no memory
+ * contains a paragraph.
+ */
 export function searchMemories(db: DatabaseSync, query: string, opts: ListMemoriesOptions = {}): MemoryRow[] {
   const limit = clampLimit(opts.limit)
   const trimmed = query.trim()
-  if (trimmed === "") return sortByWeight(selectRows(db, false), opts.now ?? new Date()).slice(0, limit)
-  return rank(selectRows(db, false), trimmed, opts.now ?? new Date()).slice(0, limit)
+  const now = opts.now ?? new Date()
+  const includeSuperseded = opts.includeSuperseded === true
+  if (trimmed === "") return sortByWeight(selectRows(db, includeSuperseded), now).slice(0, limit)
+
+  const terms = searchTerms(trimmed)
+  if (terms.length === 0) return []
+  // The index is derived: a table written before M3 grew this index (or by
+  // hand) is repaired here rather than silently answering "no memories".
+  const indexed = ensureMemoryIndex(db)
+
+  const candidates = candidateRows(db, terms, includeSuperseded, indexed)
+  return rank(candidates, terms, now).slice(0, limit)
+}
+
+/** The score one row carries: (0.5 + importance) × recency (MEMORY.md §5). */
+export function memoryScore(row: MemoryRow, now: Date = new Date()): number {
+  return weight(row, now)
 }
 
 /** How many memories are live (the number `GET /api/agent` reports). */
@@ -244,6 +286,7 @@ export function updateMemory(
     now.toISOString(),
     id,
   )
+  reindexMemory(db, id, { text: existing.text, tags: existing.tags })
   return getMemory(db, id)
 }
 
@@ -270,23 +313,218 @@ function findDuplicate(db: DatabaseSync, text: string): MemoryRow | undefined {
 
 /**
  * Rank rows against a query: keyword hits × importance × recency, the same
- * three factors MEMORY.md §5 names. Rows that match nothing are dropped, so a
+ * three factors MEMORY.md §5 names. Tags count as text, so 「m4」 finds the
+ * decision that carries that tag. Rows that match nothing are dropped, so a
  * query is a filter and not decoration.
  */
-function rank(rows: MemoryRow[], query: string, now: Date): MemoryRow[] {
-  const words = keywords(query)
+function rank(rows: MemoryRow[], terms: string[], now: Date): MemoryRow[] {
   const scored: Array<{ row: MemoryRow; score: number }> = []
   for (const row of rows) {
-    const haystack = normalizeMemoryText(row.text)
+    const haystack = haystackOf(row)
     let hits = 0
-    for (const word of words) {
-      if (word !== "" && haystack.includes(word)) hits += charLength(word)
+    for (const term of terms) {
+      if (term !== "" && haystack.includes(normalizeMemoryText(term))) hits += charLength(term)
     }
     if (hits === 0) continue
     scored.push({ row, score: hits * weight(row, now) })
   }
-  scored.sort((a, b) => b.score - a.score || b.row.importance - a.row.importance)
+  scored.sort((a, b) => b.score - a.score || b.row.importance - a.row.importance || b.row.updatedAt.localeCompare(a.row.updatedAt))
   return scored.map((entry) => entry.row)
+}
+
+/** `rank` for an in-memory list (`listMemories?query=` uses the whole table). */
+function matchRows(rows: MemoryRow[], query: string, now: Date): MemoryRow[] {
+  const terms = searchTerms(query)
+  return terms.length === 0 ? [] : rank(rows, terms, now)
+}
+
+function haystackOf(row: MemoryRow): string {
+  return normalizeMemoryText(`${row.text} ${row.tags.join(" ")}`)
+}
+
+/**
+ * The terms one query is searched by.
+ *
+ * A whole user message is not a search key: memory text is a sentence, so the
+ * message is split into ASCII words plus CJK n-grams of three (what the trigram
+ * tokenizer can answer) and two (what the LIKE fallback answers) code points.
+ * The longest terms come first so a fan-out can stop early and still be right.
+ */
+export function searchTerms(query: string): string[] {
+  const normalized = normalizeMemoryText(query)
+  if (normalized === "") return []
+  const terms: string[] = []
+  const push = (term: string): void => {
+    if (term !== "" && terms.length < MAX_SEARCH_TERMS && !terms.includes(term)) terms.push(term)
+  }
+
+  // ASCII/Latin words first: they are the sharpest keys in a mixed sentence.
+  for (const word of normalized.split(/[^\p{L}\p{N}_]+/u)) {
+    if (charLength(word) >= 2) push(word)
+  }
+
+  // CJK runs, each turned into 3-grams (what the trigram tokenizer can answer)
+  // alternating with 2-grams (what LIKE answers). The alternation matters: a
+  // memory rarely shares a whole 3-character window with a sentence, but it
+  // very often shares two characters across a word boundary.
+  const runs = normalized.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu) ?? []
+  const perRun = runs.map((run) => {
+    const points = Array.from(run)
+    const list: string[] = []
+    for (let index = 0; index < points.length; index += 1) {
+      if (index + 3 <= points.length) list.push(points.slice(index, index + 3).join(""))
+      if (index + 2 <= points.length) list.push(points.slice(index, index + 2).join(""))
+    }
+    return list
+  })
+  // Round-robin across runs, so a long first clause cannot starve the second
+  // one out of the budget (a message is a sentence, not a keyword).
+  for (let round = 0; roundsLeft(perRun, round); round += 1) {
+    for (const list of perRun) {
+      const term = list[round]
+      if (term !== undefined) push(term)
+    }
+  }
+
+  // The whole query last: an exact short phrase ("统计完了") is a strong
+  // candidate even though a long one almost never matches. A single character
+  // is only ever a query in its own right — as an n-gram it would recall the
+  // whole table.
+  if (charLength(normalized) <= 6) push(normalized)
+  return terms
+}
+
+function roundsLeft(lists: string[][], round: number): boolean {
+  return lists.some((list) => round < list.length)
+}
+
+/** The searchable body of a row: its text plus its tags, one line. */
+export function memoryBody(text: string, tags: string[]): string {
+  return `${text} ${tags.join(" ")}`.trim()
+}
+
+/**
+ * Repairs `memories_fts` when it disagrees with `memories` (an older file, a
+ * hand-edited table, a crash between the two writes). Returns false when the
+ * index could not be built, in which case callers fall back to `LIKE`.
+ */
+export function ensureMemoryIndex(db: DatabaseSync): boolean {
+  try {
+    const indexed = asInteger(db.prepare("SELECT count(*) AS n FROM memories_fts").get()?.n) ?? 0
+    const rows = asInteger(db.prepare("SELECT count(*) AS n FROM memories").get()?.n) ?? 0
+    if (indexed === rows) return true
+    db.exec("DROP TABLE IF EXISTS memories_fts")
+    db.exec("CREATE VIRTUAL TABLE memories_fts USING fts5(body, tokenize='trigram', content='')")
+    const all = db.prepare("SELECT rowid AS rid, text, tags FROM memories").all() as unknown[]
+    const insert = db.prepare("INSERT INTO memories_fts(rowid, body) VALUES (?, ?)")
+    for (const raw of all) {
+      const row = isRecord(raw) ? raw : {}
+      const rid = asInteger(row.rid)
+      if (rid === undefined) continue
+      insert.run(rid, memoryBody(asString(row.text) ?? "", parseTags(asString(row.tags))))
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * One row, (re-)indexed by its current text and tags.
+ *
+ * A contentless FTS5 table needs the *old* body to remove a posting, so an
+ * update passes the previous text in. When any of this fails the whole index is
+ * emptied: its row count no longer matches `memories`, and the next
+ * `ensureMemoryIndex` rebuilds it. The table is the truth; the index is a cache.
+ */
+function reindexMemory(db: DatabaseSync, id: string, previous?: { text: string; tags: string[] }): void {
+  try {
+    const row = db.prepare("SELECT rowid AS rid, text, tags FROM memories WHERE id = ?").get(id)
+    if (row === undefined) return
+    const rid = asInteger(row.rid)
+    if (rid === undefined) return
+    if (previous !== undefined) {
+      db.prepare("INSERT INTO memories_fts(memories_fts, rowid, body) VALUES ('delete', ?, ?)").run(
+        rid,
+        memoryBody(previous.text, previous.tags),
+      )
+    }
+    db.prepare("INSERT INTO memories_fts(rowid, body) VALUES (?, ?)").run(
+      rid,
+      memoryBody(asString(row.text) ?? "", parseTags(asString(row.tags))),
+    )
+  } catch {
+    try {
+      db.exec("DROP TABLE IF EXISTS memories_fts")
+      db.exec("CREATE VIRTUAL TABLE memories_fts USING fts5(body, tokenize='trigram', content='')")
+    } catch {
+      // Nothing left to do: searches fall back to LIKE while the index is empty.
+    }
+  }
+}
+
+/**
+ * Candidate rows for the whole term list — one statement per regime, so a
+ * sentence can keep every n-gram it has:
+ *
+ *   terms >= 3 code points   one FTS5 MATCH with an OR of quoted phrases
+ *   terms  < 3 code points   one LIKE scan with an OR of escaped patterns
+ *
+ * Quoting is mandatory in both: `hw-` is FTS5 syntax and `%` is a wildcard.
+ * A regime that fails is skipped (the other one still answers, and ranking
+ * never depends on where a row came from).
+ */
+function candidateRows(
+  db: DatabaseSync,
+  terms: string[],
+  includeSuperseded: boolean,
+  indexed: boolean,
+): MemoryRow[] {
+  const found = new Map<string, MemoryRow>()
+  const heavy = terms.filter((term) => charLength(term) >= TRIGRAM_MIN_CHARS)
+  const light = terms.filter((term) => charLength(term) < TRIGRAM_MIN_CHARS)
+
+  if (indexed && heavy.length > 0) {
+    try {
+      const match = heavy.map((term) => `"${term.replace(/"/g, '""')}"`).join(" OR ")
+      const sql =
+        "SELECT m.* FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid " +
+        "WHERE memories_fts MATCH ?" +
+        (includeSuperseded ? "" : " AND m.superseded_by IS NULL") +
+        " ORDER BY bm25(memories_fts) LIMIT ?"
+      for (const raw of db.prepare(sql).all(match, TERM_CANDIDATES) as unknown[]) {
+        const row = mapRow(raw)
+        found.set(row.id, row)
+      }
+    } catch {
+      // A term the tokenizer refuses is not an error the model has to interpret.
+    }
+  }
+  if (light.length > 0) {
+    try {
+      const clauses = light.map(() => "(text LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')").join(" OR ")
+      const pattern = light.flatMap((term) => {
+        const one = likePattern(term)
+        return [one, one]
+      })
+      const sql =
+        "SELECT * FROM memories WHERE " +
+        (includeSuperseded ? "" : "superseded_by IS NULL AND ") +
+        `(${clauses}) ORDER BY importance DESC, updated_at DESC LIMIT ?`
+      for (const raw of db.prepare(sql).all(...pattern, TERM_CANDIDATES) as unknown[]) {
+        const row = mapRow(raw)
+        found.set(row.id, row)
+      }
+    } catch {
+      // Same policy: the FTS half already answered what it could.
+    }
+  }
+  return [...found.values()]
+}
+
+/** `%term%` with LIKE's own wildcards neutralised. */
+function likePattern(term: string): string {
+  return `%${term.replace(/[\\%_]/g, (char) => `\\${char}`)}%`
 }
 
 function sortByWeight(rows: MemoryRow[], now: Date): MemoryRow[] {
