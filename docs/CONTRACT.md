@@ -65,13 +65,14 @@ new name, you get a new agent with its own log and its own memory.
 - `ctrl agent rm` archives (moves to `trash/`); `--purge` deletes for real.
 - A new name = a new directory = a new agent with no memory and no log.
 
-## 5. Tools (frozen, 5)
+## 5. Tools (frozen, 6)
 
 | Tool | Behaviour |
 | --- | --- |
 | `delegate` | `{ task, cwd?, model?, thinking?, wait? }` → starts a detached `pi -p` worker; waits up to `wait` (default 8 s) and returns the finished job if it is done, otherwise `started job <id>` |
 | `job_status` | `{ id?, lines?, full?, wait? }` → state, elapsed, exit code, tail of the worker's output; waits up to 8 s for a running job; no `id` lists every job |
 | `job_stop` | `{ id }` → SIGTERM the worker's process group |
+| `search_context` | `{ query, limit?, before? }` → snippets from the full history in SQLite (see MEMORY.md) |
 | `remember` / `recall` | pi-durable, unchanged |
 
 Both `delegate` and `job_status` **wait up to 8 s** — under the engine's 10 s
@@ -117,6 +118,7 @@ once per step and burns its whole budget on a 40 s job (observed: 11 steps of
 | `GET /api/agent/events?before=S&tail=T` | the T events before seq `S` (paging up) |
 | `POST /api/agent/messages` | `{ text }` → 202; a turn already running → 409 |
 | `POST /api/agent/abort` | `{ aborted }` |
+| `GET /api/search?q=&limit=&before=` | `{ query, hits, count }` — history search (MEMORY.md M1) |
 | `GET /api/jobs` | `{ jobs: [{ id, state, task, startedAt, elapsedMs, code? }] }` (page polling) |
 | `GET/POST /api/memory`, `DELETE /api/memory/:id` | pi-durable memory, tombstones |
 
@@ -169,6 +171,9 @@ One screen, no navigation, no rail:
 - **R3** — personal scope, remote-as-workdir, SSH-only.
 - **R4** — v1 accepted deviations (exit marker, response shapes, abort scope).
 - **R5** — default model deepseek-v4.1-flash, reasoning max, 8192 cap.
+- **R9** — memory layer M1: every event is mirrored into `<agent>/memory.db`
+  (SQLite + FTS5), and the agent gets `search_context` / `GET /api/search`.
+  The log stays the truth; the database is an index that can be rebuilt.
 - **R8** — ctrl stops doing work: the execution tools and the ssh/local
   executors are removed; a `delegate` tool starts `pi -p` workers and polls
   them. `--machine` and `/api/machines` disappear with them.
