@@ -89,6 +89,7 @@ function makeRunner(opts: Partial<RunnerConfig> = {}): JobRunner {
     maxWorkers: 3,
     model: "test-model",
     thinking: "max",
+    piExtension: "",
     ...opts,
   })
 }
@@ -184,6 +185,15 @@ test("a job id is 20261120T080102Z-a1b2c3 shaped and sortable", () => {
   assert.match(early, JOB_ID_PATTERN)
   assert.ok(early < late, "ids sort by time")
   assert.notEqual(newJobId(), newJobId(), "the suffix keeps two jobs in one second apart")
+})
+
+test("a worker loads only the provider extension, so the user's packages stay out of it", () => {
+  const runner = makeRunner({ piExtension: "/x/any-endpoint.ts" })
+  const argv = runner.workerArgv({ id: "20261120T080102Z-a1b2c3", task: "t" })
+  const at = argv.indexOf("-ne")
+  assert.ok(at > 0, "workers run with the user's packages off")
+  assert.equal(argv[at + 1], "-e")
+  assert.equal(argv[at + 2], "/x/any-endpoint.ts")
 })
 
 test("the worker command line is the frozen one (CONTRACT §5.1)", () => {

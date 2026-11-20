@@ -52,6 +52,8 @@ interface Flags {
 
   piProvider: string
 
+  piExtension: string
+
   maxWorkers: number
 
   jobTimeoutMinutes: number
@@ -141,6 +143,7 @@ export function parseArgs(argv: string[]): Flags {
     agent: DEFAULT_AGENT,
     piBin: DEFAULT_PI_BIN,
     piProvider: DEFAULT_PI_PROVIDER,
+    piExtension: "",
     maxWorkers: DEFAULT_MAX_WORKERS,
     jobTimeoutMinutes: DEFAULT_JOB_TIMEOUT_MINUTES,
     stallMinutes: DEFAULT_STALL_MINUTES,
@@ -218,6 +221,10 @@ export function parseArgs(argv: string[]): Flags {
       case "--pi-provider":
 
         flags.piProvider = inline !== undefined ? inline.trim() : value().trim()
+        break
+      case "--pi-extension":
+
+        flags.piExtension = inline !== undefined ? inline.trim() : value().trim()
         break
       case "--max-workers":
         flags.maxWorkers = integer(value(), "--max-workers", 1, 64)
@@ -520,6 +527,7 @@ async function serveCommand(flags: Flags): Promise<number> {
       workspace,
       piBin: flags.piBin,
       piProvider: flags.piProvider,
+      ...(flags.piExtension !== "" ? { piExtension: flags.piExtension } : {}),
       maxWorkers: flags.maxWorkers,
       jobTimeoutMinutes: flags.jobTimeoutMinutes,
       stallMinutes: flags.stallMinutes,

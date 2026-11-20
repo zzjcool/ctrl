@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { providerExtensionPath } from "./pi-extensions.ts"
 import type { ChildProcess } from "node:child_process"
 import { accessSync, constants as fsConstants, closeSync, existsSync, openSync, statSync, writeFileSync } from "node:fs"
 import path from "node:path"
@@ -35,6 +36,8 @@ export interface RunnerConfig {
   agentHome: string
   piBin?: string
   piProvider?: string
+
+  piExtension?: string
   maxWorkers?: number
 
   jobTimeoutMinutes?: number
@@ -74,6 +77,8 @@ export class JobRunner {
   readonly agentHome: string
   readonly piBin: string
   readonly piProvider: string
+
+  readonly piExtension: string | undefined
   readonly maxWorkers: number
 
   readonly jobTimeoutMinutes: number
@@ -88,6 +93,7 @@ export class JobRunner {
     this.agentHome = config.agentHome
     this.piBin = nonEmpty(config.piBin) ?? DEFAULT_PI_BIN
     this.piProvider = nonEmpty(config.piProvider) ?? DEFAULT_PI_PROVIDER
+    this.piExtension = config.piExtension === undefined ? providerExtensionPath() : nonEmpty(config.piExtension)
     this.maxWorkers =
       config.maxWorkers !== undefined && Number.isFinite(config.maxWorkers) && config.maxWorkers > 0
         ? Math.floor(config.maxWorkers)
@@ -121,6 +127,7 @@ export class JobRunner {
       this.piProvider,
       "--model",
       nonEmpty(input.model) ?? this.model,
+      ...(this.piExtension !== undefined ? ["-ne", "-e", this.piExtension] : []),
       "--thinking",
       nonEmpty(input.thinking) ?? this.thinking,
       "--no-session",
