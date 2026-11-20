@@ -64,6 +64,18 @@
 （`node --experimental-strip-types` 直接跑 `.ts`）、相对 import 带 `.ts` 后缀、
 测试用 `node:test`、零运行时依赖（Node builtins only）。
 
+## 运行
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.ctrl.serve.plist   # 起
+launchctl kickstart -k gui/$(id -u)/dev.ctrl.serve                              # 重启
+launchctl bootout   gui/$(id -u)/dev.ctrl.serve                                 # 停
+```
+
+launchd 调的是 `~/.local/bin/ctrl-supervise.sh`（不在仓库里）：起服务、20 秒内
+`/api/health` 不通就丢掉未提交改动重试，还不行回滚到 `~/.ctrl/known-good`，
+再不行就停下。日志：`~/Library/Logs/ctrl-serve.log`。
+
 ## 两条规矩
 
 1. **代码是唯一的事实**。文档只在施工期存在，实现完成即删除；设计决定留在
