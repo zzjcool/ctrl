@@ -12,3 +12,5 @@ ctrl.jsonl
 # Core dumps are ignored by path, NOT by bare name: a rule of `core` would
 # silently swallow src/core/ (this bit pi-durable once).
 /core
+
+.pi-subagents/
