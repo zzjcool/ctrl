@@ -1,42 +1,50 @@
 # Ctrl
 
 > 写这个项目的时候，我键盘上的 Ctrl 键坏了。
-> 所以我做了一个不用一直按着它的东西：**线在这里，执行随便去哪。**
+> 所以我做了一个不用一直按着它的东西：**线在这里，活干在别处。**
 
-**Ctrl 是一个持久对话的 agent 控制台。** 对话、记忆、会话日志留在本地；文件读写和命令执行发生在 herdr core 能到达的任何机器上——目标机不需要 node、不需要 agent、不需要装任何运行时。
+我自己用的一个对话式 agent：**在一个页面上聊天，工具跑在我另外几台机器上。**
+
+远端只要有 `sshd`——不用装 node、不用装 agent、不用装任何运行时。AI 不会知道自己不在本地：工具名、输出格式、工作目录语义都一样，只是命令落在 ssh 那头的机器上。
 
 ```text
-浏览器（唯一的界面：一个对话页）
-   │  消息 / 工具卡片 / 机器 chip
-   ▼
-ctrl  ── 对话 + 记忆 + 事件（pi-durable 的 append-only 日志就是流）
-   │
-   └── Executor ──── hc connect（JSON-RPC）────►  远端机器
-                                                 go build / npm test / dev
+本地 Mac（控制机）                          远端（hw-nj / 任何 ssh 能到的机器）
+┌──────────────────────────────┐          ┌──────────────────────────────────┐
+│ 浏览器：一个对话页            │          │  go build / npm test / rg / git   │
+│   │                          │          │        ▲                          │
+│   ▼                          │          │        │  sh -c（经 ssh）          │
+│ ctrl                         │          │                                  │
+│  ├─ pi-durable：会话 + 记忆   │          │  远端就是工作目录（不镜像、不同步）│
+│  └─ Executor ── ssh ─────────┼──────────┘                                  │
+└──────────────────────────────┘          └──────────────────────────────────┘
 ```
 
 ## 它解决什么
 
-- **笔记本不再烤手**：`go build`、测试、dev server 都在有核的那台机器上跑。
-- **目标机零安装**：只要能 ssh（`hc` 会被 core 推过去），不需要 node / pi / 沙箱运行时。
-- **对话不死**：会话是 append-only 的本地日志，进程崩了、机器重启了，回来接着说。
-- **可以有人接管**：你在 herdr 里 `attach` 同一个终端，看着 agent 在跑什么。
+- **笔记本不再烤手**：build、测试、`rg` 都在有核的那台机器上跑。
+- **远端零安装**：只要 sshd（和你要用的 toolchain）。没有 daemon，没有 agent。
+- **对话不死**：会话写在本地 append-only 日志里；进程崩了、标签页关了，回来接着说。
+- **知道自己站在哪**：每张工具卡片都写着机器名和耗时，副作用落在哪一目了然。
 
 ## 现状
 
-**M1 在即：先做那张对话页。** 契约见 [docs/CONTRACT.md](docs/CONTRACT.md)（§0.1 定义产品只有一张页面，§12 定义从页面到远端的顺序）。
+**v1 开发中。** 契约见 [docs/CONTRACT.md](docs/CONTRACT.md)，实施见 [docs/PLAN.md](docs/PLAN.md)。
 
-计划顺序：**页面 → 远程执行 → 同步 → 长任务 → 恢复**。每一步都以“能在页面上看见”为验收，不交付看不到的库。
+- 工具集：`read_file` / `write_file` / `list_dir` / `bash` / `run_task` / `task_output` + `remember` / `recall`
+- 后端：`local`、`ssh`
+- 工作区：**远端即工作目录**（不做同步、不做镜像）
+- 页面：对话 + 工具卡片 + 机器 chip + 会话列表
 
 ## 和兄弟项目的关系
 
-| 项目 | 是什么 |
-| --- | --- |
-| [herdr core](https://herdr.dev) | 牧人：机器 + 持久终端 + 文件/执行 API（`hc connect`，JSON-RPC） |
-| [kraal](https://github.com/zzjcool/kraal) | 畜栏：Swift 写的 Herdr 客户端，给 agent 群一个随身窗口 |
-| **ctrl** | 控制面：持久对话 + 调度，把执行放到牧人的牧场上 |
-| [pi-durable](https://github.com/zzjcool/pi-durable) | 引擎：append-only 会话、记忆、agent 循环、压缩 |
+| 项目 | 是什么 | ctrl 怎么用它 |
+| --- | --- | --- |
+| [pi-durable](https://github.com/zzjcool/pi-durable) | append-only 会话、记忆、agent 循环、压缩 | 引擎，唯一 import 处是 `src/engine/durable.ts` |
+| herdr core | 机器 + 持久终端 + attach | **v1 不用**；以后要"派人接管/调度 agent"再接 |
+| kraal | Herdr 的 Swift 客户端 | 无关 |
 
 ## 约定
 
-沿用 pi-durable / pi-async / pi-legion 的家规：TypeScript strict、ESM、无构建步骤（`node --experimental-strip-types` 直接跑 `.ts`）、相对 import 带 `.ts` 后缀、测试用 `node:test`、零运行时依赖（Node builtins only）。
+沿用 pi-durable / pi-async / pi-legion 的家规：TypeScript strict、ESM、无构建步骤
+（`node --experimental-strip-types` 直接跑 `.ts`）、相对 import 带 `.ts` 后缀、
+测试用 `node:test`、零运行时依赖（Node builtins only）。

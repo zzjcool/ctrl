@@ -1,275 +1,175 @@
-# ctrl contract (draft v0)
+# ctrl contract (v1 — personal scope)
 
-> Single source of truth. Decisions marked 🔴 are **not frozen** — they need an
-> owner decision before code that depends on them is written.
-> English is used here to match pi-durable; README stays Chinese.
+> Single source of truth. Personal tool, one user, one control machine.
+> Frozen decisions are marked **§**. Anything not written here is out of scope.
 
----
+## 0. What ctrl is
 
-## 0. What ctrl is (frozen)
+A **local control machine** runs ctrl. You chat with an agent on one page. Its
+tools (`read_file`, `write_file`, `list_dir`, `bash`, long tasks) execute on a
+machine you reach over SSH. The remote needs **only sshd** — no node, no agent,
+no runtime. The agent is not told it is remote: same tool names, same output
+format, same working-directory semantics.
 
-ctrl is a **durable agent console**: a persistent conversation (log + memory +
-compaction) owned by the local machine, whose tools execute on machines reached
-through **herdr core**.
+One line: **the conversation stays here, the hands work there.**
 
-Three planes:
+Why personal: the pieces it needs are mine (pi-durable, ssh access to a couple of
+boxes). It is not a product and does not compete with OpenHands/Coder/Codex.
 
-| Plane | Lives where | Owner |
+## 1. Layers
+
+| Layer | Owner | What it does |
 | --- | --- | --- |
-| Conversation | local disk (`~/.pi-durable`) | pi-durable (dependency) |
-| Execution | remote machines | herdr core (JSON-RPC) |
-| Scheduling | local process | ctrl |
+| Conversation, memory, compaction, resume | **pi-durable** (dependency) | append-only `events.jsonl`, BM25+ recall, agent loop |
+| Tool execution | **ctrl** | 8 tools, two backends: `local`, `ssh` |
+| Page | **ctrl** | one chat page, tailing the log |
+| herdr / kraal | **out of scope** | optional later backend, not needed now |
 
-One sentence: **the line stays here, the work goes there.**
+## 2. Non-goals (frozen)
 
-## 0.1 The page is the product (frozen, R2)
+- No sync / mirror / write-through. **The remote directory is the working copy.**
+- No sandbox/container lifecycle, no snapshots.
+- No git integration, no diff viewer, no editor.
+- No plugin system, no multi-agent UI, no task scheduler.
+- No multi-user, no hosted service, no TLS, no auth beyond loopback.
+- No product/business concerns: no telemetry, no onboarding, no installer.
+- No Windows.
 
-ctrl ships **one page: a conversation**. Not an ops console, not a dashboard,
-not a terminal grid. If a feature cannot be shown inside the chat surface, it is
-not v1.
+## 3. Engine dependency
 
-The page has exactly four parts:
+- pi-durable at `~/code/pi-durable` (sibling checkout, pinned `9e6fc89`).
+- **Exactly one file imports it**: `src/engine/durable.ts`. Nothing else may.
+- pi-durable is never modified. No `exports` map needed while the sibling
+  layout holds; moving to a package later is a one-file change.
+- The log format is pi-durable's; ctrl adds **no fields**. Machine binding is
+  written to a sidecar `<sessionDir>/ctrl.json`, not into events.
 
-1. **Conversation** — messages, inline tool cards, streaming by log tail.
-2. **Composer** — one input, plus a machine chip (`local` / `hw-nj` / …).
-3. **Session rail** — conversations from the durable log, newest first.
-4. **Status strip** — model, session id, event count, recovery badge.
-
-Everything remote appears **inside a tool card**, never in a separate panel:
-which machine ran it, how long, exit code, output (collapsed), stop button while
-it runs.
-
-### The session log is the stream (frozen)
-
-`runAgent()` is buffered today. ctrl does **not** add token streaming to
-pi-durable and does **not** reimplement the loop. Instead:
-
-- `POST /api/sessions/:id/messages` starts a turn in the background and returns
-  `202` immediately with the current event count.
-- The browser tails `GET /api/sessions/:id/events?since=<n>`.
-- Tool cards appear **as they are appended** — which is exactly when they become
-  durable. If the browser closes, the turn keeps running; reopening replays it.
-
-This is why recovery needs no extra machinery: the transport and the source of
-truth are the same file.
-
-## 1. Layer ownership (frozen)
-
-| Layer | Product | Responsibility |
-| --- | --- | --- |
-| Machines, terminals, exec, files, events | **herdr core** (`hc`) | the only thing installed remotely (auto-copied by `hc machine add --install`) |
-| Human window into herdr | **kraal** | Swift client; out of scope here |
-| Conversation, memory, dispatch, web console | **ctrl** | this repo |
-| Log, recall, agent loop, compaction | **pi-durable** | imported, not forked (§3) |
-
-ctrl is **not** a sandbox runtime. Isolation is whatever herdr offers: a
-machine, a container on that machine, or `machine.add --temp`. ctrl never
-manages VM/container lifecycles in v1.
-
-## 2. Non-goals for v1 (frozen)
-
-- No multi-user, no hosted service, no auth beyond loopback/token.
-- No plugin system (that is the pi-durable discussion, parked for v2).
-- No multi-agent orchestration UI (v1 runs commands; §9 is the v2 door).
-- No two-way merge of the local/remote workspace (§5 is one-way write-through).
-- No diff viewer, no editor, no file tree mutations in the web UI.
-- No embeddings; recall is pi-durable's BM25+.
-- No Windows support.
-
-## 3. Code layout and dependency (D0 🔴)
-
-ctrl is its own repo and **never forks pi-durable**:
-
-- Reuse: `runAgent`, session store (`createSession` / `openSession` /
-  `continueRecentSession`), memory store, paths, LLM client, event types.
-- **ctrl owns its tool layer.** pi-durable's v1 contract freezes its tool set
-  (§7 there), and remote tools are product semantics, not engine semantics.
-  ctrl implements `ToolSpec` (`{name, description, parameters, execute(args, ctx)}`)
-  and passes its own array to `runAgent({ tools })`.
-- Consequence: ctrl must track pi-durable's `ToolResult`/`ToolContext` shape
-  (both are tiny and stable), and pi-durable needs no revision for ctrl to exist.
-
-Dependency mechanics 🔴 — pick one:
-
-| Option | Shape | Cost |
-| --- | --- | --- |
-| **A** sibling checkout + `file:` dep | `~/code/pi-durable`, `"pi-durable": "file:../pi-durable"`, plus an `exports` map in pi-durable's package.json | one small pi-durable change; `npm install` links it |
-| **B** git submodule | `ctrl/vendor/pi-durable` | pinned, but submodule ergonomics |
-| **C** relative import | `import ... from "../../pi-durable/src/core/agent.ts"` | zero setup, breaks on `npm pack`, hides the real dependency |
-
-Recommendation: **A**. It is the only option that keeps `npm ci` honest and
-lets a future worker run the repo without knowing where pi-durable lives.
-
-## 4. Execution backend (D1, frozen except transport edge cases)
+## 4. Executor seam (frozen)
 
 ```ts
 interface Executor {
-  exec(argv: string[], o?: { cwd?: string; env?: Record<string,string>; input?: string; timeoutSec?: number })
-    : Promise<{ code: number | null; stdout: string; stderr: string; ms: number; timedOut: boolean; truncated: boolean }>
-  read(path: string, o?: { offset?: number; limit?: number }): Promise<string>
-  write(path: string, data: string): Promise<void>
-  list(path: string): Promise<string[]>
-  spawn(argv: string[], o: { cwd?: string; env?: Record<string,string>; name?: string })
-    : Promise<{ terminal: string }>            // herdr address, e.g. "hw-nj/t7"
+  readonly kind: "local" | "ssh"
+  readonly machine: string            // shown on every tool card
+  exec(argv: string[], o?: { cwd?; env?; input?; timeoutMs? }): Promise<ExecResult>
+  read(path: string, o?: { cwd?; offset?; limit? }): Promise<string>   // 1-based lines
+  write(path: string, data: string, o?: { cwd? }): Promise<void>
+  list(path: string, o?: { cwd? }): Promise<string[]>
+  spawn(argv: string[], o?: { cwd?; env?; name? }): Promise<{ address: string }>
+  readTask(address: string, o?: { lines?: number }): Promise<string>
+  stopTask(address: string): Promise<void>
 }
+type ExecResult = { code: number | null; stdout: string; stderr: string; ms: number; timedOut: boolean; truncated: boolean }
 ```
 
-Transport: spawn `hc connect`, speak JSON-RPC 2.0, one JSON object per line
-(the protocol's `hello` may switch to framed mode; ctrl asks for line mode).
-Handshake once at startup; reconnect with backoff; every request carries a
-monotonic id and a deadline.
+### SSH backend rules (frozen)
 
-Mapping:
+- Transport: the system `ssh` binary, **one ControlMaster socket per machine**
+  (`-M -S <tmp>/ctrl-<host>.sock -N -f`, `ControlPersist=60`). Measured: 1.1 s
+  per fresh connection vs ~32 ms multiplexed — never per-call connections.
+- `exec`: `ssh -S sock <host> -- sh -c '<single-quoted line>'`. argv is joined
+  with POSIX single-quote escaping (`'` → `'\''`). Never interpolate raw paths.
+- Always send `sh -c` explicitly: `machine.exec`-style remote shells do not
+  exist here; the remote shell is whatever sshd gives us.
+- Timeouts: kill the local ssh **and** the remote process group
+  (`setsid` on spawn, `kill -TERM -<pgid>` on stop). A dropped ssh connection
+  must not leave a build running silently.
+- Errors are rewritten before they reach the model: no `ssh:` prefixes, no
+  host names, no `Permission denied (publickey)`.
+- `read` = `cat`; `write` = `mkdir -p` + `cat > path` with the body on stdin;
+  `list` = `ls -1Ap`; binary payloads are rejected, not mangled.
 
-| Executor | herdr method | Hard limits to respect |
+## 5. Workspace (frozen)
+
+- The remote directory **is** the working copy. `read_file`/`write_file`/
+  `list_dir`/`bash` all resolve against the session's remote cwd.
+- No local mirror. The local disk stores sessions and memory only.
+- `~` means the **remote** user's home. Document this in the system prompt.
+
+## 6. Tool set (frozen, 8)
+
+| Tool | Backend call | Notes |
 | --- | --- | --- |
-| `exec` | `machine.exec` | timeout ≤ **600 s**, stdin ≤ 8 MB raw (base64), stdout/stderr come back base64 |
-| `read` | `file.read` | ≤ 8 MB, offset/limit are **lines** |
-| `write` | `file.write` | ≤ 8 MB raw per call (base64); no mode bits — `chmod` via `exec` |
-| `list` | `machine.exec` (`ls -1`) | no dedicated method |
-| `spawn` | `terminal.run` | returns an address; then `terminal.wait` / `read` / `send` / `interrupt` |
+| `read_file` | `read` | 20 000 char cap |
+| `write_file` | `write` | creates parents |
+| `list_dir` | `list` | one level |
+| `bash` | `exec(["sh","-c",cmd])` | **hard 10 s cap** — see below |
+| `run_task` | `spawn` | long command; returns an address |
+| `task_output` | `readTask` / `stopTask` | `{ address, lines?, kill? }` |
+| `remember` / `recall` | pi-durable | imported unchanged |
 
-Errors carry `data.kind` — surface as `ToolResult { ok: false, output }`, never
-throw through the agent loop.
+`bash` is hidden unless `--allow-bash`; the other seven are advertised.
 
-### 4.1 Hard limits found in the engine (facts, not choices)
+**Why `run_task` exists (deviation from pi-durable's set):** pi-durable's loop
+hard-caps each tool at **10 s** (`TOOL_TIMEOUT_MS`, not configurable), and the
+whole point here is `go build` on a remote box. Long work must therefore be
+started and polled, not awaited. `run_task` returns immediately with an address;
+`task_output` tails it and can kill it.
 
-| Fact | Consequence |
+## 7. Machine binding (frozen)
+
+- One session = one machine. Chosen at start: `--machine local` or
+  `--machine <ssh-host>` (read from `~/.ssh/config`).
+- The agent never sees a host name in tool signatures. Switching machines =
+  a new session (v1). A visible `use_machine` tool is a later revision.
+- The page shows the machine in one chip; every tool card carries the same
+  machine label, so the human always knows where the side effect landed.
+
+## 8. Sessions and the stream (frozen)
+
+- A turn is started, not awaited: `POST /api/sessions/:id/messages` → `202`,
+  then runs in the background (`TurnRegistry`, one turn per session).
+- The page tails `GET /api/sessions/:id/events?since=N` (seq is dense, 0-based).
+  Closing the tab never stops a turn; reopening replays it.
+- `abort` wraps `llm.complete({signal})` — no engine change. A tool already
+  running is not interrupted (v1); `run_task` exists precisely for that.
+- Resume: pi-durable marks dangling tool calls failed and never replays them.
+  ctrl adds `<sessionDir>/ctrl.json` = `{ machine, remoteCwd, createdAt }` so a
+  reopened session knows where it was working.
+
+## 9. Page (frozen)
+
+One page, four parts: conversation, composer (with machine chip), session rail,
+status strip. Tool calls render inline as cards: name, machine, duration, exit
+status, collapsed output. No machine panel, no terminal panel, no dashboard.
+
+## 10. HTTP API (frozen)
+
+| Method + path | Behaviour |
 | --- | --- |
-| `agent.ts` gives every tool call **10 s** (`TOOL_TIMEOUT_MS`), not configurable | any command that can exceed 10 s must go through `spawn` (`run_task`), never `exec` |
-| `machine.exec` caps at **600 s**, `input`/`file.write` at **8 MB base64** | chunk big transfers; long builds are terminals, not execs |
-| `runAgent()` has no token streaming and no `signal` parameter; `llm.complete()` *does* take `signal` | the log is the stream (§0.1); abort = wrap the client, no engine change |
-| event `seq` is dense and 0-based after replay | `?since=` is an index, not a timestamp — cheap tail |
-| `detectResumePoint()` returns `empty` / `clean` / `dangling_tool_call` / `interrupted_turn` | the UI badge maps directly onto these four |
-| `machine.exec` takes argv, **no shell** | the `bash` tool must send `["sh","-c",command]` explicitly |
+| `GET /api/health` | `{ status, machine, kind }` |
+| `GET /api/machines` | `{ machines: [{ name, kind, current }] }` |
+| `GET /api/sessions` | newest 30 + `title` |
+| `POST /api/sessions` | `{ cwd?, model? }` → 201 |
+| `GET /api/sessions/:id` | `{ session, events, resumePoint, turn }` |
+| `GET /api/sessions/:id/events?since=N` | `{ events, total, since, turn }` ← the stream |
+| `POST /api/sessions/:id/messages` | `{ text }` → 202; busy → 409 |
+| `POST /api/sessions/:id/abort` | `{ aborted }` |
+| `GET/POST /api/memory`, `DELETE /api/memory/:id` | pi-durable memory, tombstone semantics |
 
-## 5. Workspace model (D2 🔴, D3)
+`turn = { running, startedAt?, error?, aborted? }`.
 
-Principle: **local disk is the source of truth**; the remote tree is a build
-mirror that ctrl owns.
+## 11. Testing
 
-- **Write-through**: every `write` goes local first, then `file.write` remote.
-- **Delta push**: before a command runs, ctrl diffs a manifest
-  (`path → size, mtime, xxh/sha`) against the last pushed state and sends only
-  what changed. First contact sends a `tar` through `machine.exec` stdin in
-  ≤6 MB chunks, `<pack>` then `tar -xzf`.
-- **Lazy pull**: `read`/`list` hit local first; on miss, `file.read` remote and
-  cache. This is how remote-generated files (`go.sum`, generated code) become
-  visible without a full sync-back.
-- **Exclusions**: `.git/`, `node_modules/`, build caches by default; configurable.
+- Unit: SSH quoting/escaping, LocalExecutor, TurnRegistry lock, `since` slicing.
+- e2e: fake LLM + local executor — create session → send → events grow → tool
+  card data present; 409 on a second concurrent turn; abort path.
+- Manual (the only real acceptance): a Go repo on `hw-nj` builds from a sentence
+  typed into the page, and the card says `hw-nj · <n>s · exit 0`.
 
-Remote root 🔴 — options:
+## 12. Decisions (resolved)
 
-| Option | Path | Trade-off |
+| # | Decision | Value |
 | --- | --- | --- |
-| A | `<remoteRoot>/.ctrl/<sessionId>/` | isolation by construction; duplicates the tree per session |
-| B | `<remoteRoot>/` shared, `git worktree` per session | cheap, but needs git and a clean base repo |
-| C | user-supplied absolute path per session | simplest, no isolation |
-
-Recommendation: **A** for v1 (correctness over disk), revisit when repos get big.
-
-## 6. Durable sessions and resume (D5)
-
-- Reuse pi-durable's `events.jsonl` and memory log — ctrl adds **no fields to
-  the frozen wire format**.
-- ctrl writes a **sidecar** `<sessionDir>/ctrl.jsonl`: one record per tool call
-  binding `callId → { machine, cwd, argv, terminal?, startedAt }`. It is
-  derived data; events.jsonl stays authoritative for the conversation.
-- Resume: replays events (pi-durable already marks dangling tool calls as
-  failed, never re-executes — its §A1/R5), then uses the sidecar to
-  `terminal.get` any address: still alive → attach/observe; gone → report
-  "lost", do not resend the command.
-- Each session owns exactly one remote workdir and at most one long-running
-  terminal per `spawn` call.
-
-## 7. Long tasks (D4)
-
-- Threshold: a command expected to exceed ~60 s goes through `spawn`
-  (`terminal.run`) instead of `exec`. The model chooses via a separate tool
-  (`run_task`) rather than ctrl guessing.
-- Streaming: ctrl polls `terminal.read` (bounded lines) and pushes to the web
-  layer over SSE; exit status comes from `terminal.wait`.
-- Interrupt: `terminal.interrupt`, then keep the terminal address in the sidecar.
-- Never wait on a terminal from the agent loop without a deadline; the loop
-  records `assistant_pending`/tool call before waiting.
-
-## 8. Web surface (D6, R2)
-
-- `node:http`, zero deps, loopback by default (`127.0.0.1:7333`), optional
-  `--token`; no CORS, no cookies, no accounts.
-- **One page** (§0.1): conversation, composer with a machine chip, session rail,
-  status strip. No machine or terminal panel.
-- API:
-
-  | Method & path | Purpose |
-  | --- | --- |
-  | `GET /api/health` | liveness |
-  | `GET /api/sessions` · `POST /api/sessions` | rail |
-  | `GET /api/sessions/:id` | meta + full event list |
-  | `GET /api/sessions/:id/events?since=N` | **the stream** (poll, cheap) |
-  | `POST /api/sessions/:id/messages` | `202`; runs the turn in the background; `409` if a turn is already in flight |
-  | `POST /api/sessions/:id/abort` | stop the current turn |
-  | `GET /api/memory` · `POST /api/memory` · `DELETE /api/memory/:id` | memory |
-  | `GET /api/machines` | `machine.list` (M2) |
-  | `GET /api/tasks/:addr/stream` | SSE tail of a long task (M4 only) |
-
-- One turn per session at a time (a lock in the server, not in the browser).
-- Every herdr method exposed to the browser must be **whitelisted**; `machine.add`,
-  `machine.rm`, `terminal.attach`, `terminal.kill` stay CLI-only in v1.
-- The web process is the only thing holding the `hc connect` pipe.
-
-## 9. Scheduling (D7 🔴)
-
-v1 = the agent runs commands on a chosen machine; ctrl picks the machine from a
-config default plus an explicit `--on`.
-
-v2 = `terminal.run` launches agent templates (pi/claude) on a machine, ctrl
-tracks them as durable child tasks (`wait`/`send`/`read`), and the web UI shows
-a task tree. The door is the sidecar record plus a `tasks` table in the UI; no
-schema change is needed now.
-
-## 10. Testing (frozen requirements)
-
-- **Unit**: JSON-RPC client against a fake stdio core; manifest diff; tar
-  chunking; each tool adapter (limits, base64, error kinds).
-- **e2e**: fake herdr core (stdio JSON-RPC server) + pi-durable's fake LLM
-  server; scenarios: remote edit → remote exec → local read; long task stream;
-  `kill -9` then resume with a live and a dead terminal.
-- **Live acceptance (manual, M1 gate)**: from a local checkout, `ctrl` builds a
-  Go repo on `hw-nj`; the target has hc + Go and **no node, no pi, no agent**.
-
-## 11. Open decisions (🔴 all of them change what M1 code looks like)
-
-| # | Question | Recommendation |
-| --- | --- | --- |
-| D0 | how ctrl depends on pi-durable | A: sibling checkout + `file:` + `exports` map |
-| D2 | workspace: write-through mirror vs remote-as-truth | write-through (keep local truth) |
-| D3 | remote workdir layout | `~/.ctrl/<sessionId>/` per session |
-| D-a | web auth: loopback only vs `--token` | loopback + optional token |
-| D-b | v1 scope: commands only vs also launch agents | commands only |
-| D-d | M1 starts from pi-durable's existing web app (re-skinned) vs a fresh UI | reuse its routes/loop, rewrite the page |
-| D-c | which LLM/provider | same as pi-durable (`workbuddy/hy4-preview-ioa`, key from `~/.pi/agent/auth.json`) |
-
-## 12. Milestones — product order (frozen, R2)
-
-The page comes first; the hands come second. Every milestone ends with something
-visible in the chat, not with a library.
-
-| # | Deliverable | Acceptance (visible in the page) |
-| --- | --- | --- |
-| **M1** | ctrl chat page: pi-durable loop behind it, local executor, log-tail streaming, tool cards | 打开页面聊一轮：消息逐条出现，工具卡片即时出现，刷新不丢 |
-| **M2** | herdr executor + `run_task` (spawn) + machine chip + machine badge on every tool card | 选择 `hw-nj`，让它 `go build`，卡片上写着“hw-nj · 42s · exit 0”。`run_task` 必须在 M2：agent 循环把单个工具卡在 10 s（§4.1） |
-| **M3** | write-through + manifest delta + lazy pull | 改一个文件只推一个；远端生成的 `go.sum` 本地能读到 |
-| **M4** | `run_task` long tasks + live tail + stop | 10 分钟构建有实时输出，可停止；关掉浏览器仍在跑 |
-| **M5** | crash resume + terminal reattach + cross-session memory | `kill -9` 后重开页面，对话完整，活终端能接上，死终端诚实报丢 |
-
-M1 must not import herdr at all. M2 must not require M3 for read-only work
-(`exec` + `read` only). This keeps every step shippable.
+| D1 | transport | SSH (system binary, ControlMaster); herdr later, optional |
+| D2 | workspace | remote is the truth; no sync |
+| D3 | machine | one per session, `--machine`, transparent to the model |
+| D4 | long tasks | `run_task` + `task_output` (10 s loop cap) |
+| D5 | engine | pi-durable, one import file, no modifications |
+| D6 | UI | one page, no panels |
 
 ## 13. Revisions
 
-- **R1** — project started. Repo `zzjcool/ctrl`. Name story: the broken Ctrl key.
-- **R2** — product surface clarified by the owner: a single conversation page is
-  the product; herdr/pi-durable are the substrate. Milestone order flipped from
-  executor-first to page-first, and the log-tail streaming decision replaced a
-  token-streaming change to pi-durable.
+- **R1** — naming; repo created.
+- **R2** — product surface = one conversation page; milestones page-first.
+- **R3** — personal scope, remote-as-workdir, SSH-only, tool set narrowed to
+  pi-durable's plus the long-task pair. Product/competitive framing dropped.
