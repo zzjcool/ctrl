@@ -97,7 +97,7 @@ export class JobRunner {
     return this.jobTimeoutMinutes * 60_000
   }
 
-  workerArgv(input: { id: string; task: string; model?: string; thinking?: string }, piDir: string): string[] {
+  workerArgv(input: { id: string; task: string; model?: string; thinking?: string }): string[] {
     return [
       "-p",
       input.task,
@@ -107,8 +107,7 @@ export class JobRunner {
       nonEmpty(input.model) ?? this.model,
       "--thinking",
       nonEmpty(input.thinking) ?? this.thinking,
-      "--session-dir",
-      piDir,
+      "--no-session",
     ]
   }
 
@@ -139,7 +138,7 @@ export class JobRunner {
     const startedAt = new Date().toISOString()
     const model = nonEmpty(input.model) ?? this.model
     const thinking = nonEmpty(input.thinking) ?? this.thinking
-    const args = this.workerArgv({ id: paths.id, task, model, thinking }, paths.piDir)
+    const args = this.workerArgv({ id: paths.id, task, model, thinking })
 
     let child: ChildProcess
     let logFd: number

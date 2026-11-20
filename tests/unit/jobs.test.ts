@@ -176,7 +176,7 @@ test("a job id is 20261120T080102Z-a1b2c3 shaped and sortable", () => {
 
 test("the worker command line is the frozen one (CONTRACT §5.1)", () => {
   const runner = makeRunner({ piProvider: "any-endpoint" })
-  assert.deepEqual(runner.workerArgv({ id: "20261120T080102Z-a1b2c3", task: "count the .ts files" }, "/tmp/x/pi"), [
+  assert.deepEqual(runner.workerArgv({ id: "20261120T080102Z-a1b2c3", task: "count the .ts files" }), [
     "-p",
     "count the .ts files",
     "--provider",
@@ -185,11 +185,10 @@ test("the worker command line is the frozen one (CONTRACT §5.1)", () => {
     "test-model",
     "--thinking",
     "max",
-    "--session-dir",
-    "/tmp/x/pi",
+    "--no-session",
   ])
   assert.deepEqual(
-    runner.workerArgv({ id: "20261120T080102Z-a1b2c3", task: "t", model: "other/model", thinking: "low" }, "/p").slice(4, 8),
+    runner.workerArgv({ id: "20261120T080102Z-a1b2c3", task: "t", model: "other/model", thinking: "low" }).slice(4, 8),
     ["--model", "other/model", "--thinking", "low"],
     "delegate may override model and thinking per job",
   )
@@ -226,8 +225,7 @@ test("delegate starts a detached pi worker, writes the job dir, and returns at o
     assert.equal(readJob(agentHome, id)?.state, "running")
 
     const log = await waitForLog(id, "args: -p say hi --provider any-endpoint")
-    assert.match(log, new RegExp(`--session-dir ${paths.piDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`))
-    assert.doesNotMatch(log, /--session-id/, "pi picks its own session id; a fixed one only warns")
+    assert.match(log, /--no-session/)
 
     assert.equal(readJob(agentHome, id)?.state, "running")
     assert.equal(countRunning(agentHome), 1)
