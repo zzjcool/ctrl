@@ -34,7 +34,7 @@ import {
   DEFAULT_SWEEP_INTERVAL_MS,
   startServer,
 } from "../server/server.ts"
-import { DEFAULT_JOB_TIMEOUT_MINUTES, DEFAULT_MAX_WORKERS, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER } from "../jobs/runner.ts"
+import { DEFAULT_JOB_TIMEOUT_MINUTES, DEFAULT_MAX_WORKERS, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER, DEFAULT_STALL_MINUTES } from "../jobs/runner.ts"
 
 export type Mode = "serve" | "agent-list" | "agent-new" | "agent-rm" | "dream" | "help" | "version"
 
@@ -55,6 +55,8 @@ interface Flags {
   maxWorkers: number
 
   jobTimeoutMinutes: number
+
+  stallMinutes: number
   maxSteps: number
 
   contextBudget?: number
@@ -94,6 +96,9 @@ Serve options:
   --max-workers <n>  how many workers may run at once (default ${DEFAULT_MAX_WORKERS})
   --job-timeout <m>  kill a worker that has run longer than m minutes, and report it
                      (default ${DEFAULT_JOB_TIMEOUT_MINUTES}; 0 = no limit)
+  --stall-minutes <m>
+                     kill a worker that wrote nothing to its log for m minutes
+                     (default ${DEFAULT_STALL_MINUTES}; 0 = off)
   --max-steps <n>    tool-loop budget per turn (default ${DEFAULT_MAX_STEPS})
   --context-budget <n>
                      characters of transcript the model sees before the oldest
@@ -138,6 +143,7 @@ export function parseArgs(argv: string[]): Flags {
     piProvider: DEFAULT_PI_PROVIDER,
     maxWorkers: DEFAULT_MAX_WORKERS,
     jobTimeoutMinutes: DEFAULT_JOB_TIMEOUT_MINUTES,
+    stallMinutes: DEFAULT_STALL_MINUTES,
     maxSteps: DEFAULT_MAX_STEPS,
     heartbeatMinutes: DEFAULT_HEARTBEAT_IDLE_MINUTES,
     heartbeatBudget: DEFAULT_HEARTBEAT_TOKEN_BUDGET,
@@ -219,6 +225,9 @@ export function parseArgs(argv: string[]): Flags {
       case "--job-timeout":
 
         flags.jobTimeoutMinutes = integer(value(), "--job-timeout", 0, 10_080)
+        break
+      case "--stall-minutes":
+        flags.stallMinutes = integer(value(), "--stall-minutes", 0, 10_080)
         break
       case "--max-steps":
         flags.maxSteps = integer(value(), "--max-steps", 1, 200)
@@ -513,6 +522,7 @@ async function serveCommand(flags: Flags): Promise<number> {
       piProvider: flags.piProvider,
       maxWorkers: flags.maxWorkers,
       jobTimeoutMinutes: flags.jobTimeoutMinutes,
+      stallMinutes: flags.stallMinutes,
       maxSteps: flags.maxSteps,
       heartbeatIdleMinutes: flags.heartbeatMinutes,
       heartbeatBudget: flags.heartbeatBudget,
@@ -543,6 +553,7 @@ async function serveCommand(flags: Flags): Promise<number> {
       `  pi bin: ${running.ctx.jobs.piBin} (provider ${running.ctx.jobs.piProvider || "default"})\n` +
       `  max workers: ${running.ctx.jobs.maxWorkers}\n` +
       `  job timeout: ${running.ctx.jobTimeoutMinutes > 0 ? `${running.ctx.jobTimeoutMinutes}m (swept every ${Math.round(DEFAULT_SWEEP_INTERVAL_MS / 1000)}s)` : "none"}\n` +
+      `  stall guard: ${running.ctx.jobs.stallMinutes > 0 ? `${running.ctx.jobs.stallMinutes}m without new output (swept every ${Math.round(DEFAULT_SWEEP_INTERVAL_MS / 1000)}s)` : "off"}\n` +
       `  context budget: ${running.ctx.contextBudget} chars\n` +
       `  heartbeat: ${heartbeatLine(running.ctx.heartbeat)}\n` +
       `  directory: ${running.ctx.agentHome}\n`,

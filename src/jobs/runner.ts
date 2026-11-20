@@ -23,6 +23,10 @@ export const DEFAULT_MAX_WORKERS = 3
 
 export const DEFAULT_JOB_TIMEOUT_MINUTES = 15
 
+export const DEFAULT_STALL_MINUTES = 4
+
+export const STALL_GRACE_MS = 120_000
+
 export const STOP_TIMEOUT_MS = 3_000
 const STOP_POLL_MS = 50
 
@@ -34,6 +38,8 @@ export interface RunnerConfig {
   maxWorkers?: number
 
   jobTimeoutMinutes?: number
+
+  stallMinutes?: number
 
   model: string
 
@@ -72,6 +78,8 @@ export class JobRunner {
 
   readonly jobTimeoutMinutes: number
 
+  readonly stallMinutes: number
+
   onExit?: (job: JobView) => void
   private readonly model: string
   private readonly thinking: string
@@ -88,6 +96,10 @@ export class JobRunner {
       config.jobTimeoutMinutes !== undefined && Number.isFinite(config.jobTimeoutMinutes) && config.jobTimeoutMinutes >= 0
         ? Math.floor(config.jobTimeoutMinutes)
         : DEFAULT_JOB_TIMEOUT_MINUTES
+    this.stallMinutes =
+      config.stallMinutes !== undefined && Number.isFinite(config.stallMinutes) && config.stallMinutes >= 0
+        ? Math.floor(config.stallMinutes)
+        : DEFAULT_STALL_MINUTES
     this.onExit = config.onExit
     this.model = config.model
     this.thinking = config.thinking
@@ -95,6 +107,10 @@ export class JobRunner {
 
   get jobTimeoutMs(): number {
     return this.jobTimeoutMinutes * 60_000
+  }
+
+  get stallMs(): number {
+    return this.stallMinutes * 60_000
   }
 
   workerArgv(input: { id: string; task: string; model?: string; thinking?: string }): string[] {
@@ -108,6 +124,8 @@ export class JobRunner {
       "--thinking",
       nonEmpty(input.thinking) ?? this.thinking,
       "--no-session",
+      "--mode",
+      "json",
     ]
   }
 
@@ -260,6 +278,25 @@ export class JobRunner {
     }
     return stopped
   }
+
+  async sweepStalls(now: number = Date.now()): Promise<string[]> {
+    const stallMs = this.stallMs
+    if (stallMs <= 0) return []
+    const stopped: string[] = []
+    for (const job of listJobs(this.agentHome, { limit: 0, now })) {
+      if (job.state !== "running") continue
+      if (job.elapsedMs <= STALL_GRACE_MS) continue
+      const logPath = jobPaths(this.agentHome, job.id).logPath
+      const lastWrite = lastModifiedMs(logPath)
+      if (lastWrite === undefined) continue
+      const quietMs = now - lastWrite
+      if (quietMs <= stallMs) continue
+      appendNote(logPath, `ctrl: no output for ${Math.floor(quietMs / 60_000)}m — stopped`)
+      const reply = await this.stop(job.id)
+      if (reply.ok) stopped.push(job.id)
+    }
+    return stopped
+  }
 }
 
 function resolveBinary(requested: string): string | undefined {
@@ -305,6 +342,15 @@ function signalGroup(pid: number, signal: NodeJS.Signals): void {
     process.kill(pid, signal)
   } catch {
 
+  }
+}
+
+function lastModifiedMs(file: string): number | undefined {
+  try {
+    const info = statSync(file)
+    return info.isFile() ? info.mtimeMs : undefined
+  } catch {
+    return undefined
   }
 }
 

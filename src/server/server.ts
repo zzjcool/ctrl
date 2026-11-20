@@ -4,7 +4,14 @@ import type { DatabaseSync } from "node:sqlite"
 import { fileURLToPath } from "node:url"
 import { createChatCompletionsClient, openSession } from "../engine/durable.ts"
 import type { LlmClient } from "../engine/durable.ts"
-import { DEFAULT_MAX_WORKERS, DEFAULT_JOB_TIMEOUT_MINUTES, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER, JobRunner } from "../jobs/runner.ts"
+import {
+  DEFAULT_JOB_TIMEOUT_MINUTES,
+  DEFAULT_MAX_WORKERS,
+  DEFAULT_PI_BIN,
+  DEFAULT_PI_PROVIDER,
+  DEFAULT_STALL_MINUTES,
+  JobRunner,
+} from "../jobs/runner.ts"
 import { createSqliteAgentMemory } from "../memory/agent-memory.ts"
 import { lastIndexedSeq, readMeta, writeMeta } from "../memory/db.ts"
 import { DREAM_IDLE_MS, DREAM_TICK_MS, DreamController, lastDreamSeq } from "../memory/dream.ts"
@@ -86,6 +93,8 @@ export interface ServerConfig {
 
   jobTimeoutMinutes?: number
 
+  stallMinutes?: number
+
   sweepIntervalMs?: number
   publicDir?: string
   selfEdit?: SelfEditConfig
@@ -155,6 +164,10 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     piProvider: config.piProvider ?? DEFAULT_PI_PROVIDER,
     maxWorkers: config.maxWorkers ?? DEFAULT_MAX_WORKERS,
     jobTimeoutMinutes,
+    stallMinutes:
+      Number.isFinite(config.stallMinutes) && (config.stallMinutes ?? 0) >= 0
+        ? Math.floor(config.stallMinutes as number)
+        : DEFAULT_STALL_MINUTES,
     model: defaultModel,
     thinking: reasoningEffort,
   })
@@ -335,9 +348,22 @@ export function defaultRepoRoot(): string {
 }
 
 function sweepJobs(ctx: AppContext): void {
-  void ctx.jobs.sweepTimeouts().catch((error: unknown) => {
-    process.stderr.write(`ctrl: job timeout sweep failed: ${error instanceof Error ? error.message : String(error)}\n`)
-  })
+  void (async () => {
+    try {
+      await ctx.jobs.sweepTimeouts()
+    } catch (error: unknown) {
+      warnSweep("job timeout sweep", error)
+    }
+    try {
+      await ctx.jobs.sweepStalls()
+    } catch (error: unknown) {
+      warnSweep("job stall sweep", error)
+    }
+  })()
+}
+
+function warnSweep(label: string, error: unknown): void {
+  process.stderr.write(`ctrl: ${label} failed: ${error instanceof Error ? error.message : String(error)}\n`)
 }
 
 export function createAppServer(config: ServerConfig = {}): { server: Server; ctx: AppContext } {
@@ -374,7 +400,7 @@ export async function startServer(config: ServerConfig = {}): Promise<RunningSer
       ? Math.floor(config.sweepIntervalMs as number)
       : DEFAULT_SWEEP_INTERVAL_MS
   let sweepTimer: NodeJS.Timeout | undefined
-  if (ctx.jobTimeoutMinutes > 0) {
+  if (ctx.jobTimeoutMinutes > 0 || ctx.jobs.stallMinutes > 0) {
     sweepJobs(ctx)
     sweepTimer = setInterval(() => sweepJobs(ctx), sweepIntervalMs)
     sweepTimer.unref()

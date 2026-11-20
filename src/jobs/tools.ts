@@ -9,6 +9,7 @@ import {
   readJobLog,
   waitForJob,
 } from "./store.ts"
+import { renderStream } from "./stream.ts"
 
 export const DEFAULT_WAIT_MS = 8_000
 import type { JobState, JobView } from "./store.ts"
@@ -61,6 +62,10 @@ function oneLine(text: string, max: number): string {
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat
 }
 
+function clipChars(text: string, max: number): string {
+  return text.length <= max ? text : text.slice(text.length - max)
+}
+
 const STATE_HINTS: Partial<Record<JobState, string>> = {
   lost: "the worker process is gone and never recorded an exit — ctrl restarted while it ran",
   running: "still working; poll again with job_status",
@@ -82,9 +87,12 @@ export function renderJobStatus(
   const hint = STATE_HINTS[job.state]
   if (hint !== undefined) header.push(`note: ${hint}`)
 
-  const log = readJobLog(agentHome, job.id, { lines: opts.lines, full: opts.full })
-  const body = log.text.trimEnd() === "" ? "(no output yet)" : log.text.trimEnd()
-  const truncation = log.truncated
+  const log = readJobLog(agentHome, job.id, { lines: 0 })
+  const full = opts.full === true
+  const rendered = renderStream(log.text, { maxLines: full ? 0 : (opts.lines ?? DEFAULT_TAIL_LINES) }).trimEnd()
+  const clipped = full ? clipChars(rendered, MAX_OUTPUT_CHARS) : rendered
+  const body = clipped === "" ? "(no output yet)" : clipped
+  const truncation = full && clipped.length < rendered.length
     ? `\n(truncated to the last ${MAX_OUTPUT_CHARS} characters — ask for lines=N to page the tail)`
     : ""
   return `${header.join("\n")}\n\n${body}${truncation}`

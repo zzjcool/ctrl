@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises"
+import { readFileSync } from "node:fs"
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { after, before, test } from "node:test"
@@ -17,6 +18,7 @@ import {
   readJob,
   readJobLog,
   readJobMeta,
+  updateJobMeta,
   writeJobMeta,
 } from "../../src/jobs/store.ts"
 import type { JobMeta, JobView } from "../../src/jobs/store.ts"
@@ -138,12 +140,17 @@ function deadPid(): number {
   throw new Error("no free pid found")
 }
 
-async function seedJob(id: string, startedAt: string, meta: Partial<JobMeta> = {}): Promise<string> {
-  await mkdir(jobPaths(agentHome, id).dir, { recursive: true })
-  writeJobMeta(agentHome, {
+async function seedJobIn(
+  home: string,
+  id: string,
+  meta: Partial<JobMeta> = {},
+  startedAt: string = new Date().toISOString(),
+): Promise<string> {
+  await mkdir(jobPaths(home, id).dir, { recursive: true })
+  writeJobMeta(home, {
     id,
     task: `seeded ${id}`,
-    cwd: agentHome,
+    cwd: home,
     model: "test-model",
     thinking: "max",
     startedAt,
@@ -151,6 +158,10 @@ async function seedJob(id: string, startedAt: string, meta: Partial<JobMeta> = {
     ...meta,
   })
   return id
+}
+
+async function seedJob(id: string, startedAt: string, meta: Partial<JobMeta> = {}): Promise<string> {
+  return await seedJobIn(agentHome, id, meta, startedAt)
 }
 
 before(async () => {
@@ -186,7 +197,13 @@ test("the worker command line is the frozen one (CONTRACT §5.1)", () => {
     "--thinking",
     "max",
     "--no-session",
+    "--mode",
+    "json",
   ])
+  assert.ok(
+    runner.workerArgv({ id: "20261120T080102Z-a1b2c3", task: "t" }).join(" ").includes("--mode json"),
+    "the worker streams JSON events so its log shows progress and can be watched for stalls",
+  )
   assert.deepEqual(
     runner.workerArgv({ id: "20261120T080102Z-a1b2c3", task: "t", model: "other/model", thinking: "low" }).slice(4, 8),
     ["--model", "other/model", "--thinking", "low"],
@@ -451,6 +468,89 @@ test("the sweep leaves a worker alone until it is actually past the timeout", as
   }
 })
 
+test("a worker that stopped writing its log is killed by the stall sweep, and its log says why", async () => {
+  setEnv({ FAKE_PI_SLEEP: "30" })
+  const runner = makeRunner()
+  const work = await scratchDir("ctrl-jobs-work-")
+  try {
+    assert.equal(runner.stallMinutes, 4)
+    const reply = runner.delegate({ task: "go quiet" }, work)
+    const id = idOf(reply.output)
+    const pid = readJobMeta(agentHome, id)?.pid ?? 0
+    await waitForLog(id, "args: -p go quiet")
+
+    const quietSince = new Date(Date.now() - 10 * 60_000)
+    await utimes(jobPaths(agentHome, id).logPath, quietSince, quietSince)
+    updateJobMeta(agentHome, id, { startedAt: quietSince.toISOString() })
+
+    assert.deepEqual(await runner.sweepStalls(), [id])
+
+    const job = readJob(agentHome, id)
+    assert.equal(job?.state, "killed")
+    assert.equal(job?.signal, "SIGTERM")
+    assert.equal(isProcessAlive(pid), false, "the worker's process group is gone")
+
+    const log = readJobLog(agentHome, id, { full: true }).text
+    assert.match(log, /ctrl: no output for \d+m — stopped/)
+
+    const shown = await jobTool(runner, "job_status").execute({ id }, toolContext(work))
+    assert.match(shown.output, /state: killed/)
+    assert.match(shown.output, /ctrl: no output for \d+m — stopped/, "the note survives the renderer as a plain line")
+
+    assert.deepEqual(await runner.sweepStalls(), [])
+  } finally {
+    setEnv({})
+  }
+})
+
+test("the stall sweep leaves a young worker and a busy worker alone", async () => {
+  setEnv({ FAKE_PI_SLEEP: "30" })
+  const runner = makeRunner()
+  const work = await scratchDir("ctrl-jobs-work-")
+  try {
+    const reply = runner.delegate({ task: "just started" }, work)
+    const id = idOf(reply.output)
+    await waitForLog(id, "args: -p just started")
+
+    assert.deepEqual(await runner.sweepStalls(), [], "the two-minute grace covers a fresh worker")
+    assert.equal(readJob(agentHome, id)?.state, "running")
+
+    updateJobMeta(agentHome, id, { startedAt: new Date(Date.now() - 10 * 60_000).toISOString() })
+    assert.deepEqual(await runner.sweepStalls(), [], "an old job whose log just grew is still working")
+    assert.equal(readJob(agentHome, id)?.state, "running")
+
+    await runner.stop(id)
+    assert.equal(readJob(agentHome, id)?.state, "killed")
+  } finally {
+    setEnv({})
+  }
+})
+
+test("--stall-minutes 0 turns the stall sweep off", async () => {
+  setEnv({ FAKE_PI_SLEEP: "30" })
+  const work = await scratchDir("ctrl-jobs-work-")
+  try {
+    const runner = makeRunner()
+    const reply = runner.delegate({ task: "quiet for an hour" }, work)
+    const id = idOf(reply.output)
+    await waitForLog(id, "args: -p quiet for an hour")
+
+    const quietSince = new Date(Date.now() - 60 * 60_000)
+    await utimes(jobPaths(agentHome, id).logPath, quietSince, quietSince)
+    updateJobMeta(agentHome, id, { startedAt: quietSince.toISOString() })
+
+    const off = makeRunner({ stallMinutes: 0 })
+    assert.equal(off.stallMinutes, 0)
+    assert.deepEqual(await off.sweepStalls(), [])
+    assert.equal(readJob(agentHome, id)?.state, "running")
+
+    await runner.stop(id)
+    assert.equal(readJob(agentHome, id)?.state, "killed")
+  } finally {
+    setEnv({})
+  }
+})
+
 test("the tools answer a bad id with a sentence instead of throwing", async () => {
   const runner = makeRunner()
   const work = await scratchDir("ctrl-jobs-work-")
@@ -545,6 +645,40 @@ test("a job directory that was hand-made in an earlier run is still readable", a
   const status = createJobTools({ runner, agentHome: home }).find((tool) => tool.name === "job_status")
   const shown = await status?.execute({ id }, toolContext("/tmp"))
   assert.match(shown?.output ?? "", /found 42 files/)
+  assert.equal(shown?.output.split("\n\n").slice(1).join("\n\n").trimEnd(), "found 42 files\ndone", "plain log lines stay as they are")
+})
+
+test("job_status renders a JSONL worker log as a timeline", async () => {
+  const home = await scratchDir("ctrl-jobs-jsonl-")
+  const id = await seedJobIn(home, "20261120T080102Z-jsonl1", {
+    exitedAt: new Date().toISOString(),
+    code: 0,
+    signal: null,
+  })
+  const stream = readFileSync(new URL("./fixtures/pi-json-stream.jsonl", import.meta.url), "utf8")
+  const giant = JSON.stringify({ type: "agent_end", messages: [{ role: "system", content: "pad ".repeat(9_000) }] })
+  await writeFile(path.join(home, "jobs", id, "out.log"), `${stream}${giant}\nctrl: no output for 4m — stopped\n`)
+
+  const runner = makeRunner()
+  const status = createJobTools({ runner, agentHome: home }).find((tool) => tool.name === "job_status")
+  const shown = await status?.execute({ id }, toolContext("/tmp"))
+  const body = (shown?.output ?? "").split("\n\n").slice(1).join("\n\n").trimEnd()
+  assert.equal(
+    body,
+    [
+      "→ bash: echo hello-ctrl",
+      "← hello-ctrl",
+      "assistant: The command printed `hello-ctrl`.",
+      "ctrl: no output for 4m — stopped",
+    ].join("\n"),
+    shown?.output,
+  )
+  assert.ok(!shown?.output.includes("tool_execution_start"), "raw events do not leak into the status")
+  assert.ok(
+    body.includes("→ bash: echo hello-ctrl"),
+    "a huge trailing event does not push the timeline out of the window",
+  )
+  assert.equal(body.split("\n").length, 4)
 })
 
 test("a missing pi binary is refused up front, not turned into a ghost job", async () => {
