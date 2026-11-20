@@ -646,6 +646,10 @@ function applyJobToCard(card, job) {
   card.badgeState.textContent = badgeText(jobState, job.code)
   if (job.elapsedMs !== null) card.durEl.textContent = formatDuration(job.elapsedMs)
   if (job.task && !card.taskEl.textContent) setJobTask(card, job.task)
+  if (typeof job.output === "string" && job.output.trim()) {
+    card.pre.textContent = job.output.trim()
+    card.pre.classList.remove("is-empty")
+  }
 }
 
 function fillJobCall(card, data, ts) {

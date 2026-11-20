@@ -28,7 +28,7 @@ import type {
   ToolSpec,
 } from "../engine/durable.ts"
 import type { JobRunner } from "../jobs/runner.ts"
-import { DEFAULT_LIST_LIMIT, listJobs } from "../jobs/store.ts"
+import { DEFAULT_LIST_LIMIT, listJobs, readJobLog } from "../jobs/store.ts"
 import type { JobView } from "../jobs/store.ts"
 import { LOG_ID } from "./agents.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
@@ -130,7 +130,9 @@ export async function handleApiRequest(
         sendJson(response, 405, { error: `method ${method} not allowed` })
         return true
       }
-      sendJson(response, 200, { jobs: listJobs(ctx.agentHome, { limit: DEFAULT_LIST_LIMIT }).map(jobSummary) })
+      sendJson(response, 200, {
+        jobs: listJobs(ctx.agentHome, { limit: DEFAULT_LIST_LIMIT }).map((job) => jobSummary(job, ctx.agentHome)),
+      })
       return true
     }
 
@@ -283,8 +285,8 @@ function describeAgent(ctx: AppContext): Record<string, unknown> {
 }
 
 /** CONTRACT §7: the six fields the page polls for a delegate card. */
-export function jobSummary(job: JobView): Record<string, unknown> {
-  return {
+export function jobSummary(job: JobView, agentHome?: string): Record<string, unknown> {
+  const summary: Record<string, unknown> = {
     id: job.id,
     state: job.state,
     task: job.task,
@@ -292,6 +294,15 @@ export function jobSummary(job: JobView): Record<string, unknown> {
     elapsedMs: job.elapsedMs,
     ...(typeof job.code === "number" ? { code: job.code } : {}),
   }
+  // The page shows a delegate card long after the turn that started it, and
+  // the tool result only says "started job …". A tail of the worker's own log
+  // is what makes the card worth looking at.
+  if (agentHome !== undefined) {
+    const log = readJobLog(agentHome, job.id, { lines: 15 })
+    const text = log.text.trimEnd()
+    if (text !== "") summary.output = text.length > 3_000 ? `…${text.slice(-3_000)}` : text
+  }
+  return summary
 }
 
 // ---------------------------------------------------------------------------
