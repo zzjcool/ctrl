@@ -1,21 +1,35 @@
 import { createServer } from "node:http"
 import type { IncomingMessage, Server, ServerResponse } from "node:http"
+import type { DatabaseSync } from "node:sqlite"
 import { fileURLToPath } from "node:url"
 import { createChatCompletionsClient, openSession } from "../engine/durable.ts"
 import type { LlmClient } from "../engine/durable.ts"
 import { DEFAULT_MAX_WORKERS, DEFAULT_JOB_TIMEOUT_MINUTES, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER, JobRunner } from "../jobs/runner.ts"
 import { createSqliteAgentMemory } from "../memory/agent-memory.ts"
-import { lastIndexedSeq } from "../memory/db.ts"
+import { lastIndexedSeq, readMeta, writeMeta } from "../memory/db.ts"
 import { DREAM_IDLE_MS, DREAM_TICK_MS, DreamController, lastDreamSeq } from "../memory/dream.ts"
+import { openFocusCount, listFocus } from "../memory/focus.ts"
 import { createMemoryIndex } from "../memory/index.ts"
-import { createRecordingLlm } from "../memory/usage.ts"
+import type { MemoryIndex } from "../memory/index.ts"
+import { MAX_PROPOSAL_LIMIT, listProposals } from "../memory/proposals.ts"
+import { createRecordingLlm, usageSummary } from "../memory/usage.ts"
 import type { UsageKind } from "../memory/usage.ts"
 import { DEFAULT_CONTEXT_BUDGET } from "../memory/window.ts"
 import { SelfEditGate } from "../selfedit/gate.ts"
 import { createTools } from "../tools/index.ts"
 import { DEFAULT_AGENT, LOG_ID, ensureAgent, logPath, resolveRoot } from "./agents.ts"
+import {
+  DEFAULT_HEARTBEAT_IDLE_MINUTES,
+  DEFAULT_HEARTBEAT_MAX_PER_DAY,
+  DEFAULT_HEARTBEAT_TICK_MS,
+  DEFAULT_HEARTBEAT_TOKEN_BUDGET,
+  HEARTBEAT_FOCUS_LINES,
+  createHeartbeat,
+  heartbeatCounterKey,
+} from "./heartbeat.ts"
+import type { Heartbeat } from "./heartbeat.ts"
 import { sendJson, serveStatic } from "./http.ts"
-import { dreamOnce, handleApiRequest, type AppContext } from "./routes.ts"
+import { dreamOnce, handleApiRequest, runTurn, type AppContext } from "./routes.ts"
 import { readSidecar, writeSidecar } from "./sidecar.ts"
 import { TurnRegistry } from "./turns.ts"
 import { createWaker, type Waker } from "./wake.ts"
@@ -55,6 +69,14 @@ export interface ServerConfig {
   dreamIntervalMs?: number
 
   dream?: boolean
+
+  heartbeatIdleMinutes?: number
+
+  heartbeatBudget?: number
+
+  heartbeatMaxPerDay?: number
+
+  heartbeatIntervalMs?: number
 
   piBin?: string
 
@@ -148,6 +170,7 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     jobTimeoutMinutes,
 
     wake: undefined as unknown as Waker,
+    heartbeat: undefined as unknown as Heartbeat,
     turns: new TurnRegistry(),
     memory,
     contextBudget,
@@ -209,11 +232,86 @@ export function buildContext(config: ServerConfig = {}): AppContext {
   })
 
   ctx.wake = createWaker(ctx)
+
+  ctx.heartbeat = createHeartbeat(
+    {
+      now: () => Date.now(),
+      usageToday: () => ({
+        tokens: withDb(memory, 0, (db) => {
+          const summary = usageSummary(db, { days: 1 })
+          return summary.today.promptTokens + summary.today.completionTokens
+        }),
+      }),
+      openFocus: () => withDb(memory, 0, (db) => openFocusCount(db)),
+      focusTexts: () =>
+        withDb(memory, [] as string[], (db) =>
+          listFocus(db, { limit: HEARTBEAT_FOCUS_LINES }).map((item) => item.text),
+        ),
+      openProposals: () =>
+        withDb(memory, 0, (db) => listProposals(db, { status: "open", limit: MAX_PROPOSAL_LIMIT }).length),
+      lastEventAt: () => {
+        const at = lastActivityMs(ensured.home)
+        return at === undefined ? undefined : new Date(at).toISOString()
+      },
+      turnRunning: () => ctx.turns.isRunning(LOG_ID),
+      start: (text) => {
+        const log = openSession(LOG_ID, { home: ensured.home })
+        const started = ctx.turns.start(LOG_ID, (signal) => runTurn(ctx, log, text, signal))
+        if (!started) throw new Error("a turn is already running for this agent")
+      },
+      readCounter: (date) =>
+        withDb(memory, 0, (db) => {
+          const raw = readMeta(db, heartbeatCounterKey(date))
+          const parsed = raw === undefined ? 0 : Number.parseInt(raw, 10)
+          return Number.isFinite(parsed) ? parsed : 0
+        }),
+      writeCounter: (date, count) => {
+        const db = memory.handle()
+        if (db === undefined) return
+        try {
+          writeMeta(db, heartbeatCounterKey(date), String(count))
+        } catch (error) {
+          process.stderr.write(
+            `ctrl: heartbeat counter not saved: ${error instanceof Error ? error.message : String(error)}\n`,
+          )
+        }
+      },
+    },
+    {
+      idleMinutes:
+        Number.isFinite(config.heartbeatIdleMinutes) && config.heartbeatIdleMinutes !== undefined
+          ? (config.heartbeatIdleMinutes as number)
+          : DEFAULT_HEARTBEAT_IDLE_MINUTES,
+      dailyTokenBudget:
+        Number.isFinite(config.heartbeatBudget) && config.heartbeatBudget !== undefined
+          ? Math.floor(config.heartbeatBudget as number)
+          : DEFAULT_HEARTBEAT_TOKEN_BUDGET,
+      maxPerDay:
+        Number.isFinite(config.heartbeatMaxPerDay) && config.heartbeatMaxPerDay !== undefined
+          ? Math.floor(config.heartbeatMaxPerDay as number)
+          : DEFAULT_HEARTBEAT_MAX_PER_DAY,
+      tickMs:
+        Number.isFinite(config.heartbeatIntervalMs) && (config.heartbeatIntervalMs ?? 0) > 0
+          ? Math.floor(config.heartbeatIntervalMs as number)
+          : DEFAULT_HEARTBEAT_TICK_MS,
+    },
+  )
+
   runner.onExit = (job) => {
     ctx.wake.notify(job)
     return ctx.selfEdit.handleExit(job)
   }
   return ctx
+}
+
+function withDb<T>(memory: MemoryIndex, fallback: T, read: (db: DatabaseSync) => T): T {
+  const db = memory.handle()
+  if (db === undefined) return fallback
+  try {
+    return read(db)
+  } catch {
+    return fallback
+  }
 }
 
 function lastActivityMs(agentHome: string): number | undefined {
@@ -289,6 +387,7 @@ export async function startServer(config: ServerConfig = {}): Promise<RunningSer
     close: async () => {
 
       ctx.wake.stop()
+      ctx.heartbeat.stop()
       if (sweepTimer !== undefined) {
         clearInterval(sweepTimer)
         sweepTimer = undefined

@@ -7,6 +7,7 @@ import type { MemoryIndex } from "../memory/index.ts"
 import type { UsageKind } from "../memory/usage.ts"
 import type { SelfEditGate } from "../selfedit/gate.ts"
 import { handleAgentRoutes } from "./agent-routes.ts"
+import type { Heartbeat } from "./heartbeat.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
 import { handleJobsRoute } from "./job-routes.ts"
 import { handleMemoryRoutes, isMemoryPath } from "./memory-routes.ts"
@@ -28,6 +29,7 @@ export interface AppContext {
   jobs: JobRunner
   jobTimeoutMinutes: number
   wake: Waker
+  heartbeat: Heartbeat
   turns: TurnRegistry
   memory: MemoryIndex
   contextBudget: number

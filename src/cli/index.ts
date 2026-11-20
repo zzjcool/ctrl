@@ -20,6 +20,12 @@ import {
   resolveRoot,
 } from "../server/agents.ts"
 import {
+  DEFAULT_HEARTBEAT_IDLE_MINUTES,
+  DEFAULT_HEARTBEAT_MAX_PER_DAY,
+  DEFAULT_HEARTBEAT_TOKEN_BUDGET,
+} from "../server/heartbeat.ts"
+import type { Heartbeat } from "../server/heartbeat.ts"
+import {
   DEFAULT_HOST,
   DEFAULT_MAX_STEPS,
   DEFAULT_MODEL,
@@ -52,6 +58,12 @@ interface Flags {
   maxSteps: number
 
   contextBudget?: number
+
+  heartbeatMinutes: number
+
+  heartbeatBudget: number
+
+  heartbeatMax: number
 
   model?: string
   reasoningEffort?: string
@@ -86,6 +98,13 @@ Serve options:
   --context-budget <n>
                      characters of transcript the model sees before the oldest
                      half is compressed into a summary (default ${DEFAULT_CONTEXT_BUDGET})
+  --heartbeat <m>    wake on its own after m idle minutes to look at focus and
+                     pending proposals (default ${DEFAULT_HEARTBEAT_IDLE_MINUTES}; 0 = off)
+  --heartbeat-budget <tokens>
+                     tokens a day the heartbeat may spend before it goes quiet
+                     (default ${DEFAULT_HEARTBEAT_TOKEN_BUDGET})
+  --heartbeat-max <n>
+                     heartbeats per day at most (default ${DEFAULT_HEARTBEAT_MAX_PER_DAY}; 0 = off)
   --model <id>       model for a brand-new log (default workbuddy/deepseek-v4.1-flash,
                      or $PI_DURABLE_MODEL); afterwards the log decides
   --reasoning-effort <level>
@@ -120,6 +139,9 @@ export function parseArgs(argv: string[]): Flags {
     maxWorkers: DEFAULT_MAX_WORKERS,
     jobTimeoutMinutes: DEFAULT_JOB_TIMEOUT_MINUTES,
     maxSteps: DEFAULT_MAX_STEPS,
+    heartbeatMinutes: DEFAULT_HEARTBEAT_IDLE_MINUTES,
+    heartbeatBudget: DEFAULT_HEARTBEAT_TOKEN_BUDGET,
+    heartbeatMax: DEFAULT_HEARTBEAT_MAX_PER_DAY,
     json: false,
     purge: false,
   }
@@ -203,6 +225,15 @@ export function parseArgs(argv: string[]): Flags {
         break
       case "--context-budget":
         flags.contextBudget = integer(value(), "--context-budget", 1_000, 1_000_000)
+        break
+      case "--heartbeat":
+        flags.heartbeatMinutes = integer(value(), "--heartbeat", 0, 10_080)
+        break
+      case "--heartbeat-budget":
+        flags.heartbeatBudget = integer(value(), "--heartbeat-budget", 0, 100_000_000)
+        break
+      case "--heartbeat-max":
+        flags.heartbeatMax = integer(value(), "--heartbeat-max", 0, 96)
         break
       case "--model":
         flags.model = word(value(), "--model")
@@ -483,6 +514,9 @@ async function serveCommand(flags: Flags): Promise<number> {
       maxWorkers: flags.maxWorkers,
       jobTimeoutMinutes: flags.jobTimeoutMinutes,
       maxSteps: flags.maxSteps,
+      heartbeatIdleMinutes: flags.heartbeatMinutes,
+      heartbeatBudget: flags.heartbeatBudget,
+      heartbeatMaxPerDay: flags.heartbeatMax,
       ...(flags.contextBudget !== undefined ? { contextBudget: flags.contextBudget } : {}),
       ...(flags.model !== undefined ? { model: flags.model } : {}),
       ...(flags.reasoningEffort !== undefined ? { reasoningEffort: flags.reasoningEffort } : {}),
@@ -510,6 +544,7 @@ async function serveCommand(flags: Flags): Promise<number> {
       `  max workers: ${running.ctx.jobs.maxWorkers}\n` +
       `  job timeout: ${running.ctx.jobTimeoutMinutes > 0 ? `${running.ctx.jobTimeoutMinutes}m (swept every ${Math.round(DEFAULT_SWEEP_INTERVAL_MS / 1000)}s)` : "none"}\n` +
       `  context budget: ${running.ctx.contextBudget} chars\n` +
+      `  heartbeat: ${heartbeatLine(running.ctx.heartbeat)}\n` +
       `  directory: ${running.ctx.agentHome}\n`,
   )
 
@@ -522,6 +557,11 @@ async function serveCommand(flags: Flags): Promise<number> {
 
   await new Promise<void>((resolve) => running.server.once("close", resolve))
   return 0
+}
+
+function heartbeatLine(heartbeat: Heartbeat): string {
+  if (heartbeat.idleMinutes <= 0 || heartbeat.maxPerDay <= 0) return "off"
+  return `after ${heartbeat.idleMinutes}m idle, max ${heartbeat.maxPerDay}/day, ${heartbeat.dailyTokenBudget} tokens/day`
 }
 
 function isPortInUse(error: unknown): boolean {
