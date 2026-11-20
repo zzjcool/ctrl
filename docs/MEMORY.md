@@ -3,6 +3,10 @@
 > 目标不是"多存一点"，是让 agent **在需要时能把很久以前的事找回来**，
 > 并且在空闲时自己整理。pi-durable 的 `remember/recall` 不够，这一层要重做。
 
+**状态**：M1 ✅ SQLite 镜像 + `search_context` · M2 ✅ 40k 窗口压缩 ·
+M3 ✅ 做梦（抽取/去重/supersede/focus/画像） · M4 ✅ focus 面板 + 记忆抽屉 ·
+M5 ⏳ 语义检索（网关没有 embeddings，等本地模型）
+
 ## 1. 你的想法（原话拆解）
 
 1. 所有上下文进 SQLite。

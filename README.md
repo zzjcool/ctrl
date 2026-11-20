@@ -38,12 +38,18 @@
 
 ## 现状
 
-**v3 开发中**（ctrl 从"自己干活"改成"调 pi 干活"）。契约见
-[docs/CONTRACT.md](docs/CONTRACT.md)，施工单见 [docs/PLAN.md](docs/PLAN.md)。
+**v4**：会说话、会派活、会记事。契约见 [docs/CONTRACT.md](docs/CONTRACT.md)，
+记忆系统设计见 [docs/MEMORY.md](docs/MEMORY.md)。
 
-- 工具：`delegate` / `job_status` / `job_stop` + `remember` / `recall`
-- worker：`pi -p`，每个 job 独立会话目录，输出落盘，最多 3 个并行
-- 模型：默认 `workbuddy/deepseek-v4.1-flash`（reasoning `max`）
+- **记忆**：全部事件增量镜像进 `<agent>/memory.db`（SQLite + FTS5）；
+  对话窗口只留最近约 4 万字符，更早的压成摘要，原文靠 `search_context` 翻。
+- **做梦**：空闲 10 分钟或手动 `POST /api/dream`，抽事实、去重、矛盾 supersede、
+  整理 focus、必要时重写 `profile.md`；每次都有 `dream_runs` 记录。
+- **面板**：右侧 focus（doing/open/blocked）、运行中的 worker、上次做梦时间；
+  「记忆」抽屉可搜索、可删除。
+- **工具**：`delegate` / `job_status` / `job_stop` / `search_context` / `focus_set` / `remember` / `recall`
+- **worker**：`pi -p`，每个 job 独立会话目录，输出落盘，最多 3 个并行
+- **模型**：默认 `workbuddy/deepseek-v4.1-flash`（reasoning `max`）
 
 ## 和兄弟项目的关系
 
