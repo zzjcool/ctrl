@@ -487,7 +487,7 @@ test("a message is accepted once with 202, refused with 409 while a turn runs an
   assert.equal((await api("GET", "/api/agent/messages")).status, 405)
 })
 
-test("the model is offered exactly nine tools under fixed names", async () => {
+test("the model is offered exactly ten tools under fixed names", async () => {
   fixture.fake.reset()
   fixture.fake.push({ content: "no tool needed" })
   assert.equal((await send("which tools do you have?")).status, 202)
@@ -496,8 +496,9 @@ test("the model is offered exactly nine tools under fixed names", async () => {
   const body = fixture.fake.bodies.at(-1)
   assert.ok(body, "the fake model saw a request")
   const names = (body.tools ?? []).map((tool) => tool.function.name)
-  assert.equal(names.length, 9)
+  assert.equal(names.length, 10)
   assert.deepEqual(names.slice().sort(), [
+    "apply_proposal",
     "delegate",
     "focus_set",
     "job_status",

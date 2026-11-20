@@ -10,6 +10,7 @@ import {
   updateProposal,
 } from "../memory/proposals.ts"
 import type { Proposal, ProposalTests } from "../memory/proposals.ts"
+import { PACKAGE_JSON, parseNameStatus, protectedReason, touchesPackageJson } from "./apply.ts"
 import {
   git,
   gitAddAll,
@@ -20,9 +21,12 @@ import {
   gitCreateBranch,
   gitDeleteBranch,
   gitDiff,
+  gitDiffNameStatus,
   gitDiffStat,
   gitHasStagedChanges,
   gitMergeNoFf,
+  gitRevParse,
+  gitShowFile,
   gitStatusPorcelain,
   errorMessage,
   runCommand,
@@ -263,6 +267,9 @@ export class SelfEditGate {
       throw new GateError(409, `branch ${proposal.branch} no longer exists`)
     }
 
+    const violation = await this.protection(proposal)
+    if (violation !== undefined) throw new GateError(409, `proposal ${id} ${violation} — refusing to merge`)
+
     const checkout = await gitCheckout(this.repoRoot, this.baseBranch)
     if (!checkout.ok) throw new GateError(409, `could not check out ${this.baseBranch}: ${clip(checkout.stderr)}`)
 
@@ -272,7 +279,30 @@ export class SelfEditGate {
       throw new GateError(409, `merge of ${proposal.branch} failed: ${clip(merge.stderr)}`)
     }
 
-    return updateProposal(db, id, { status: "applied", endedAt: this.now().toISOString() }) ?? proposal
+    const mergedCommit = await gitRevParse(this.repoRoot, "HEAD")
+    const at = this.now().toISOString()
+    return (
+      updateProposal(db, id, {
+        status: "applied",
+        endedAt: at,
+        appliedAt: at,
+        ...(mergedCommit !== undefined ? { mergedCommit } : {}),
+      }) ?? proposal
+    )
+  }
+
+  private async protection(proposal: Proposal): Promise<string | undefined> {
+    const listing = await gitDiffNameStatus(this.repoRoot, proposal.base, proposal.branch)
+    if (!listing.ok) return `cannot read the diff of ${proposal.branch}: ${clip(listing.stderr)}`
+    const entries = parseNameStatus(listing.stdout)
+    const touchesPackage = touchesPackageJson(entries)
+    const before = touchesPackage ? await gitShowFile(this.repoRoot, proposal.base, PACKAGE_JSON) : undefined
+    const after = touchesPackage ? await gitShowFile(this.repoRoot, proposal.branch, PACKAGE_JSON) : undefined
+    return protectedReason(
+      entries,
+      before !== undefined && before.ok ? before.stdout : undefined,
+      after !== undefined && after.ok ? after.stdout : undefined,
+    )
   }
 
   async discard(id: string): Promise<Proposal> {

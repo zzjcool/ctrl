@@ -6,6 +6,7 @@ import type { ImageAttachments } from "../media/attachments.ts"
 import { createViewImageTool } from "../media/tool.ts"
 import type { MemoryIndex } from "../memory/index.ts"
 import { createFocusSetTool, createSearchContextTool } from "../memory/tools.ts"
+import { createApplyProposalTool } from "../selfedit/apply.ts"
 import type { SelfEditGate } from "../selfedit/gate.ts"
 import { createSelfEditTool } from "../selfedit/tool.ts"
 
@@ -30,7 +31,9 @@ export function memoryTools(): ToolSpec[] {
 export function createTools(opts: CreateToolsOptions): ToolSpec[] {
   return [
     ...createJobTools({ agentHome: opts.agentHome, runner: opts.runner }),
-    ...(opts.selfEdit !== undefined ? createSelfEditTool({ gate: opts.selfEdit }) : []),
+    ...(opts.selfEdit !== undefined
+      ? [...createSelfEditTool({ gate: opts.selfEdit }), createApplyProposalTool({ gate: opts.selfEdit })]
+      : []),
 
     createSearchContextTool({ index: opts.memory, db: opts.memory.handle() }),
     createFocusSetTool({ db: opts.memory.handle() }),

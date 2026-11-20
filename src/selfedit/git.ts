@@ -125,6 +125,20 @@ export async function gitDiff(repo: string, base: string, branch: string): Promi
   return await git(repo, ["diff", `${base}...${branch}`])
 }
 
+export async function gitDiffNameStatus(repo: string, base: string, branch: string): Promise<CommandResult> {
+  return await git(repo, ["diff", "--name-status", `${base}...${branch}`])
+}
+
+export async function gitShowFile(repo: string, ref: string, file: string): Promise<CommandResult> {
+  return await git(repo, ["show", `${ref}:${file}`])
+}
+
+export async function gitRevParse(repo: string, ref: string): Promise<string | undefined> {
+  const result = await git(repo, ["rev-parse", ref])
+  const sha = result.stdout.trim()
+  return result.ok && sha !== "" ? sha : undefined
+}
+
 export async function gitMergeNoFf(repo: string, branch: string, message: string): Promise<CommandResult> {
   return await git(repo, ["merge", "--no-ff", branch, "-m", message])
 }

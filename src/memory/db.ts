@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 
-export const SCHEMA_VERSION = 4
+export const SCHEMA_VERSION = 5
 export const MEMORY_DB_FILENAME = "memory.db"
 
 export function memoryDbPath(agentHome: string): string {
@@ -103,7 +103,9 @@ CREATE TABLE IF NOT EXISTS proposals (
   created_at TEXT NOT NULL,
   ended_at TEXT,
   tests TEXT,
-  error TEXT
+  error TEXT,
+  applied_at TEXT,
+  merged_commit TEXT
 );
 
 CREATE INDEX IF NOT EXISTS proposals_created ON proposals(created_at);
@@ -151,6 +153,7 @@ export function openMemoryDb(file: string): DatabaseSync {
 
 function migrate(db: DatabaseSync): void {
   ensureProposalsTable(db)
+  migrateProposalsColumns(db)
   ensureUsageTable(db)
   ensureDreamLessonsColumn(db)
   const stored = readMeta(db, META_SCHEMA_VERSION)
@@ -169,6 +172,13 @@ function migrate(db: DatabaseSync): void {
 
 export function ensureProposalsTable(db: DatabaseSync): void {
   db.exec(PROPOSALS_DDL)
+}
+
+export function migrateProposalsColumns(db: DatabaseSync): void {
+  const columns = db.prepare("PRAGMA table_info(proposals)").all() as Array<Record<string, unknown>>
+  const existing = new Set(columns.map((row) => String(row.name ?? "")))
+  if (!existing.has("applied_at")) db.exec("ALTER TABLE proposals ADD COLUMN applied_at TEXT")
+  if (!existing.has("merged_commit")) db.exec("ALTER TABLE proposals ADD COLUMN merged_commit TEXT")
 }
 
 export function ensureUsageTable(db: DatabaseSync): void {

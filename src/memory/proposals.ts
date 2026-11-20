@@ -25,6 +25,8 @@ export interface Proposal {
   summary?: string
   diffstat?: string
   endedAt?: string
+  appliedAt?: string
+  mergedCommit?: string
   tests?: ProposalTests
   error?: string
 }
@@ -47,6 +49,8 @@ export interface ProposalPatch {
   summary?: string
   diffstat?: string
   endedAt?: string
+  appliedAt?: string
+  mergedCommit?: string
   tests?: ProposalTests
   error?: string
 }
@@ -55,8 +59,8 @@ export function createProposal(db: DatabaseSync, draft: ProposalDraft): Proposal
   const createdAt = draft.createdAt ?? new Date().toISOString()
   const status = draft.status ?? "open"
   db.prepare(
-    "INSERT INTO proposals(id, branch, base, task, summary, diffstat, status, created_at, ended_at, tests, error) " +
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO proposals(id, branch, base, task, summary, diffstat, status, created_at, ended_at, tests, error, applied_at, merged_commit) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     draft.id,
     draft.branch,
@@ -69,6 +73,8 @@ export function createProposal(db: DatabaseSync, draft: ProposalDraft): Proposal
     null,
     draft.tests === undefined ? null : JSON.stringify(draft.tests),
     draft.error ?? null,
+    null,
+    null,
   )
   const stored = getProposal(db, draft.id)
   if (stored !== undefined) return stored
@@ -90,7 +96,7 @@ export function updateProposal(db: DatabaseSync, id: string, patch: ProposalPatc
   const current = getProposal(db, id)
   if (current === undefined) return undefined
   db.prepare(
-    "UPDATE proposals SET status = ?, summary = ?, diffstat = ?, ended_at = ?, tests = ?, error = ? WHERE id = ?",
+    "UPDATE proposals SET status = ?, summary = ?, diffstat = ?, ended_at = ?, tests = ?, error = ?, applied_at = ?, merged_commit = ? WHERE id = ?",
   ).run(
     patch.status ?? current.status,
     patch.summary ?? current.summary ?? null,
@@ -98,6 +104,8 @@ export function updateProposal(db: DatabaseSync, id: string, patch: ProposalPatc
     patch.endedAt ?? current.endedAt ?? null,
     patch.tests === undefined ? (current.tests === undefined ? null : JSON.stringify(current.tests)) : JSON.stringify(patch.tests),
     patch.error ?? current.error ?? null,
+    patch.appliedAt ?? current.appliedAt ?? null,
+    patch.mergedCommit ?? current.mergedCommit ?? null,
     id,
   )
   return getProposal(db, id)
@@ -174,6 +182,8 @@ function toProposal(raw: unknown): Proposal | undefined {
   const summary = text(row.summary)
   const diffstat = text(row.diffstat)
   const endedAt = text(row.ended_at)
+  const appliedAt = text(row.applied_at)
+  const mergedCommit = text(row.merged_commit)
   const error = text(row.error)
   const tests = parseProposalTests(row.tests)
   return {
@@ -186,6 +196,8 @@ function toProposal(raw: unknown): Proposal | undefined {
     ...(summary !== undefined ? { summary } : {}),
     ...(diffstat !== undefined ? { diffstat } : {}),
     ...(endedAt !== undefined ? { endedAt } : {}),
+    ...(appliedAt !== undefined ? { appliedAt } : {}),
+    ...(mergedCommit !== undefined ? { mergedCommit } : {}),
     ...(error !== undefined ? { error } : {}),
     ...(tests !== undefined ? { tests } : {}),
   }
