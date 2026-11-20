@@ -200,6 +200,7 @@ async function startCtrl(opts: StartOptions): Promise<RunningServer> {
 
     piBin: opts.piBin,
     piProvider: "any-endpoint",
+    piExtension: "",
     maxWorkers: 3,
     env: {
       ...process.env,

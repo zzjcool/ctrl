@@ -89,6 +89,8 @@ export interface ServerConfig {
 
   piProvider?: string
 
+  piExtension?: string
+
   maxWorkers?: number
 
   jobTimeoutMinutes?: number
@@ -162,6 +164,7 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     agentHome: ensured.home,
     piBin: config.piBin ?? DEFAULT_PI_BIN,
     piProvider: config.piProvider ?? DEFAULT_PI_PROVIDER,
+    ...(config.piExtension !== undefined ? { piExtension: config.piExtension } : {}),
     maxWorkers: config.maxWorkers ?? DEFAULT_MAX_WORKERS,
     jobTimeoutMinutes,
     stallMinutes:
