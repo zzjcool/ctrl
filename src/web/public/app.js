@@ -478,6 +478,9 @@ function readJobs(data) {
       startedAt: typeof item.startedAt === "string" ? item.startedAt : "",
       elapsedMs: numberOf(item.elapsedMs),
       code: numberOf(item.code),
+      // The backend sends a tail of the worker's own log; drop it here and the
+      // delegate card can never show what the worker actually did.
+      output: typeof item.output === "string" ? item.output : "",
     })
   }
   return jobs

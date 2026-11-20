@@ -316,9 +316,9 @@ function previousSummary(events: LogEvent[]): string | undefined {
  * Render the dropped events as prompt text, capped at `max` characters.
  *
  * A very old log can drop more than one prompt can hold; when that happens the
- * head and the tail are kept and the middle is elided — the tail is adjacent to
- * the new window, the head carries the start of the story, and the previous
- * summary already covers everything before it.
+ * head and the tail are kept and the middle is elided — the tail is the part
+ * adjacent to the new window (the context the model is about to continue from),
+ * and the head is where the story it is folding up began.
  */
 function clipTranscript(events: LogEvent[], max: number): string {
   const lines: string[] = []

@@ -47,7 +47,7 @@ import {
   tombstoneMemory,
   type MemoryRow,
 } from "../memory/memories.ts"
-import { DEFAULT_CONTEXT_BUDGET, compressWindow, windowInfo } from "../memory/window.ts"
+import { compressWindow, windowInfo } from "../memory/window.ts"
 import { LOG_ID } from "./agents.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
 import { readSidecar } from "./sidecar.ts"
