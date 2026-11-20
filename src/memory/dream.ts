@@ -109,6 +109,8 @@ export interface DreamContext {
   maxTokens?: number
   maxEvents?: number
   maxChars?: number
+  /** Review the focus list even when no new events arrived (manual trigger). */
+  force?: boolean
 }
 
 export interface DreamResult {
@@ -207,6 +209,14 @@ export const DREAM_INSTRUCTIONS =
 export type FocusWithAfter = FocusItem & { after?: Array<{ seq: number; role: string; text: string }> }
 
 /** Attach the few events that followed each open item: what tells "done" apart from "still open". */
+/** Focus has not been reviewed for a while — old enough to be worth a pass. */
+export function focusIsStale(db: DatabaseSync, now: () => Date, ageMs = 30 * 60_000): boolean {
+  const last = lastDreamAt(db)
+  if (last === undefined) return true
+  const at = Date.parse(last)
+  return !Number.isFinite(at) || now().getTime() - at >= ageMs
+}
+
 export function focusWithAfter(
   events: LogEvent[],
   focus: FocusItem[],
@@ -250,7 +260,13 @@ export function buildDreamPrompt(batch: DreamBatch, existing: MemoryRow[], focus
             return after === "" ? line : `${line}\n  after: ${after}`
           })
           .join("\n")
+  const emptyNote =
+    batch.events.length === 0
+      ? "No new events. Review the focus list only: close what its `after:` lines show as finished, " +
+        "and do not invent memories.\n\n"
+      : ""
   return (
+    emptyNote +
     `Current focus (open/doing):\n${focusBlock}\n\n` +
     `Existing memories:\n${memories}\n\n` +
     `New events (seq ${batch.fromSeq}..${batch.toSeq}):\n${transcript === "" ? "(no prose, only markers)" : transcript}`
@@ -434,7 +450,12 @@ export async function runDream(ctx: DreamContext): Promise<DreamResult> {
     batchEvents: batch.events.length,
   }
 
-  if (batch.events.length === 0) {
+  const openFocus = listFocus(ctx.db, { limit: 10 })
+  // No new material normally means no model call. The exception is focus
+  // hygiene: an item closed by a later turn still sits on the panel until a
+  // dream re-reads it, and that turn may have produced nothing new.
+  const reviewFocus = openFocus.length > 0 && (ctx.force === true || focusIsStale(ctx.db, ctx.now ?? (() => new Date())))
+  if (batch.events.length === 0 && !reviewFocus) {
     // Nothing new: no model call, no writes, but the run is still recorded —
     // a manual `POST /api/dream` deserves an answer in `GET /api/dreams`.
     result.skipped = true
@@ -445,7 +466,7 @@ export async function runDream(ctx: DreamContext): Promise<DreamResult> {
     return result
   }
 
-  const existing = relevantMemories(ctx.db, batch)
+  const existing = batch.events.length === 0 ? [] : relevantMemories(ctx.db, batch)
   let payload: DreamPayload | undefined
   try {
     const response = await ctx.llm.complete({

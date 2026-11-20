@@ -760,5 +760,7 @@ export async function dreamOnce(ctx: AppContext): Promise<DreamResult> {
       return await client.complete(request)
     },
   }
-  return await runDream({ db, agentHome: ctx.agentHome, events: log.events(), llm })
+  // A manual dream is also the "tidy the panel now" button: review focus even
+  // when the log has nothing new.
+  return await runDream({ db, agentHome: ctx.agentHome, events: log.events(), llm, force: true })
 }
