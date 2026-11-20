@@ -14,12 +14,14 @@ import {
   createJobPaths,
   isJobId,
   isProcessAlive,
+  jobPaths,
+  listJobs,
   readJob,
   readJobMeta,
   updateJobMeta,
   writeJobMeta,
 } from "./store.ts"
-import type { JobMeta } from "./store.ts"
+import type { JobMeta, JobView } from "./store.ts"
 
 export const DEFAULT_PI_BIN = "pi"
 /**
@@ -28,6 +30,12 @@ export const DEFAULT_PI_BIN = "pi"
  */
 export const DEFAULT_PI_PROVIDER = "any-endpoint"
 export const DEFAULT_MAX_WORKERS = 3
+/**
+ * How long a worker may run before the sweep kills it. A worker that never
+ * returns holds one of the three worker slots forever, so "no limit" is not a
+ * safe default; `--job-timeout 0` is still there for somebody who wants it.
+ */
+export const DEFAULT_JOB_TIMEOUT_MINUTES = 30
 /** How long `job_stop` waits for SIGTERM to be honoured. */
 export const STOP_TIMEOUT_MS = 3_000
 const STOP_POLL_MS = 50
@@ -38,10 +46,17 @@ export interface RunnerConfig {
   piBin?: string
   piProvider?: string
   maxWorkers?: number
+  /** Kill a worker that has run longer than this; 0 means no limit. */
+  jobTimeoutMinutes?: number
   /** Worker model when `delegate` does not name one (ctrl's own model). */
   model: string
   /** Worker thinking budget when `delegate` does not name one. */
   thinking: string
+  /**
+   * Called once per job when its exit is recorded (B: wake the agent). Never
+   * awaited and never able to fail an exit path — see `emitExit`.
+   */
+  onExit?: (job: JobView) => void
 }
 
 export interface DelegateInput {
@@ -71,6 +86,10 @@ export class JobRunner {
   readonly piBin: string
   readonly piProvider: string
   readonly maxWorkers: number
+  /** Minutes a worker may run; 0 = unlimited (the sweep does nothing). */
+  readonly jobTimeoutMinutes: number
+  /** Set by the server once the context exists; see RunnerConfig.onExit. */
+  onExit?: (job: JobView) => void
   private readonly model: string
   private readonly thinking: string
 
@@ -82,8 +101,18 @@ export class JobRunner {
       config.maxWorkers !== undefined && Number.isFinite(config.maxWorkers) && config.maxWorkers > 0
         ? Math.floor(config.maxWorkers)
         : DEFAULT_MAX_WORKERS
+    this.jobTimeoutMinutes =
+      config.jobTimeoutMinutes !== undefined && Number.isFinite(config.jobTimeoutMinutes) && config.jobTimeoutMinutes >= 0
+        ? Math.floor(config.jobTimeoutMinutes)
+        : DEFAULT_JOB_TIMEOUT_MINUTES
+    this.onExit = config.onExit
     this.model = config.model
     this.thinking = config.thinking
+  }
+
+  /** `jobTimeoutMinutes` in milliseconds; 0 means the sweep is off. */
+  get jobTimeoutMs(): number {
+    return this.jobTimeoutMinutes * 60_000
   }
 
   /** The argv a worker gets; exposed so a test can pin it without spawning. */
@@ -226,6 +255,54 @@ export class JobRunner {
       code: exit.code,
       signal: exit.signal,
     })
+    // Only the write above that actually happened reports an exit, so the same
+    // job cannot announce itself twice (event + stop, or stop + event).
+    const job = readJob(this.agentHome, id)
+    if (job !== undefined) this.emitExit(job)
+  }
+
+  /**
+   * Tell the server a worker is done. Deliberately fire-and-forget: an exit
+   * must be recorded even when nobody is listening, and a listener that throws
+   * must not become an unhandled rejection in the parent's exit path.
+   */
+  private emitExit(job: JobView): void {
+    const callback = this.onExit
+    if (callback === undefined) return
+    try {
+      const returned: unknown = callback(job)
+      if (returned !== null && typeof returned === "object" && "catch" in returned) {
+        void (returned as Promise<unknown>).catch((error: unknown) => warnExit(error))
+      }
+    } catch (error) {
+      warnExit(error)
+    }
+  }
+
+  /**
+   * Kill every worker that has run past `jobTimeoutMinutes` (A: the job timeout).
+   * `stop()` is the same SIGTERM the `job_stop` tool sends, so a swept job reads
+   * as `killed` off the disk like any other; the reason goes into its own log,
+   * where `job_status` and the delegate card already show it.
+   *
+   * `now` is a parameter so a test can sweep from the future instead of sleeping
+   * for half an hour. Returns the ids actually stopped.
+   */
+  async sweepTimeouts(now: number = Date.now()): Promise<string[]> {
+    const limitMs = this.jobTimeoutMs
+    if (limitMs <= 0) return []
+    const stopped: string[] = []
+    for (const job of listJobs(this.agentHome, { limit: 0, now })) {
+      // `running` is read from disk: a job killed by an earlier sweep, or one
+      // whose process is gone, is not touched again.
+      if (job.state !== "running") continue
+      if (job.elapsedMs <= limitMs) continue
+      const logPath = jobPaths(this.agentHome, job.id).logPath
+      appendNote(logPath, `ctrl: job exceeded ${this.jobTimeoutMinutes}m — stopped`)
+      const reply = await this.stop(job.id)
+      if (reply.ok) stopped.push(job.id)
+    }
+    return stopped
   }
 }
 
@@ -292,4 +369,9 @@ function appendNote(logFile: string, note: string): void {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** A throwing listener is reported, never propagated into an exit handler. */
+function warnExit(error: unknown): void {
+  process.stderr.write(`ctrl: job exit listener failed: ${errorMessage(error)}\n`)
 }

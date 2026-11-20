@@ -427,6 +427,82 @@ test("job_stop SIGTERMs the worker and the job then reads killed from disk alone
   }
 })
 
+// ---------------------------------------------------------------------------
+// the timeout sweep (A)
+// ---------------------------------------------------------------------------
+
+test("a worker past the job timeout is killed by the sweep, and its log says why", async () => {
+  setEnv({ FAKE_PI_SLEEP: "5" })
+  const runner = makeRunner() // DEFAULT_JOB_TIMEOUT_MINUTES = 30
+  const work = await scratchDir("ctrl-jobs-work-")
+  try {
+    assert.equal(runner.jobTimeoutMinutes, 30)
+    const reply = runner.delegate({ task: "never finishes" }, work)
+    const id = idOf(reply.output)
+    const pid = readJobMeta(agentHome, id)?.pid ?? 0
+    assert.equal(isProcessAlive(pid), true)
+
+    // Sweep from a minute past the limit instead of sleeping for 31 minutes.
+    const stopped = await runner.sweepTimeouts(Date.now() + 31 * 60_000)
+    assert.deepEqual(stopped, [id])
+
+    // `killed` is the state `job_stop` already produces; nothing new to explain.
+    const job = readJob(agentHome, id)
+    assert.equal(job?.state, "killed")
+    assert.equal(job?.signal, "SIGTERM")
+    assert.equal(isProcessAlive(pid), false, "the worker's process group is gone")
+
+    // The reason is in the worker's own log, where job_status shows it.
+    const log = readJobLog(agentHome, id, { full: true }).text
+    assert.match(log, /ctrl: job exceeded 30m — stopped/)
+    const status = jobTool(runner, "job_status")
+    const shown = await status.execute({ id }, toolContext(work))
+    assert.match(shown.output, /state: killed/)
+    assert.match(shown.output, /ctrl: job exceeded 30m — stopped/)
+
+    // Sweeping again is a no-op: a job is stopped once.
+    assert.deepEqual(await runner.sweepTimeouts(Date.now() + 31 * 60_000), [])
+  } finally {
+    setEnv({})
+  }
+})
+
+test("the sweep leaves a worker alone until it is actually past the timeout", async () => {
+  setEnv({ FAKE_PI_SLEEP: "5" })
+  const work = await scratchDir("ctrl-jobs-work-")
+  try {
+    // `--job-timeout 0` means no limit at all: not even the year 3000 kills it.
+    // The check runs before anything is started, so it cannot sweep another
+    // test's worker either.
+    const unlimited = makeRunner({ jobTimeoutMinutes: 0 })
+    assert.equal(unlimited.jobTimeoutMinutes, 0)
+    assert.deepEqual(await unlimited.sweepTimeouts(Date.now() + 365 * 24 * 60 * 60_000), [])
+
+    const runner = makeRunner()
+    const reply = runner.delegate({ task: "still young" }, work)
+    const id = idOf(reply.output)
+
+    // Exactly at the limit is not over it, and a fresh job is nowhere near it.
+    const startedAt = Date.parse(readJobMeta(agentHome, id)?.startedAt ?? "")
+    assert.deepEqual(await runner.sweepTimeouts(startedAt + 30 * 60_000), [], "elapsed == timeout is not over")
+    assert.deepEqual(await runner.sweepTimeouts(), [])
+    assert.equal(readJob(agentHome, id)?.state, "running")
+
+    // The job's own 0-limit runner must not touch it either.
+    assert.deepEqual(await unlimited.sweepTimeouts(startedAt + 365 * 24 * 60 * 60_000), [])
+    assert.equal(readJob(agentHome, id)?.state, "running", "0 disables the sweep")
+
+    await runner.stop(id)
+    assert.equal(readJob(agentHome, id)?.state, "killed")
+
+    // A job that already exited is never swept, however old it looks.
+    assert.equal(countRunning(agentHome), 0)
+    assert.deepEqual(await runner.sweepTimeouts(Date.now() + 365 * 24 * 60 * 60_000), [])
+  } finally {
+    setEnv({})
+  }
+})
+
 test("the tools answer a bad id with a sentence instead of throwing", async () => {
   const runner = makeRunner()
   const work = await scratchDir("ctrl-jobs-work-")

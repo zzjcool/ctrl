@@ -1,7 +1,7 @@
 // Worker jobs on disk (CONTRACT §5.1, PLAN §3.1).
 //
 //   <agentHome>/jobs/<id>/
-//     meta.json   { id, task, cwd, model, thinking, startedAt, pid, exitedAt?, code?, signal? }
+//     meta.json   { id, task, cwd, model, thinking, startedAt, pid, exitedAt?, code?, signal?, notifiedAt? }
 //     out.log     the worker's stdout+stderr
 //     pi/         the worker's own pi session dir (--session-dir)
 //
@@ -45,6 +45,12 @@ export interface JobMeta {
   exitedAt?: string
   code?: number | null
   signal?: string | null
+  /**
+   * When ctrl woke the agent for this job's exit — written once, so a second
+   * exit event (the `exit` handler and `stop()` both finalise) never wakes
+   * twice, and a restart never wakes for something that already happened.
+   */
+  notifiedAt?: string
 }
 
 /** A meta plus the state derived from it: what every reader actually wants. */
@@ -137,6 +143,7 @@ export function writeJobMeta(agentHome: string, meta: JobMeta): JobMeta {
   if (typeof meta.exitedAt === "string" && meta.exitedAt !== "") record.exitedAt = meta.exitedAt
   if (meta.code !== undefined) record.code = meta.code
   if (meta.signal !== undefined) record.signal = meta.signal
+  if (typeof meta.notifiedAt === "string" && meta.notifiedAt !== "") record.notifiedAt = meta.notifiedAt
   // Write-then-rename: a reader never sees half a meta.json.
   const tmp = `${paths.metaPath}.tmp`
   writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, "utf8")
@@ -170,6 +177,7 @@ export function readJobMeta(agentHome: string, id: string): JobMeta | undefined 
     if (typeof candidate.exitedAt === "string" && candidate.exitedAt !== "") meta.exitedAt = candidate.exitedAt
     if (typeof candidate.code === "number" || candidate.code === null) meta.code = candidate.code
     if (typeof candidate.signal === "string" || candidate.signal === null) meta.signal = candidate.signal
+    if (typeof candidate.notifiedAt === "string" && candidate.notifiedAt !== "") meta.notifiedAt = candidate.notifiedAt
     return meta
   } catch {
     return undefined

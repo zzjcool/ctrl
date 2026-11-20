@@ -38,8 +38,7 @@
 
 ## 现状
 
-**v4**：会说话、会派活、会记事。契约见 [docs/CONTRACT.md](docs/CONTRACT.md)，
-记忆系统设计见 [docs/MEMORY.md](docs/MEMORY.md)。
+**v4**：会说话、会派活、会记事。
 
 - **记忆**：全部事件增量镜像进 `<agent>/memory.db`（SQLite + FTS5）；
   对话窗口只留最近约 4 万字符，更早的压成摘要，原文靠 `search_context` 翻。
@@ -64,3 +63,10 @@
 沿用 pi-durable / pi-async / pi-legion 的家规：TypeScript strict、ESM、无构建步骤
 （`node --experimental-strip-types` 直接跑 `.ts`）、相对 import 带 `.ts` 后缀、
 测试用 `node:test`、零运行时依赖（Node builtins only）。
+
+## 两条规矩
+
+1. **代码是唯一的事实**。文档只在施工期存在，实现完成即删除；设计决定留在
+   commit message 和测试里，不留 spec 文档。
+2. **不写注释**。意图靠命名、拆小函数和测试表达；一个坑值得记住，就写一个测试，
+   而不是写一行注释。

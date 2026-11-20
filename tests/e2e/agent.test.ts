@@ -836,6 +836,90 @@ test("restarting ctrl finds the same log, memory, workspace and jobs", async () 
   assert.ok(stillHere.json.count >= 1, "the turn after the restart is indexed too")
 })
 
+test("a worker that outlives its turn wakes the agent, and the stream shows it (B)", async () => {
+  // Its own ctrl and its own pi: the shared fake worker sleeps 0.3 s, which is
+  // shorter than a turn, and a wake needs a worker that outlives one. The fake
+  // model is shared — tests in this file run in order, so its queue is ours.
+  const root = await mkdtemp(path.join(tmpdir(), "ctrl-e2e-wake-root-"))
+  const workspace = await mkdtemp(path.join(tmpdir(), "ctrl-e2e-wake-work-"))
+  const binDir = await mkdtemp(path.join(tmpdir(), "ctrl-e2e-wake-bin-"))
+  const piBin = path.join(binDir, "pi")
+  await writeFile(piBin, "#!/bin/sh\nsleep 1.2\nprintf 'late result\\n'\nexit 0\n", { mode: 0o755 })
+  const isolated = await startCtrl({ baseUrl: fixture.fake.url, root, workspace, piBin })
+
+  const stream = async (): Promise<Stream> => {
+    const reply = await request(isolated.port, "GET", "/api/agent/events?since=0")
+    assert.equal(reply.status, 200, reply.text)
+    return reply.json as Stream
+  }
+
+  try {
+    fixture.fake.reset()
+    // wait:0 → the turn ends while the worker is still counting, which is the
+    // only situation in which a wake is the right thing to do.
+    fixture.fake.push({ toolCalls: [{ name: "delegate", arguments: { task: "count slowly", wait: 0 } }] })
+    fixture.fake.push({ content: "the worker is counting" })
+    fixture.fake.push({ content: "the worker finished counting" })
+
+    const sent = await request(isolated.port, "POST", "/api/agent/messages", { text: "count the files, slowly" })
+    assert.equal(sent.status, 202, sent.text)
+
+    const userMessages = (snapshot: Stream): string[] =>
+      snapshot.events
+        .filter((event) => event.type === "user_message")
+        .map((event) => (event as Extract<SessionEvent, { type: "user_message" }>).data.text)
+
+    const deadline = Date.now() + 10_000
+    let snapshot = await stream()
+    let wake: Extract<SessionEvent, { type: "user_message" }> | undefined
+    for (;;) {
+      wake = snapshot.events.find(
+        (event): event is Extract<SessionEvent, { type: "user_message" }> =>
+          event.type === "user_message" && event.data.text.startsWith("[ctrl] worker "),
+      )
+      if (wake !== undefined && !snapshot.turn.running) break
+      if (Date.now() > deadline) {
+        throw new Error(`no [ctrl] wake message in the stream: ${JSON.stringify(userMessages(snapshot))}`)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      snapshot = await stream()
+    }
+
+    // CONTRACT §7: the wake is visible in the one stream the page reads.
+    assert.match(wake.data.text, /^\[ctrl\] worker \d{8}T\d{6}Z-[a-z0-9]{6} finished \(exited, \d+\.\ds\) — report the result to the user\.$/)
+    const jobId = /\[ctrl\] worker (\S+) finished/.exec(wake.data.text)?.[1] as string
+    assert.ok(jobId.length > 0)
+
+    // …and it started an ordinary turn: an assistant message follows it.
+    const answer = snapshot.events.find(
+      (event): event is Extract<SessionEvent, { type: "assistant_message" }> =>
+        event.type === "assistant_message" && event.seq > wake.seq,
+    )
+    assert.equal(answer?.data.text, "the worker finished counting")
+    assert.deepEqual(userMessages(snapshot).filter((text) => text.startsWith("[ctrl]")), [wake.data.text], "one wake per job")
+
+    // No custom event type was invented: a wake is a user_message, and the
+    // worker's own job is what it talks about.
+    const types = new Set(snapshot.events.map((event) => event.type))
+    for (const type of types) {
+      assert.ok(
+        ["session_created", "user_message", "assistant_message", "assistant_pending", "tool_call", "tool_result", "memory_recall", "error", "compaction"].includes(type),
+        `unexpected event type ${type}`,
+      )
+    }
+
+    const jobs = await request(isolated.port, "GET", "/api/jobs")
+    const job = (jobs.json.jobs as Record<string, any>[]).find((candidate) => candidate.id === jobId)
+    assert.equal(job?.state, "exited", "the wake is about a worker that really finished")
+    assert.match(String(job?.output ?? ""), /late result/)
+  } finally {
+    await isolated.close()
+    await rm(root, { recursive: true, force: true })
+    await rm(workspace, { recursive: true, force: true })
+    await rm(binDir, { recursive: true, force: true })
+  }
+})
+
 test("a model failure is logged once, by the engine, not twice", async () => {
   // A closed port: the client retries and then throws. Nothing to do with the
   // shared fake, so this test gets its own isolated ctrl.

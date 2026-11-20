@@ -10,7 +10,7 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http"
 import { fileURLToPath } from "node:url"
 import { createChatCompletionsClient, openSession } from "../engine/durable.ts"
 import type { LlmClient } from "../engine/durable.ts"
-import { DEFAULT_MAX_WORKERS, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER, JobRunner } from "../jobs/runner.ts"
+import { DEFAULT_MAX_WORKERS, DEFAULT_JOB_TIMEOUT_MINUTES, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER, JobRunner } from "../jobs/runner.ts"
 import { createSqliteAgentMemory } from "../memory/agent-memory.ts"
 import { lastIndexedSeq } from "../memory/db.ts"
 import { DREAM_IDLE_MS, DREAM_TICK_MS, DreamController, lastDreamSeq } from "../memory/dream.ts"
@@ -22,6 +22,7 @@ import { sendJson, serveStatic } from "./http.ts"
 import { dreamOnce, handleApiRequest, type AppContext } from "./routes.ts"
 import { readSidecar, writeSidecar } from "./sidecar.ts"
 import { TurnRegistry } from "./turns.ts"
+import { createWaker, type Waker } from "./wake.ts"
 
 export const DEFAULT_PORT = 7333
 export const DEFAULT_HOST = "127.0.0.1"
@@ -35,6 +36,11 @@ export const DEFAULT_MODEL = "workbuddy/deepseek-v4.1-flash"
 export const DEFAULT_REASONING_EFFORT = "max"
 /** Reasoning tokens are billed inside `max_tokens`; 2048 truncates tool calls. */
 export const DEFAULT_MAX_TOKENS = 8192
+/**
+ * How often the worker-timeout sweep runs. A job is killed within this window
+ * of crossing `--job-timeout`, so the tick is much finer than the timeout.
+ */
+export const DEFAULT_SWEEP_INTERVAL_MS = 60_000
 
 export interface ServerConfig {
   /** `<root>`: holds `agents/` and `trash/`. Defaults to CTRL_ROOT, then ~/.ctrl. */
@@ -66,6 +72,13 @@ export interface ServerConfig {
   piProvider?: string
   /** How many workers may run at once. Defaults to 3. */
   maxWorkers?: number
+  /**
+   * Minutes a worker may run before the sweep kills it (default 30);
+   * 0 turns the timeout off entirely.
+   */
+  jobTimeoutMinutes?: number
+  /** How often the timeout sweep runs; defaults to DEFAULT_SWEEP_INTERVAL_MS (60 s). */
+  sweepIntervalMs?: number
   publicDir?: string
   env?: NodeJS.ProcessEnv
   /** Injected by tests; by default a real chat/completions client. */
@@ -97,6 +110,11 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     Number.isFinite(config.contextBudget) && (config.contextBudget ?? 0) > 0
       ? Math.floor(config.contextBudget as number)
       : DEFAULT_CONTEXT_BUDGET
+  // `--job-timeout 0` is a real setting (no limit), so this clamp allows it.
+  const jobTimeoutMinutes =
+    Number.isFinite(config.jobTimeoutMinutes) && (config.jobTimeoutMinutes ?? 0) >= 0
+      ? Math.floor(config.jobTimeoutMinutes as number)
+      : DEFAULT_JOB_TIMEOUT_MINUTES
 
   // One agent, resolved before anything else: `agents/<name>/` either exists
   // (we open its log) or is created with agent.json and an empty log.
@@ -129,6 +147,7 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     piBin: config.piBin ?? DEFAULT_PI_BIN,
     piProvider: config.piProvider ?? DEFAULT_PI_PROVIDER,
     maxWorkers: config.maxWorkers ?? DEFAULT_MAX_WORKERS,
+    jobTimeoutMinutes,
     model: defaultModel,
     thinking: reasoningEffort,
   })
@@ -141,6 +160,10 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     maxSteps,
     defaultModel,
     jobs: runner,
+    jobTimeoutMinutes,
+    // Replaced right below, like `dreams`: a waker starts turns, so it is built
+    // from the finished context rather than before it.
+    wake: undefined as unknown as Waker,
     turns: new TurnRegistry(),
     memory,
     contextBudget,
@@ -190,6 +213,12 @@ export function buildContext(config: ServerConfig = {}): AppContext {
         : DREAM_TICK_MS,
     warn: (message) => process.stderr.write(`${message}\n`),
   })
+
+  // B: a worker that finishes after its turn ended wakes the agent. Wired here
+  // (not in startServer) so every context — a test one included — behaves the
+  // same; the runner calls it from its own exit path, never awaited.
+  ctx.wake = createWaker(ctx)
+  runner.onExit = (job) => ctx.wake.notify(job)
   return ctx
 }
 
@@ -208,6 +237,16 @@ function lastActivityMs(agentHome: string): number | undefined {
 
 export function defaultPublicDir(): string {
   return fileURLToPath(new URL("../web/public", import.meta.url))
+}
+
+/**
+ * One pass of A's timeout sweep. Never awaited by the caller: a slow SIGTERM
+ * must not hold up the timer tick, and a failure must not take ctrl down.
+ */
+function sweepJobs(ctx: AppContext): void {
+  void ctx.jobs.sweepTimeouts().catch((error: unknown) => {
+    process.stderr.write(`ctrl: job timeout sweep failed: ${error instanceof Error ? error.message : String(error)}\n`)
+  })
 }
 
 /** Build the http.Server without binding a port. */
@@ -242,12 +281,33 @@ export async function startServer(config: ServerConfig = {}): Promise<RunningSer
     ctx.dreams.startTimer()
     ctx.dreams.tick()
   }
+  // A: workers that outlive `--job-timeout` are killed. One sweep now (a worker
+  // left over from before this process started is still on the clock) and then
+  // one per minute; `unref` so the timer never keeps ctrl — or a test — alive.
+  const sweepIntervalMs =
+    Number.isFinite(config.sweepIntervalMs) && (config.sweepIntervalMs ?? 0) > 0
+      ? Math.floor(config.sweepIntervalMs as number)
+      : DEFAULT_SWEEP_INTERVAL_MS
+  let sweepTimer: NodeJS.Timeout | undefined
+  if (ctx.jobTimeoutMinutes > 0) {
+    sweepJobs(ctx)
+    sweepTimer = setInterval(() => sweepJobs(ctx), sweepIntervalMs)
+    sweepTimer.unref()
+  }
   return {
     server,
     ctx,
     port,
     url: `http://${host}:${port}`,
     close: async () => {
+      // A worker exiting while we shut down must not start a turn against a
+      // database that is about to be closed (B) — and the sweep must not send a
+      // SIGTERM into a process that is on its way out.
+      ctx.wake.stop()
+      if (sweepTimer !== undefined) {
+        clearInterval(sweepTimer)
+        sweepTimer = undefined
+      }
       // The dream's timer must not keep the process (or a test) alive, and a
       // dream in flight must not be cut in half while the database closes.
       ctx.dreams.stopTimer()

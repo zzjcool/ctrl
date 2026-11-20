@@ -35,9 +35,10 @@ import {
   DEFAULT_MODEL,
   DEFAULT_PORT,
   DEFAULT_REASONING_EFFORT,
+  DEFAULT_SWEEP_INTERVAL_MS,
   startServer,
 } from "../server/server.ts"
-import { DEFAULT_MAX_WORKERS, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER } from "../jobs/runner.ts"
+import { DEFAULT_JOB_TIMEOUT_MINUTES, DEFAULT_MAX_WORKERS, DEFAULT_PI_BIN, DEFAULT_PI_PROVIDER } from "../jobs/runner.ts"
 
 export type Mode = "serve" | "agent-list" | "agent-new" | "agent-rm" | "dream" | "help" | "version"
 
@@ -56,6 +57,8 @@ interface Flags {
   piProvider: string
   /** How many workers may run at once. */
   maxWorkers: number
+  /** Minutes a worker may run before it is killed; 0 = no limit. */
+  jobTimeoutMinutes: number
   maxSteps: number
   /** Characters of transcript the model sees before M2 compresses (MEMORY.md §10.1). */
   contextBudget?: number
@@ -87,6 +90,8 @@ Serve options:
   --pi-bin <path>    the pi binary a worker is spawned as (default ${DEFAULT_PI_BIN})
   --pi-provider <p>  provider a worker passes to pi (default ${DEFAULT_PI_PROVIDER})
   --max-workers <n>  how many workers may run at once (default ${DEFAULT_MAX_WORKERS})
+  --job-timeout <m>  kill a worker that has run longer than m minutes, and report it
+                     (default ${DEFAULT_JOB_TIMEOUT_MINUTES}; 0 = no limit)
   --max-steps <n>    tool-loop budget per turn (default ${DEFAULT_MAX_STEPS})
   --context-budget <n>
                      characters of transcript the model sees before the oldest
@@ -123,6 +128,7 @@ export function parseArgs(argv: string[]): Flags {
     piBin: DEFAULT_PI_BIN,
     piProvider: DEFAULT_PI_PROVIDER,
     maxWorkers: DEFAULT_MAX_WORKERS,
+    jobTimeoutMinutes: DEFAULT_JOB_TIMEOUT_MINUTES,
     maxSteps: DEFAULT_MAX_STEPS,
     json: false,
     purge: false,
@@ -198,6 +204,10 @@ export function parseArgs(argv: string[]): Flags {
         break
       case "--max-workers":
         flags.maxWorkers = integer(value(), "--max-workers", 1, 64)
+        break
+      case "--job-timeout":
+        // 0 is a setting, not a mistake: it means "never kill a worker".
+        flags.jobTimeoutMinutes = integer(value(), "--job-timeout", 0, 10_080)
         break
       case "--max-steps":
         flags.maxSteps = integer(value(), "--max-steps", 1, 200)
@@ -507,6 +517,7 @@ async function serveCommand(flags: Flags): Promise<number> {
       piBin: flags.piBin,
       piProvider: flags.piProvider,
       maxWorkers: flags.maxWorkers,
+      jobTimeoutMinutes: flags.jobTimeoutMinutes,
       maxSteps: flags.maxSteps,
       ...(flags.contextBudget !== undefined ? { contextBudget: flags.contextBudget } : {}),
       ...(flags.model !== undefined ? { model: flags.model } : {}),
@@ -533,6 +544,7 @@ async function serveCommand(flags: Flags): Promise<number> {
       `  model: ${model}\n` +
       `  pi bin: ${running.ctx.jobs.piBin} (provider ${running.ctx.jobs.piProvider || "default"})\n` +
       `  max workers: ${running.ctx.jobs.maxWorkers}\n` +
+      `  job timeout: ${running.ctx.jobTimeoutMinutes > 0 ? `${running.ctx.jobTimeoutMinutes}m (swept every ${Math.round(DEFAULT_SWEEP_INTERVAL_MS / 1000)}s)` : "none"}\n` +
       `  context budget: ${running.ctx.contextBudget} chars\n` +
       `  directory: ${running.ctx.agentHome}\n`,
   )

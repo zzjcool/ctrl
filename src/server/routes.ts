@@ -62,6 +62,7 @@ import { LOG_ID } from "./agents.ts"
 import { HttpError, readJson, sendJson } from "./http.ts"
 import { readSidecar } from "./sidecar.ts"
 import { createAbortableLlm, type TurnRegistry } from "./turns.ts"
+import type { Waker } from "./wake.ts"
 
 export interface AppContext {
   /** `<root>`: holds `agents/` and `trash/`. */
@@ -77,6 +78,14 @@ export interface AppContext {
   defaultModel: string
   /** Starts and stops pi workers; the only thing here that touches a process. */
   jobs: JobRunner
+  /**
+   * Minutes a worker may run before the sweep kills it; 0 is "no limit".
+   * The sweep itself lives on the runner (`sweepTimeouts`), the timer in
+   * `startServer`; the server reports the number at startup.
+   */
+  jobTimeoutMinutes: number
+  /** Wakes the agent when a worker exits (B); the runner's `onExit` calls it. */
+  wake: Waker
   turns: TurnRegistry
   /** The SQLite mirror of the log (MEMORY.md §4); may be degraded, never absent. */
   memory: MemoryIndex
@@ -541,8 +550,11 @@ export function jobSummary(job: JobView, agentHome?: string): Record<string, unk
  * The import lives in `finally` because an aborted or failed turn still wrote
  * events worth searching, and because a turn must never be held hostage by its
  * index — `importAfterTurn` cannot throw.
+ *
+ * Exported for `wake.ts`: a worker that finishes after its turn ended starts a
+ * turn through this same path, so a wake is an ordinary turn in every respect.
  */
-async function runTurn(ctx: AppContext, log: Session, text: string, signal: AbortSignal): Promise<void> {
+export async function runTurn(ctx: AppContext, log: Session, text: string, signal: AbortSignal): Promise<void> {
   try {
     await runTurnOnce(ctx, log, text, signal)
   } finally {
