@@ -21,7 +21,6 @@ import type { MemoryIndex } from "../memory/index.ts"
 import { MAX_PROPOSAL_LIMIT, listProposals } from "../memory/proposals.ts"
 import { createRecordingLlm, todayTokensByKind, usageSummary } from "../memory/usage.ts"
 import type { UsageKind } from "../memory/usage.ts"
-import { DEFAULT_CONTEXT_BUDGET } from "../memory/window.ts"
 import { ImageAttachments } from "../media/attachments.ts"
 import { createImageLlm } from "../media/images.ts"
 import { SelfEditGate } from "../selfedit/gate.ts"
@@ -71,8 +70,6 @@ export interface ServerConfig {
   reasoningEffort?: string
 
   maxTokens?: number
-
-  contextBudget?: number
 
   dreamIdleMs?: number
 
@@ -137,10 +134,6 @@ export function buildContext(config: ServerConfig = {}): AppContext {
   const maxSteps = Number.isFinite(config.maxSteps) && (config.maxSteps ?? 0) > 0
     ? Math.floor(config.maxSteps as number)
     : DEFAULT_MAX_STEPS
-  const contextBudget =
-    Number.isFinite(config.contextBudget) && (config.contextBudget ?? 0) > 0
-      ? Math.floor(config.contextBudget as number)
-      : DEFAULT_CONTEXT_BUDGET
 
   const jobTimeoutMinutes =
     Number.isFinite(config.jobTimeoutMinutes) && (config.jobTimeoutMinutes ?? 0) >= 0
@@ -192,7 +185,6 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     heartbeat: undefined as unknown as Heartbeat,
     turns: new TurnRegistry(),
     memory,
-    contextBudget,
 
     agentMemory: createSqliteAgentMemory({
       db: memory.handle(),

@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url"
 import { createChatCompletionsClient } from "../engine/durable.ts"
 import { runDream } from "../memory/dream.ts"
 import { createMemoryIndex } from "../memory/index.ts"
-import { DEFAULT_CONTEXT_BUDGET } from "../memory/window.ts"
 import {
   DEFAULT_AGENT,
   AgentError,
@@ -61,8 +60,6 @@ interface Flags {
   stallMinutes: number
   maxSteps: number
 
-  contextBudget?: number
-
   heartbeatMinutes: number
 
   heartbeatBudget: number
@@ -102,9 +99,6 @@ Serve options:
                      kill a worker that wrote nothing to its log for m minutes
                      (default ${DEFAULT_STALL_MINUTES}; 0 = off)
   --max-steps <n>    tool-loop budget per turn (default ${DEFAULT_MAX_STEPS})
-  --context-budget <n>
-                     characters of transcript the model sees before the oldest
-                     half is compressed into a summary (default ${DEFAULT_CONTEXT_BUDGET})
   --heartbeat <m>    wake on its own after m idle minutes to look at focus and
                      pending proposals (default ${DEFAULT_HEARTBEAT_IDLE_MINUTES}; 0 = off)
   --heartbeat-budget <tokens>
@@ -238,9 +232,6 @@ export function parseArgs(argv: string[]): Flags {
         break
       case "--max-steps":
         flags.maxSteps = integer(value(), "--max-steps", 1, 200)
-        break
-      case "--context-budget":
-        flags.contextBudget = integer(value(), "--context-budget", 1_000, 1_000_000)
         break
       case "--heartbeat":
         flags.heartbeatMinutes = integer(value(), "--heartbeat", 0, 10_080)
@@ -535,7 +526,6 @@ async function serveCommand(flags: Flags): Promise<number> {
       heartbeatIdleMinutes: flags.heartbeatMinutes,
       heartbeatBudget: flags.heartbeatBudget,
       heartbeatMaxPerDay: flags.heartbeatMax,
-      ...(flags.contextBudget !== undefined ? { contextBudget: flags.contextBudget } : {}),
       ...(flags.model !== undefined ? { model: flags.model } : {}),
       ...(flags.reasoningEffort !== undefined ? { reasoningEffort: flags.reasoningEffort } : {}),
     })
@@ -562,7 +552,6 @@ async function serveCommand(flags: Flags): Promise<number> {
       `  max workers: ${running.ctx.jobs.maxWorkers}\n` +
       `  job timeout: ${running.ctx.jobTimeoutMinutes > 0 ? `${running.ctx.jobTimeoutMinutes}m (swept every ${Math.round(DEFAULT_SWEEP_INTERVAL_MS / 1000)}s)` : "none"}\n` +
       `  stall guard: ${running.ctx.jobs.stallMinutes > 0 ? `${running.ctx.jobs.stallMinutes}m without new output (swept every ${Math.round(DEFAULT_SWEEP_INTERVAL_MS / 1000)}s)` : "off"}\n` +
-      `  context budget: ${running.ctx.contextBudget} chars\n` +
       `  heartbeat: ${heartbeatLine(running.ctx.heartbeat)}\n` +
       `  directory: ${running.ctx.agentHome}\n`,
   )

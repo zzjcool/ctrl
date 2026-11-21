@@ -33,7 +33,6 @@ export interface AppContext {
   heartbeat: Heartbeat
   turns: TurnRegistry
   memory: MemoryIndex
-  contextBudget: number
   dreams: DreamController
   agentMemory: AgentMemory
   selfEdit: SelfEditGate
