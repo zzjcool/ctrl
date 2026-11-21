@@ -13,8 +13,7 @@ function harness(responses: Array<Response | (() => Response)>): Harness {
   const bodies: Record<string, unknown>[] = []
   const queue = [...responses]
   const state = { calls: 0 }
-  const fetchImpl = async (input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> => {
-    void input
+  const fetchImpl = async (_input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> => {
     state.calls += 1
     if (init?.body !== undefined) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
     const next = queue.shift()
@@ -49,10 +48,6 @@ function sse(chunks: string[]): Response {
     },
   })
   return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } })
-}
-
-function dropped(chunks: string[]): Response {
-  return sse(chunks)
 }
 
 function dataLine(payload: unknown): string {
@@ -194,7 +189,7 @@ test("[DONE] ends the stream and nothing after it is parsed", async () => {
 
 test("a stream that dies mid answer is retried once and never repeats the text it dropped", async () => {
   const fake = harness([
-    dropped([textChunk("half an ans"), textChunk("wer")]),
+    sse([textChunk("half an ans"), textChunk("wer")]),
     sse([textChunk("complete answer"), textChunk("", "stop"), DONE]),
   ])
   const sink = collector()
