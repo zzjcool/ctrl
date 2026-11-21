@@ -132,7 +132,9 @@ export function createFocusSetTool(opts: FocusToolOptions): ToolSpec {
     description:
       "Keep your own focus list — what you are working on right now (at most a few items). " +
       "Call it with `text` to add an item (state open), or with `id` (and optional `text`/`state`) to move an " +
-      "existing one. States: open, doing (working on it now), blocked, done (finished). " +
+      "existing one. States: open, doing (working on it now), blocked, review (waiting for a check), done " +
+      "(finished), dropped (abandoned). Optional notes travel with the item: `accept` (what finished means), " +
+      "`evidence` (proof), `why` (what blocks it), `reason` (why it was abandoned). " +
       "It answers with the item it wrote, including its id.",
     parameters: schema(
       {
@@ -141,8 +143,17 @@ export function createFocusSetTool(opts: FocusToolOptions): ToolSpec {
         state: {
           type: "string",
           enum: [...FOCUS_STATES],
-          description: "open | doing | blocked | done. Defaults to open when creating.",
+          description:
+            "open | doing | blocked | review | done | dropped. Defaults to open when creating.",
         },
+        evidence: {
+          type: "array",
+          items: { type: "string" },
+          description: "Concrete proof the item is really done or under way (commands, files, results).",
+        },
+        accept: { type: "string", description: "How you will know the item is finished." },
+        why: { type: "string", description: "What is blocking the item." },
+        reason: { type: "string", description: "Why the item was abandoned." },
       },
       [],
     ),
@@ -162,10 +173,20 @@ export function createFocusSetTool(opts: FocusToolOptions): ToolSpec {
         return { ok: true, output: `unknown state "${rawState}": use one of ${FOCUS_STATES.join(", ")}` }
       }
       try {
+        const evidence = Array.isArray(args.evidence)
+          ? args.evidence.filter((value): value is string => typeof value === "string")
+          : undefined
+        const accept = typeof args.accept === "string" ? args.accept : undefined
+        const why = typeof args.why === "string" ? args.why : undefined
+        const reason = typeof args.reason === "string" ? args.reason : undefined
         const item = upsertFocus(db, {
           ...(id !== undefined && id !== "" ? { id } : {}),
           ...(text !== undefined && text !== "" ? { text } : {}),
           ...(rawState !== undefined && rawState !== "" ? { state: rawState } : {}),
+          ...(evidence !== undefined ? { evidence } : {}),
+          ...(accept !== undefined ? { accept } : {}),
+          ...(why !== undefined ? { why } : {}),
+          ...(reason !== undefined ? { reason } : {}),
           source: "agent",
         })
         return { ok: true, output: renderFocus(item) }
