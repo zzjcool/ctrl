@@ -6,7 +6,13 @@ import { DatabaseSync } from "node:sqlite"
 import { after, test } from "node:test"
 import type { ToolContext } from "../../src/engine/durable.ts"
 import { SCHEMA_VERSION, memoryDbPath, openMemoryDb, schemaVersion } from "../../src/memory/db.ts"
-import { createProposal, listProposals } from "../../src/memory/proposals.ts"
+import {
+  NO_CHANGES_ERROR,
+  createProposal,
+  getProposal,
+  listProposals,
+  updateProposal,
+} from "../../src/memory/proposals.ts"
 import { SelfEditGate, GateError, selfEditBranchName, type SelfEditRunner } from "../../src/selfedit/gate.ts"
 import {
   git,
@@ -402,4 +408,88 @@ test("a verification command that times out is recorded as a failure", async () 
   assert.ok(proposal)
   assert.equal(proposal.tests?.typecheck?.ok, false)
   assert.match(String(proposal.tests?.typecheck?.output), /timed out/)
+})
+
+test("a reason code survives the round trip through the proposals table", async () => {
+  const db = await makeDb()
+  createProposal(db, {
+    id: "reasoned",
+    branch: "self/reasoned",
+    base: "main",
+    task: "record the reason",
+    status: "failed",
+    createdAt: NOW.toISOString(),
+    error: NO_CHANGES_ERROR,
+    reason: "no_changes",
+  })
+  assert.equal(getProposal(db, "reasoned")?.reason, "no_changes")
+  assert.equal(listProposals(db)[0]?.reason, "no_changes")
+  assert.equal(updateProposal(db, "reasoned", { reason: "timeout" })?.reason, "timeout")
+  assert.equal(updateProposal(db, "reasoned", { summary: "kept" })?.reason, "timeout")
+  assert.equal(updateProposal(db, "reasoned", { reason: null })?.reason, undefined)
+  assert.equal(updateProposal(db, "reasoned", { reason: "green" })?.reason, "green")
+})
+
+test("a proposal written before reason existed reads back without a reason", async () => {
+  const db = await makeDb()
+  db.prepare("INSERT INTO proposals(id, branch, base, task, status, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(
+    "old-row",
+    "self/old-row",
+    "main",
+    "old task",
+    "failed",
+    NOW.toISOString(),
+  )
+  const stored = getProposal(db, "old-row")
+  assert.ok(stored)
+  assert.equal(stored.reason, undefined)
+  assert.equal(stored.status, "failed")
+  assert.equal(updateProposal(db, "old-row", { status: "discarded" })?.reason, undefined)
+})
+
+test("opening a legacy database adds reason and backfills it from the old error text once", async () => {
+  const home = await scratch("ctrl-self-reason-legacy-")
+  const file = memoryDbPath(home)
+  const legacy = new DatabaseSync(file)
+  legacy.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+  legacy.exec(
+    "CREATE TABLE proposals (id TEXT PRIMARY KEY, branch TEXT NOT NULL, base TEXT NOT NULL, task TEXT NOT NULL, " +
+      "summary TEXT, diffstat TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, ended_at TEXT, tests TEXT, error TEXT, " +
+      "applied_at TEXT, merged_commit TEXT)",
+  )
+  const insert = legacy.prepare(
+    "INSERT INTO proposals(id, branch, base, task, status, created_at, error) VALUES (?, ?, 'main', ?, 'failed', ?, ?)",
+  )
+  const at = NOW.toISOString()
+  insert.run("empty-diff", "self/empty-diff", "empty", at, NO_CHANGES_ERROR)
+  insert.run("slow", "self/slow", "slow", at, "ctrl: job exceeded 30m — stopped")
+  insert.run("stalled", "self/stalled", "stalled", at, "ctrl: no output for 8m — stopped")
+  insert.run("crash", "self/crash", "crash", at, "worker exited with code 1")
+  insert.run("clean", "self/clean", "clean", at, "")
+  insert.run("null-error", "self/null-error", "null", at, null)
+  legacy.prepare("INSERT INTO meta(key, value) VALUES ('schema_version', '6')").run()
+  legacy.close()
+
+  const db = openMemoryDb(file)
+  dbs.push(db)
+  const columns = (db.prepare("PRAGMA table_info(proposals)").all() as Array<Record<string, unknown>>).map((row) =>
+    String(row.name ?? ""),
+  )
+  assert.ok(columns.includes("reason"))
+  assert.equal(getProposal(db, "empty-diff")?.reason, "no_changes")
+  assert.equal(getProposal(db, "slow")?.reason, "timeout")
+  assert.equal(getProposal(db, "stalled")?.reason, "timeout")
+  assert.equal(getProposal(db, "crash")?.reason, "worker_failed")
+  assert.equal(getProposal(db, "clean")?.reason, "green")
+  assert.equal(getProposal(db, "null-error")?.reason, "green")
+  assert.equal(schemaVersion(db), 6)
+
+  db.prepare("UPDATE proposals SET reason = 'verification_failed' WHERE id = 'clean'").run()
+  db.close()
+  dbs.splice(dbs.indexOf(db), 1)
+  const reopened = openMemoryDb(file)
+  dbs.push(reopened)
+  assert.equal(getProposal(reopened, "clean")?.reason, "verification_failed", "the backfill does not rerun on every boot")
+  assert.equal(getProposal(reopened, "slow")?.reason, "timeout")
+  assert.equal(schemaVersion(reopened), 6)
 })

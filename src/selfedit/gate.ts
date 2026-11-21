@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite"
 import { readJobLog } from "../jobs/store.ts"
 import { META_PENDING_WAKE, writeMeta } from "../memory/db.ts"
+import { claimPendingEdit, getPendingEdit, releasePendingEdit } from "../memory/pending-edits.ts"
 import {
   DEFAULT_PROPOSAL_LIMIT,
   NO_CHANGES_ERROR,
@@ -9,10 +10,11 @@ import {
   getProposal,
   listProposals,
   proposalStatusFor,
+  reasonFor,
   testsGreen,
   updateProposal,
 } from "../memory/proposals.ts"
-import type { Proposal, ProposalStatus, ProposalTests } from "../memory/proposals.ts"
+import type { Proposal, ProposalReason, ProposalStatus, ProposalTests } from "../memory/proposals.ts"
 import { PACKAGE_JSON, parseNameStatus, protectedReason, touchesPackageJson } from "./apply.ts"
 import {
   git,
@@ -218,14 +220,16 @@ export class SelfEditGate {
       return { ok: false, output: reply.output }
     }
 
-    this.pending.set(reply.id, {
+    const pending: PendingEdit = {
       proposalId,
       jobId: reply.id,
       branch,
       base: current,
       task: trimmed,
       createdAt: timestamp.toISOString(),
-    })
+    }
+    this.pending.set(reply.id, pending)
+    this.claimPending(pending)
 
     return {
       ok: true,
@@ -236,7 +240,7 @@ export class SelfEditGate {
   }
 
   async handleExit(exit: SelfEditExit): Promise<Proposal | undefined> {
-    const pending = this.pending.get(exit.id)
+    const pending = this.pending.get(exit.id) ?? this.recoverPending(exit.id)
     if (pending === undefined) return undefined
     try {
       return await this.settle(pending, exit)
@@ -244,7 +248,60 @@ export class SelfEditGate {
       return this.recordFailure(pending, exit, errorMessage(error))
     } finally {
       this.pending.delete(exit.id)
+      this.releasePending(exit.id)
       await this.returnToBase()
+    }
+  }
+
+  private claimPending(pending: PendingEdit): void {
+    const db = this.db
+    if (db === undefined) {
+      this.warn(`no memory database — self-edit ${pending.proposalId} is not on disk, a restart would lose it`)
+      return
+    }
+    try {
+      claimPendingEdit(db, {
+        proposalId: pending.proposalId,
+        jobId: pending.jobId,
+        branch: pending.branch,
+        base: pending.base,
+        task: pending.task,
+        createdAt: pending.createdAt,
+      })
+    } catch (error) {
+      this.warn(`could not claim self-edit ${pending.proposalId}: ${errorMessage(error)}`)
+    }
+  }
+
+  private recoverPending(jobId: string): PendingEdit | undefined {
+    const db = this.db
+    if (db === undefined) return undefined
+    try {
+      const row = getPendingEdit(db, jobId)
+      if (row === undefined) return undefined
+      const pending: PendingEdit = {
+        proposalId: row.proposalId,
+        jobId: row.jobId,
+        branch: row.branch,
+        base: row.base,
+        task: row.task,
+        createdAt: row.createdAt,
+      }
+      this.pending.set(jobId, pending)
+      return pending
+    } catch (error) {
+      this.warn(`could not recover the pending self-edit for ${jobId}: ${errorMessage(error)}`)
+      return undefined
+    }
+  }
+
+  private releasePending(jobId: string): void {
+    const db = this.db
+    if (db === undefined) return
+    try {
+      releasePendingEdit(db, jobId)
+    } catch (error) {
+      this.warn(`could not release the pending self-edit for ${jobId}: ${errorMessage(error)}`)
     }
   }
 
@@ -374,11 +431,18 @@ export class SelfEditGate {
       .filter((part): part is string => part !== undefined && part !== "")
       .join("; ")
     const status: ProposalStatus = testsGreen(tests) && changed && error === "" ? "open" : "failed"
+    const failure: "ok" | "timeout" | "worker_failed" = stoppedByTimeout(this.agentHome, pending.jobId, exit)
+      ? "timeout"
+      : jobError !== undefined || branchError !== undefined || commitError !== undefined
+        ? "worker_failed"
+        : "ok"
+    const reason = reasonFor({ green, changed, failure })
 
     return this.record({
       pending,
       tests,
       status,
+      reason,
       summary: this.jobSummary(pending.jobId),
       ...(diffstat !== undefined ? { diffstat } : {}),
       ...(error !== "" ? { error } : {}),
@@ -443,6 +507,7 @@ export class SelfEditGate {
     pending: PendingEdit
     tests: ProposalTests
     status?: ProposalStatus
+    reason?: ProposalReason
     summary?: string
     diffstat?: string
     error?: string
@@ -466,6 +531,7 @@ export class SelfEditGate {
         ...(input.summary !== undefined ? { summary: input.summary } : {}),
         ...(input.diffstat !== undefined ? { diffstat: input.diffstat } : {}),
         ...(input.error !== undefined ? { error: input.error } : {}),
+        ...(input.reason !== undefined ? { reason: input.reason } : {}),
       })
     } catch (error) {
       this.warn(`could not record proposal ${input.pending.proposalId}: ${errorMessage(error)}`)
@@ -476,9 +542,11 @@ export class SelfEditGate {
   private recordFailure(pending: PendingEdit, exit: SelfEditExit, message: string): Proposal | undefined {
     this.warn(`self-edit ${pending.proposalId} failed: ${message}`)
     const jobError = jobFailure(exit)
+    const failure = stoppedByTimeout(this.agentHome, pending.jobId, exit) ? "timeout" : "worker_failed"
     return this.record({
       pending,
       tests: {},
+      reason: reasonFor({ green: false, changed: false, failure }),
       ...(jobError !== undefined ? { error: `${jobError}; ${message}` } : { error: message }),
     })
   }
@@ -505,6 +573,19 @@ export class SelfEditGate {
 
 function pendingWakeText(id: string): string {
   return `[ctrl] you applied ${id}. Run the experience script and a live smoke, then report — if it regressed, fix or revert.`
+}
+
+const STOP_NOTE_PATTERN = /^ctrl: (?:job exceeded \d+m|no output for \d+m) — stopped$/
+
+function stoppedByTimeout(agentHome: string | undefined, jobId: string, exit: SelfEditExit): boolean {
+  if (typeof exit.signal !== "string" || exit.signal === "") return false
+  if (agentHome === undefined) return false
+  try {
+    const text = readJobLog(agentHome, jobId, { full: true }).text
+    return text.split("\n").some((line) => STOP_NOTE_PATTERN.test(line.trim()))
+  } catch {
+    return false
+  }
 }
 
 function jobFailure(exit: SelfEditExit): string | undefined {

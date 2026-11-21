@@ -8,6 +8,10 @@ export const PROPOSAL_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/
 
 export type ProposalStatus = "open" | "failed" | "applied" | "discarded"
 
+export type ProposalReason = "green" | "verification_failed" | "no_changes" | "timeout" | "worker_failed"
+
+export const PROPOSAL_REASONS: ProposalReason[] = ["green", "verification_failed", "no_changes", "timeout", "worker_failed"]
+
 export const NO_CHANGES_ERROR = "the worker produced no changes"
 
 export const VERIFICATION_FAILED_ERROR = "verification did not pass"
@@ -34,6 +38,7 @@ export interface Proposal {
   mergedCommit?: string
   tests?: ProposalTests
   error?: string
+  reason?: ProposalReason | null
 }
 
 export interface ProposalDraft {
@@ -48,6 +53,7 @@ export interface ProposalDraft {
   status?: ProposalStatus
   tests?: ProposalTests
   error?: string
+  reason?: ProposalReason | null
 }
 
 export interface ProposalPatch {
@@ -60,14 +66,15 @@ export interface ProposalPatch {
   mergedCommit?: string
   tests?: ProposalTests
   error?: string
+  reason?: ProposalReason | null
 }
 
 export function createProposal(db: DatabaseSync, draft: ProposalDraft): Proposal {
   const createdAt = draft.createdAt ?? new Date().toISOString()
   const status = draft.status ?? "open"
   db.prepare(
-    "INSERT INTO proposals(id, branch, base, task, summary, diffstat, status, created_at, ended_at, tests, error, applied_at, merged_commit, job_id) " +
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO proposals(id, branch, base, task, summary, diffstat, status, created_at, ended_at, tests, error, applied_at, merged_commit, job_id, reason) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     draft.id,
     draft.branch,
@@ -83,6 +90,7 @@ export function createProposal(db: DatabaseSync, draft: ProposalDraft): Proposal
     null,
     null,
     draft.jobId ?? null,
+    draft.reason ?? null,
   )
   const stored = getProposal(db, draft.id)
   if (stored !== undefined) return stored
@@ -98,6 +106,7 @@ export function createProposal(db: DatabaseSync, draft: ProposalDraft): Proposal
     ...(draft.diffstat !== undefined ? { diffstat: draft.diffstat } : {}),
     ...(draft.tests !== undefined ? { tests: draft.tests } : {}),
     ...(draft.error !== undefined ? { error: draft.error } : {}),
+    ...(draft.reason !== undefined && draft.reason !== null ? { reason: draft.reason } : {}),
   }
 }
 
@@ -105,7 +114,7 @@ export function updateProposal(db: DatabaseSync, id: string, patch: ProposalPatc
   const current = getProposal(db, id)
   if (current === undefined) return undefined
   db.prepare(
-    "UPDATE proposals SET status = ?, summary = ?, diffstat = ?, ended_at = ?, tests = ?, error = ?, applied_at = ?, merged_commit = ?, job_id = ? WHERE id = ?",
+    "UPDATE proposals SET status = ?, summary = ?, diffstat = ?, ended_at = ?, tests = ?, error = ?, applied_at = ?, merged_commit = ?, job_id = ?, reason = ? WHERE id = ?",
   ).run(
     patch.status ?? current.status,
     patch.summary ?? current.summary ?? null,
@@ -116,6 +125,7 @@ export function updateProposal(db: DatabaseSync, id: string, patch: ProposalPatc
     patch.appliedAt ?? current.appliedAt ?? null,
     patch.mergedCommit ?? current.mergedCommit ?? null,
     patch.jobId ?? current.jobId ?? null,
+    patch.reason !== undefined ? (patch.reason ?? null) : (current.reason ?? null),
     id,
   )
   return getProposal(db, id)
@@ -135,6 +145,18 @@ export function getProposalByJob(db: DatabaseSync, jobId: string): Proposal | un
 
 export function proposalStatusFor(tests: ProposalTests | undefined): ProposalStatus {
   return testsGreen(tests) ? "open" : "failed"
+}
+
+export function reasonFor(input: {
+  green: boolean
+  changed: boolean
+  failure: "ok" | "timeout" | "worker_failed"
+}): ProposalReason {
+  if (input.failure === "timeout") return "timeout"
+  if (input.failure === "worker_failed") return "worker_failed"
+  if (!input.changed) return "no_changes"
+  if (!input.green) return "verification_failed"
+  return "green"
 }
 
 export function listProposals(
@@ -208,6 +230,7 @@ function toProposal(raw: unknown): Proposal | undefined {
   const appliedAt = text(row.applied_at)
   const mergedCommit = text(row.merged_commit)
   const error = text(row.error)
+  const reason = proposalReason(row.reason)
   const tests = parseProposalTests(row.tests)
   return {
     id,
@@ -223,6 +246,7 @@ function toProposal(raw: unknown): Proposal | undefined {
     ...(appliedAt !== undefined ? { appliedAt } : {}),
     ...(mergedCommit !== undefined ? { mergedCommit } : {}),
     ...(error !== undefined ? { error } : {}),
+    ...(reason !== undefined ? { reason } : {}),
     ...(tests !== undefined ? { tests } : {}),
   }
 }
@@ -231,6 +255,10 @@ function proposalStatus(value: unknown): ProposalStatus | undefined {
   return value === "open" || value === "failed" || value === "applied" || value === "discarded"
     ? value
     : undefined
+}
+
+function proposalReason(value: unknown): ProposalReason | undefined {
+  return PROPOSAL_REASONS.find((reason) => reason === value)
 }
 
 function text(value: unknown): string | undefined {

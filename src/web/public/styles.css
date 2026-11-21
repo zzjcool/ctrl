@@ -1504,6 +1504,45 @@ body {
   color: var(--ok);
 }
 
+.proposal-reason {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  line-height: 1.7;
+  letter-spacing: 0.04em;
+  color: var(--fg-faint);
+  white-space: nowrap;
+}
+
+.proposal-reason[data-reason="green"] {
+  border-color: var(--ok-line);
+  color: var(--ok);
+}
+
+.proposal-reason[data-reason="verification_failed"] {
+  border-color: var(--fail-line);
+  color: var(--fail);
+}
+
+.proposal-reason[data-reason="no_changes"] {
+  border-color: var(--line-strong);
+  color: var(--fg-faint);
+}
+
+.proposal-reason[data-reason="timeout"] {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.proposal-reason[data-reason="worker_failed"] {
+  border-color: var(--fail-line);
+  border-style: dashed;
+  color: var(--fail);
+}
+
 .proposal-task {
   min-width: 0;
   font-size: 12.5px;

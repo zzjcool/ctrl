@@ -117,6 +117,17 @@ CREATE TABLE IF NOT EXISTS proposals (
 CREATE INDEX IF NOT EXISTS proposals_created ON proposals(created_at);
 `
 
+const PENDING_EDITS_DDL = `
+CREATE TABLE IF NOT EXISTS self_edit_pending (
+  job_id TEXT PRIMARY KEY,
+  proposal_id TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  base TEXT NOT NULL,
+  task TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+`
+
 const USAGE_DDL = `
 CREATE TABLE IF NOT EXISTS usage (
   id TEXT PRIMARY KEY,
@@ -162,7 +173,9 @@ export function openMemoryDb(file: string): DatabaseSync {
 export function migrate(db: DatabaseSync): void {
   ensureProposalsTable(db)
   migrateProposalsColumns(db)
+  migrateProposalReason(db)
   migrateProposalStatuses(db)
+  ensurePendingEditsTable(db)
   ensureUsageTable(db)
   ensureDreamLessonsColumn(db)
   migrateFocusColumns(db)
@@ -190,6 +203,25 @@ export function migrateProposalsColumns(db: DatabaseSync): void {
   if (!existing.has("applied_at")) db.exec("ALTER TABLE proposals ADD COLUMN applied_at TEXT")
   if (!existing.has("merged_commit")) db.exec("ALTER TABLE proposals ADD COLUMN merged_commit TEXT")
   if (!existing.has("job_id")) db.exec("ALTER TABLE proposals ADD COLUMN job_id TEXT")
+}
+
+export function migrateProposalReason(db: DatabaseSync): void {
+  const columns = db.prepare("PRAGMA table_info(proposals)").all() as Array<Record<string, unknown>>
+  const existing = new Set(columns.map((row) => String(row.name ?? "")))
+  if (existing.has("reason")) return
+  db.exec("ALTER TABLE proposals ADD COLUMN reason TEXT")
+  db.prepare("UPDATE proposals SET reason = 'no_changes' WHERE error LIKE '%the worker produced no changes%'").run()
+  db.prepare(
+    "UPDATE proposals SET reason = 'timeout' WHERE reason IS NULL AND (error LIKE '%exceeded%' OR error LIKE '%no output for%')",
+  ).run()
+  db.prepare(
+    "UPDATE proposals SET reason = 'worker_failed' WHERE reason IS NULL AND error IS NOT NULL AND trim(error) != ''",
+  ).run()
+  db.prepare("UPDATE proposals SET reason = 'green' WHERE reason IS NULL AND (error IS NULL OR trim(error) = '')").run()
+}
+
+export function ensurePendingEditsTable(db: DatabaseSync): void {
+  db.exec(PENDING_EDITS_DDL)
 }
 
 export function migrateProposalStatuses(db: DatabaseSync): void {

@@ -44,6 +44,16 @@ const PROPOSAL_TEST_KEYS = ["typecheck", "unit", "e2e", "contract"]
 
 const PROPOSAL_STATUSES = ["open", "applied", "discarded"]
 
+const PROPOSAL_REASONS = ["green", "verification_failed", "no_changes", "timeout", "worker_failed"]
+
+const PROPOSAL_REASON_TEXT = {
+  green: "全绿",
+  verification_failed: "验证失败",
+  no_changes: "空 diff",
+  timeout: "超时",
+  worker_failed: "worker 失败",
+}
+
 const state = {
   name: "",
   turn: { running: false },
@@ -1564,6 +1574,15 @@ function normalizeProposalStatus(value) {
   return PROPOSAL_STATUSES.includes(raw) ? raw : ""
 }
 
+function normalizeProposalReason(value) {
+  const raw = typeof value === "string" ? value.trim().toLowerCase() : ""
+  return PROPOSAL_REASONS.includes(raw) ? raw : ""
+}
+
+function proposalReasonText(reason) {
+  return PROPOSAL_REASON_TEXT[reason] || ""
+}
+
 function proposalStateText(stateName) {
   if (stateName === "ok") return "通过"
   if (stateName === "fail") return "失败"
@@ -1596,6 +1615,7 @@ function readProposal(item) {
     summary: typeof item.summary === "string" ? item.summary : "",
     diffstat: typeof item.diffstat === "string" ? item.diffstat : "",
     status: normalizeProposalStatus(item.status),
+    reason: normalizeProposalReason(item.reason),
     createdAt: typeof item.createdAt === "string" ? item.createdAt : String(item.created_at ?? ""),
     endedAt: typeof endedAt === "string" ? endedAt : "",
     tests: readProposalTests(item.tests),
@@ -1639,7 +1659,16 @@ function proposalsSignature(proposals) {
       return stateName === "unknown" ? "-" : stateName === "ok" ? "1" : "0"
     }).join("")
     parts.push(
-      [proposal.id, proposal.status, proposal.branch, proposal.createdAt, proposal.endedAt, proposal.diffstat, marks].join("\u0001"),
+      [
+        proposal.id,
+        proposal.status,
+        proposal.reason,
+        proposal.branch,
+        proposal.createdAt,
+        proposal.endedAt,
+        proposal.diffstat,
+        marks,
+      ].join("\u0001"),
     )
   }
   return parts.join("\u0002")
@@ -1663,7 +1692,13 @@ function proposalItemEl(proposal) {
   const head = el("div", "proposal-line")
   const badge = el("span", "proposal-badge", proposal.status || "—")
   badge.dataset.status = proposal.status || "unknown"
-  head.append(badge, el("span", "proposal-task", shortProposalTask(proposal.task)))
+  head.appendChild(badge)
+  if (proposal.reason) {
+    const reason = el("span", "proposal-reason", proposalReasonText(proposal.reason))
+    reason.dataset.reason = proposal.reason
+    head.appendChild(reason)
+  }
+  head.appendChild(el("span", "proposal-task", shortProposalTask(proposal.task)))
 
   const meta = el("div", "proposal-line")
   meta.appendChild(el("span", "proposal-branch", proposal.branch || "（没有分支）"))
@@ -1815,6 +1850,7 @@ function renderProposalBody(proposal) {
   meta.appendChild(proposalMetaRow("branch", proposal.branch || "—"))
   meta.appendChild(proposalMetaRow("base", proposal.base || "—"))
   meta.appendChild(proposalMetaRow("created", proposal.createdAt ? absoluteTime(proposal.createdAt) : "—"))
+  if (proposal.reason) meta.appendChild(proposalMetaRow("reason", proposalReasonText(proposal.reason) || proposal.reason))
   if (proposal.endedAt) meta.appendChild(proposalMetaRow("ended", absoluteTime(proposal.endedAt)))
   if (proposal.summary) meta.appendChild(proposalMetaRow("summary", proposal.summary))
   els.proposalBody.appendChild(meta)
