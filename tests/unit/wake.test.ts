@@ -14,6 +14,8 @@ interface ScriptedReply {
   toolCalls?: Array<{ name: string; args: Record<string, unknown> }>
 
   delayMs?: number
+
+  hold?: Promise<void>
 }
 
 interface ScriptedLlm {
@@ -35,7 +37,9 @@ function scriptedLlm(script: ScriptedReply[]): ScriptedLlm {
       async complete(request: LlmCompleteRequest): Promise<LlmResponse> {
         calls.push(request)
         const reply = queue.shift() ?? { text: "(no further script)" }
-        if (reply.delayMs !== undefined && reply.delayMs > 0) {
+        if (reply.hold !== undefined) {
+          await reply.hold
+        } else if (reply.delayMs !== undefined && reply.delayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, reply.delayMs))
         }
         return {
@@ -59,6 +63,7 @@ interface Fixture {
   root: string
   workspace: string
   binDir: string
+  releaseWorker(): Promise<void>
 }
 
 const scratch: string[] = []
@@ -69,21 +74,22 @@ async function scratchDir(prefix: string): Promise<string> {
   return dir
 }
 
-function fakePiSource(sleepSeconds: number): string {
+function fakePiSource(releasePath: string): string {
   return `#!/bin/sh
 printf 'args: %s\\n' "$*"
-sleep ${sleepSeconds}
+while [ ! -e '${releasePath}' ]; do sleep 0.05; done
 printf 'the worker did the thing\\n'
 exit 0
 `
 }
 
-async function startCtrl(opts: { sleepSeconds: number; script: ScriptedReply[] }): Promise<Fixture> {
+async function startCtrl(opts: { script: ScriptedReply[] }): Promise<Fixture> {
   const root = await scratchDir("ctrl-wake-root-")
   const workspace = await scratchDir("ctrl-wake-work-")
   const binDir = await scratchDir("ctrl-wake-bin-")
   const piBin = path.join(binDir, "pi")
-  await writeFile(piBin, fakePiSource(opts.sleepSeconds), { mode: 0o755 })
+  const releasePath = path.join(binDir, "release")
+  await writeFile(piBin, fakePiSource(releasePath), { mode: 0o755 })
 
   const llm = scriptedLlm(opts.script)
   const running = await startServer({
@@ -101,12 +107,12 @@ async function startCtrl(opts: { sleepSeconds: number; script: ScriptedReply[] }
     dream: false,
     createLlm: () => llm.client,
   })
-  return { running, llm, root, workspace, binDir }
+  return { running, llm, root, workspace, binDir, releaseWorker: async () => await writeFile(releasePath, "go") }
 }
 
 let fixtures: Fixture[] = []
 
-async function makeFixture(opts: { sleepSeconds: number; script: ScriptedReply[] }): Promise<Fixture> {
+async function makeFixture(opts: { script: ScriptedReply[] }): Promise<Fixture> {
   const fixture = await startCtrl(opts)
   fixtures.push(fixture)
   return fixture
@@ -183,6 +189,12 @@ function wakeLines(snapshot: Stream): string[] {
     .filter((text) => text.startsWith(WAKE_PREFIX))
 }
 
+function userTexts(snapshot: Stream): string[] {
+  return snapshot.events
+    .filter((event) => event.type === "user_message")
+    .map((event) => (event as Extract<SessionEvent, { type: "user_message" }>).data.text)
+}
+
 function jobIdOf(snapshot: Stream): string {
   const results = snapshot.events.filter((event) => event.type === "tool_result") as Extract<
     SessionEvent,
@@ -204,13 +216,9 @@ async function jobState(fixture: Fixture, id: string): Promise<string> {
 
 test("a worker that outlives its turn wakes the agent, once", async () => {
   const fixture = await makeFixture({
-
-    sleepSeconds: 2,
     script: [
-
       { toolCalls: [{ name: "delegate", args: { task: "count slowly", wait: 0 } }] },
       { text: "the worker is counting" },
-
       { text: "the worker finished and printed the thing" },
     ],
   })
@@ -222,6 +230,8 @@ test("a worker that outlives its turn wakes the agent, once", async () => {
   const id = jobIdOf(afterTurn)
   assert.equal(await jobState(fixture, id), "running", "the worker must still be running when the turn ends")
   assert.deepEqual(wakeLines(afterTurn), [], "a running worker has nothing to report yet")
+
+  await fixture.releaseWorker()
 
   const woken = await waitFor(
     () => events(fixture),
@@ -286,18 +296,26 @@ test("a worker that outlives its turn wakes the agent, once", async () => {
 })
 
 test("a worker that finishes during a turn does not start a second one", async () => {
+  let releaseTurn: () => void = () => undefined
+  const turnHeld = new Promise<void>((resolve) => {
+    releaseTurn = resolve
+  })
   const fixture = await makeFixture({
-
-    sleepSeconds: 0.4,
     script: [
       { toolCalls: [{ name: "delegate", args: { task: "count quickly", wait: 0 } }] },
-      { text: "the worker is on it", delayMs: 2_500 },
+      { text: "the worker is on it", hold: turnHeld },
     ],
   })
 
   assert.equal((await api(fixture, "POST", "/api/agent/messages", { text: "count the files" })).status, 202)
-  const done = await settle(fixture)
-  const id = jobIdOf(done)
+  const delegated = await waitFor(
+    () => events(fixture),
+    (snapshot) => snapshot.events.some((event) => event.type === "tool_result" && event.data.name === "delegate"),
+    "the delegate never returned a job id",
+  )
+  const id = jobIdOf(delegated)
+
+  await fixture.releaseWorker()
   const exitWaitStarted = Date.now()
   try {
     await waitFor(
@@ -308,18 +326,20 @@ test("a worker that finishes during a turn does not start a second one", async (
     )
   } catch (error) {
     assert.fail(
-      `the worker did not exit within ${Date.now() - exitWaitStarted}ms of the turn settling: ${(error as Error).message}`,
+      `the worker did not exit ${Date.now() - exitWaitStarted}ms after the turn was held open: ${(error as Error).message}`,
     )
   }
 
-  await new Promise((resolve) => setTimeout(resolve, 400))
-  const after = await events(fixture)
-  assert.deepEqual(wakeLines(after), [], "the running turn polls the job itself; no wake message")
+  const during = await events(fixture)
+  assert.equal(during.turn.running, true, "the held turn is still open when the worker exits")
+  assert.deepEqual(wakeLines(during), [], "the running turn polls the job itself; no wake message")
+  assert.deepEqual(userTexts(during), ["count the files"], "exactly one user_message, the one the user sent")
+
+  releaseTurn()
+  const after = await settle(fixture)
   assert.equal(after.turn.running, false)
-  const userTexts = after.events
-    .filter((event) => event.type === "user_message")
-    .map((event) => (event as Extract<SessionEvent, { type: "user_message" }>).data.text)
-  assert.deepEqual(userTexts, ["count the files"], "exactly one user_message, the one the user sent")
+  assert.deepEqual(wakeLines(after), [], "the settled turn does not start a second one either")
+  assert.deepEqual(userTexts(after), ["count the files"], "no wake message lands once the turn is over")
 
   assert.equal(typeof readJobMeta(fixture.running.ctx.agentHome, id)?.notifiedAt, "string")
 })
