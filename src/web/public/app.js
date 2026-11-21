@@ -44,7 +44,15 @@ const PROPOSAL_TEST_KEYS = ["typecheck", "unit", "e2e", "contract"]
 
 const PROPOSAL_STATUSES = ["open", "applied", "discarded"]
 
-const PROPOSAL_REASONS = ["green", "verification_failed", "no_changes", "timeout", "worker_failed"]
+const PROPOSAL_REASONS = [
+  "green",
+  "verification_failed",
+  "no_changes",
+  "timeout",
+  "worker_failed",
+  "post_boot_failed",
+  "experience_failed",
+]
 
 const PROPOSAL_REASON_TEXT = {
   green: "全绿",
@@ -52,6 +60,8 @@ const PROPOSAL_REASON_TEXT = {
   no_changes: "空 diff",
   timeout: "超时",
   worker_failed: "worker 失败",
+  post_boot_failed: "启动自检失败",
+  experience_failed: "体验自检失败",
 }
 
 const state = {

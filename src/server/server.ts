@@ -24,6 +24,7 @@ import type { UsageKind } from "../memory/usage.ts"
 import { ImageAttachments } from "../media/attachments.ts"
 import { createImageLlm } from "../media/images.ts"
 import { SelfEditGate } from "../selfedit/gate.ts"
+import { consumePostBootFailure } from "../selfedit/post-boot-failed.ts"
 import { createTools } from "../tools/index.ts"
 import { DEFAULT_AGENT, LOG_ID, ensureAgent, logPath, resolveRoot } from "./agents.ts"
 import {
@@ -225,6 +226,14 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     ...(config.selfEdit?.restart !== undefined ? { restart: config.selfEdit.restart } : {}),
     warn: (message) => process.stderr.write(`ctrl: ${message}\n`),
   })
+
+  consumePostBootFailure({
+    db: memory.handle(),
+    agentHome: ensured.home,
+    root,
+    warn: (message) => process.stderr.write(`ctrl: ${message}\n`),
+  })
+  bootTrace("context:post-boot-failed")
 
   ctx.tools = createTools({
     agentHome: ensured.home,

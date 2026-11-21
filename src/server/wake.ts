@@ -19,6 +19,8 @@ const REASON_WAKE_TEXT: Record<ProposalReason, string> = {
   no_changes: "worker 没改出任何东西，没什么可合的；要改就重新 self_edit。",
   timeout: "跑太久被停掉了，结果不完整，不会自动合；拆小一点重新 self_edit，或写一句理由 discard。",
   worker_failed: "worker 自己失败了，结果不可信，不会自动合；查一下再 self_edit，或写一句理由 discard。",
+  post_boot_failed: "合进去之后启动自检没过，supervisor 已经回滚到 known-good；这个提案算失败，别当它生效，查一下再 self_edit。",
+  experience_failed: "合进去之后 experience 脚本没过，supervisor 已经回滚到 known-good；这个提案算失败，别当它生效，查一下再 self_edit。",
 }
 
 const UNKNOWN_REASON_TEXT = "没有记录失败原因（老提案），不确定能不能合；看一眼 diff 和测试再决定 apply 还是 discard。"
