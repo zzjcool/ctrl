@@ -160,7 +160,8 @@ export async function executeTool(
   args: Record<string, unknown>,
   ctx: ToolContext,
 ): Promise<ToolResult> {
-  const timeoutMs = positiveInteger(ctx.timeoutMs, DEFAULT_TIMEOUT_MS)
+  const fallbackTimeoutMs = positiveInteger(ctx.timeoutMs, DEFAULT_TIMEOUT_MS)
+  const timeoutMs = positiveInteger(spec.timeoutMs, fallbackTimeoutMs)
   const maxOutputChars = positiveInteger(ctx.maxOutputChars, DEFAULT_MAX_OUTPUT_CHARS)
   let timer: ReturnType<typeof setTimeout> | undefined
 
@@ -238,8 +239,8 @@ function truncate(output: string, maxChars: number): string {
   return `${output.slice(0, maxChars)}... [truncated ${removed} chars]`
 }
 
-function positiveInteger(value: number, fallback: number): number {
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback
+function positiveInteger(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback
 }
 
 function isMemoryKind(value: unknown): value is MemoryKind {

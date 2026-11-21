@@ -13,6 +13,8 @@ import { createApplyProposalTool } from "../selfedit/apply.ts"
 import type { SelfEditGate } from "../selfedit/gate.ts"
 import { createSelfEditTool } from "../selfedit/tool.ts"
 
+const LONG_TOOL_TIMEOUT_MS = 180_000
+
 export interface CreateToolsOptions {
 
   agentHome: string

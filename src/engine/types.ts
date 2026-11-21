@@ -183,5 +183,6 @@ export interface ToolSpec {
   parameters: JsonSchema
 
   hidden?: boolean
+  timeoutMs?: number
   execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>
 }
