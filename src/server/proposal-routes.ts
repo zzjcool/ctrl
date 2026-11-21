@@ -1,6 +1,8 @@
 import type { ServerResponse } from "node:http"
+import { errorMessage } from "../memory/events.ts"
 import { GateError } from "../selfedit/gate.ts"
 import { HttpError, sendJson } from "./http.ts"
+import { syncFocusOnApplied, syncFocusOnClosed } from "./proposal-focus-hook.ts"
 import { methodNotAllowed, notFound } from "./routes.ts"
 import type { AppContext } from "./routes.ts"
 
@@ -46,7 +48,12 @@ export async function handleProposalRoutes(
   }
 
   if (action === "apply") {
-    await guard(() => ctx.selfEdit.apply(id))
+    const proposal = await guard(() => ctx.selfEdit.apply(id))
+    try {
+      syncFocusOnApplied(ctx.memory.handle(), proposal.id, proposal.mergedCommit)
+    } catch (error) {
+      console.error(`could not sync focus for applied proposal ${proposal.id}: ${errorMessage(error)}`)
+    }
     sendJson(response, 200, { applied: true, restarting: true })
     ctx.selfEdit.scheduleRestart()
     return
@@ -54,6 +61,11 @@ export async function handleProposalRoutes(
 
   if (action === "discard") {
     const proposal = await guard(() => ctx.selfEdit.discard(id))
+    try {
+      syncFocusOnClosed(ctx.memory.handle(), proposal.id, "discarded", proposal.summary ?? proposal.error ?? "")
+    } catch (error) {
+      console.error(`could not sync focus for discarded proposal ${proposal.id}: ${errorMessage(error)}`)
+    }
     sendJson(response, 200, { discarded: true, proposal })
     return
   }
