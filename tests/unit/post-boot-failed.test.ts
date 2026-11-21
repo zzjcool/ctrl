@@ -12,8 +12,8 @@ import {
   POST_BOOT_MARKER,
   consumePostBootFailure,
   parsePostBootMarker,
-} from "../../src/selfedit/post-boot-failed.ts"
-import type { PostBootFailure } from "../../src/selfedit/post-boot-failed.ts"
+} from "../../src/memory/post-boot-failed.ts"
+import type { PostBootFailure } from "../../src/memory/post-boot-failed.ts"
 
 const SHA = "af44a938e7c3b6588687051f985d49852d550a65"
 

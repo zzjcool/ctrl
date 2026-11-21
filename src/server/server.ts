@@ -24,7 +24,7 @@ import type { UsageKind } from "../memory/usage.ts"
 import { ImageAttachments } from "../media/attachments.ts"
 import { createImageLlm } from "../media/images.ts"
 import { SelfEditGate } from "../selfedit/gate.ts"
-import { consumePostBootFailure } from "../selfedit/post-boot-failed.ts"
+import { consumePostBootFailure } from "../memory/post-boot-failed.ts"
 import { createTools } from "../tools/index.ts"
 import { DEFAULT_AGENT, LOG_ID, ensureAgent, logPath, resolveRoot } from "./agents.ts"
 import {

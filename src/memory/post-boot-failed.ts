@@ -1,8 +1,8 @@
 import { existsSync, readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import type { DatabaseSync } from "node:sqlite"
-import { getProposal, updateProposal } from "../memory/proposals.ts"
-import { errorMessage } from "./git.ts"
+import { getProposal, updateProposal } from "./proposals.ts"
+import { errorMessage } from "../selfedit/git.ts"
 
 export const POST_BOOT_MARKER = "post-boot-failed"
 
