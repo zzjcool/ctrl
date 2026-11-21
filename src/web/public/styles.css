@@ -567,6 +567,16 @@ body {
   flex: 0 0 auto;
 }
 
+.job-truncated {
+  display: inline;
+  margin-left: 5px;
+  color: var(--warn);
+}
+
+.job-truncated[hidden] {
+  display: none;
+}
+
 .job[data-state="running"] .job-badge {
   color: var(--accent);
   border-color: var(--accent-soft);
