@@ -2202,14 +2202,14 @@ async function abortTurn() {
   }
 }
 
-async function loadTail() {
+async function loadTail({ scroll = true } = {}) {
   try {
     const data = await api(`/events?tail=${TAIL}&view=conversation`)
     const total = numberOf(data && data.total)
     if (total !== null) state.eventCount = Math.max(state.eventCount, total)
     const events = Array.isArray(data && data.events) ? data.events : []
     appendEvents(events)
-    scrollToBottom()
+    if (scroll) scrollToBottom()
   } catch (error) {
     toast(`历史加载失败：${messageOf(error)}`)
   }
@@ -2329,8 +2329,8 @@ async function tryLoadAgent() {
     setConnected(true)
     state.loaded = true
     updateHead()
-    if (state.eventCount > 0) await loadTail()
-    await refreshJobs()
+    await Promise.all([state.eventCount > 0 ? loadTail({ scroll: false }) : null, refreshJobs()])
+    if (state.stickToBottom) scrollToBottom()
     await refreshProposals()
     void refreshFocus()
     renderDream()
