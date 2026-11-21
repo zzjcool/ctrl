@@ -1,6 +1,6 @@
 export const DEFAULT_WIDTHS = [390, 1280]
 
-export const READY_TIMEOUT_MS = 8_000
+export const READY_TIMEOUT_MS = 15_000
 
 export const VIEWPORT_HEIGHT = 900
 

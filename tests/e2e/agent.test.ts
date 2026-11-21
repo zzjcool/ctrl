@@ -632,26 +632,70 @@ async function waitForDreams(count: number, timeoutMs = 8000): Promise<Record<st
 
 test("focus, memories and dreams are the panel's three surfaces (MEMORY.md §10.1)", async () => {
 
-  const created = await api("POST", "/api/focus", { text: "实现 M4 面板" })
+  const created = await api("POST", "/api/focus", { text: "实现 M4 面板", accept: "三块数据都从 /api 能读到" })
   assert.equal(created.status, 200, created.text)
   const focusId = created.json.item.id as string
-  assert.deepEqual(Object.keys(created.json.item).sort(), ["id", "seq", "state", "text", "updatedAt"])
+  assert.deepEqual(Object.keys(created.json.item).sort(), ["accept", "id", "seq", "state", "text", "updatedAt"])
   assert.equal(created.json.item.state, "open")
   assert.equal(created.json.item.seq, null)
+  assert.equal(created.json.item.accept, "三块数据都从 /api 能读到")
+  assert.equal(created.json.item.evidence, undefined, "no evidence yet")
+  assert.equal(created.json.item.why, undefined, "nothing is blocked")
+  assert.equal(created.json.item.reason, undefined, "nothing was dropped")
 
-  const moved = await api("POST", "/api/focus", { id: focusId, state: "doing" })
+  const moved = await api("POST", "/api/focus", { id: focusId, state: "doing", evidence: ["npm test"] })
   assert.equal(moved.status, 200, moved.text)
   assert.equal(moved.json.item.state, "doing")
   assert.equal(moved.json.item.text, "实现 M4 面板")
+  assert.deepEqual(moved.json.item.evidence, ["npm test"])
+  assert.equal(moved.json.item.accept, "三块数据都从 /api 能读到")
+  assert.deepEqual(Object.keys(moved.json.item).sort(), [
+    "accept",
+    "evidence",
+    "id",
+    "seq",
+    "state",
+    "text",
+    "updatedAt",
+  ])
+  assert.equal(moved.json.item.why, undefined, "moving to doing does not invent a why")
+  assert.equal(moved.json.item.reason, undefined, "moving to doing does not invent a reason")
+
+  const blockedFocus = await api("POST", "/api/focus", { text: "面板阻塞项", state: "blocked", why: "等接口联调" })
+  assert.equal(blockedFocus.status, 200, blockedFocus.text)
+  assert.equal(blockedFocus.json.item.why, "等接口联调")
+  assert.equal(blockedFocus.json.item.accept, undefined)
+  assert.equal(blockedFocus.json.item.evidence, undefined)
+
+  const droppedFocus = await api("POST", "/api/focus", { text: "面板放弃项", state: "dropped", reason: "第一版不做图表" })
+  assert.equal(droppedFocus.status, 200, droppedFocus.text)
+  assert.equal(droppedFocus.json.item.reason, "第一版不做图表")
+  assert.equal(droppedFocus.json.item.why, undefined)
 
   const listed = await api("GET", "/api/focus")
   assert.equal(listed.status, 200, listed.text)
-  assert.ok(
-    (listed.json.items as Array<Record<string, any>>).some((item) => item.id === focusId && item.state === "doing"),
-    "the item is in the panel",
+  const panelRows = listed.json.items as Array<Record<string, any>>
+  const panelRow = panelRows.find((item) => item.id === focusId)
+  assert.equal(panelRow?.state, "doing", "the item is in the panel")
+  assert.equal(panelRow?.text, "实现 M4 面板")
+  assert.deepEqual(panelRow?.evidence, ["npm test"])
+  assert.equal(panelRow?.accept, "三块数据都从 /api 能读到")
+  assert.equal(
+    panelRows.some((item) => item.id === blockedFocus.json.item.id),
+    true,
+    "a blocked item is on the same panel",
+  )
+  assert.equal(
+    panelRows.some((item) => item.id === droppedFocus.json.item.id),
+    false,
+    "a dropped item leaves the panel, like a done one",
   )
   assert.equal((await api("POST", "/api/focus", {})).status, 400, "text or id is required")
   assert.equal((await api("POST", "/api/focus", { text: "x", state: "nonsense" })).status, 400)
+  const noAccept = await api("POST", "/api/focus", { text: "没有验收的项" })
+  assert.equal(noAccept.status, 400, "open focus without accept is refused")
+  assert.equal(noAccept.json.code, "missing-field")
+  assert.equal(noAccept.json.error, "moving focus new to open requires accept")
 
   const memory = await api("POST", "/api/memories", {
     text: "面板用 focus 和 memories 两块数据",

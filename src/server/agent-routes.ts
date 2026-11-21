@@ -12,7 +12,7 @@ import { attachmentSink } from "../media/attachments.ts"
 import { MAX_IMAGE_BYTES, imageType, saveImage } from "../media/images.ts"
 import type { UsageKind } from "../memory/usage.ts"
 import { lastDreamAt, readProfile } from "../memory/dream.ts"
-import { listFocus, openFocusCount } from "../memory/focus.ts"
+import { formatFocusLine, listFocusForPrompt, openFocusCount } from "../memory/focus.ts"
 import { liveMemoryCount } from "../memory/memories.ts"
 import { recordCompactionSummary, windowInfo } from "../memory/window.ts"
 import { LOG_ID } from "./agents.ts"
@@ -300,9 +300,9 @@ export function buildSystemPrompt(opts: {
   const profile = readProfile(opts.agentHome) ?? ""
   if (profile !== "") parts.push(`# What you know about this person\n${profile}`)
   if (opts.db !== undefined) {
-    const focus = listFocus(opts.db, { limit: 5 })
+    const focus = listFocusForPrompt(opts.db, { limit: 20 })
     if (focus.length > 0) {
-      parts.push(`# Focus\n${focus.map((item) => `- [${item.state}] ${item.text}`).join("\n")}`)
+      parts.push(`# Focus\n${focus.map((item) => formatFocusLine(item)).join("\n")}`)
     }
   }
   return parts.join("\n\n")

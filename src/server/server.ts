@@ -15,7 +15,7 @@ import {
 import { createSqliteAgentMemory } from "../memory/agent-memory.ts"
 import { lastIndexedSeq, readMeta, writeMeta } from "../memory/db.ts"
 import { DREAM_IDLE_MS, DREAM_TICK_MS, DreamController, lastDreamSeq } from "../memory/dream.ts"
-import { openFocusCount, listFocus } from "../memory/focus.ts"
+import { formatFocusLine, isStale, listFocus, listFocusForPrompt, openFocusCount } from "../memory/focus.ts"
 import { createMemoryIndex } from "../memory/index.ts"
 import type { MemoryIndex } from "../memory/index.ts"
 import { MAX_PROPOSAL_LIMIT, listProposals } from "../memory/proposals.ts"
@@ -272,6 +272,13 @@ export function buildContext(config: ServerConfig = {}): AppContext {
         withDb(memory, [] as string[], (db) =>
           listFocus(db, { limit: HEARTBEAT_FOCUS_LINES }).map((item) => item.text),
         ),
+      staleFocusTexts: () =>
+        withDb(memory, [] as string[], (db) => {
+          const now = new Date()
+          return listFocusForPrompt(db)
+            .filter((item) => isStale(item, now))
+            .map((item) => formatFocusLine(item, now))
+        }),
       openProposals: () =>
         withDb(memory, [] as ProposalSummary[], (db) =>
           listProposals(db, { status: "open", limit: MAX_PROPOSAL_LIMIT }).map((proposal) =>

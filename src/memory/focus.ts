@@ -23,6 +23,12 @@ export const MAX_FOCUS_LIMIT = 50
 
 export const STALE_MS = 3 * 24 * 60 * 60 * 1000
 
+const DAY_MS = 24 * 60 * 60 * 1000
+
+export const DEFAULT_PROMPT_FOCUS_LIMIT = 20
+
+export const FOCUS_EVIDENCE_MAX_CHARS = 40
+
 export const FOCUS_TRANSITIONS: Record<FocusState, FocusState[]> = {
   open: ["doing", "blocked", "dropped"],
   doing: ["review", "blocked", "open", "dropped"],
@@ -76,6 +82,11 @@ export interface FocusItem {
 export interface ListFocusOptions {
   includeDone?: boolean
   limit?: number
+}
+
+export interface ListFocusForPromptOptions {
+  limit?: number
+  now?: Date
 }
 
 export interface UpsertFocusInput {
@@ -188,6 +199,10 @@ export function upsertFocus(db: DatabaseSync, input: UpsertFocusInput): FocusIte
       return getFocus(db, id) as FocusItem
     }
     if (text === undefined || text === "") throw new Error("focus needs text when the id is new")
+    const twin = findFocusTwin(db, text)
+    if (twin !== undefined) {
+      return reuseFocus(db, twin, { text, state, stamp, evidence, accept, why, reason, input })
+    }
     db.prepare(
       "INSERT INTO focus(id, text, state, updated_at, source, seq, evidence, accept, why, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(
@@ -207,25 +222,9 @@ export function upsertFocus(db: DatabaseSync, input: UpsertFocusInput): FocusIte
 
   if (text === undefined || text === "") throw new Error("focus needs text or an id")
 
-  const wanted = normalizeFocusText(text)
-  const twin = listFocus(db, { includeDone: false, limit: MAX_FOCUS_LIMIT }).find(
-    (item) => normalizeFocusText(item.text) === wanted,
-  )
+  const twin = findFocusTwin(db, text)
   if (twin !== undefined) {
-    db.prepare(
-      "UPDATE focus SET state = ?, updated_at = ?, source = ?, seq = ?, evidence = ?, accept = ?, why = ?, reason = ? WHERE id = ?",
-    ).run(
-      state ?? twin.state,
-      stamp,
-      input.source ?? "agent",
-      input.seq ?? twin.seq ?? null,
-      evidence === undefined ? evidenceJson(twin.evidence ?? []) : evidenceJson(evidence),
-      mergeFocusField(accept, twin.accept),
-      mergeFocusField(why, twin.why),
-      mergeFocusField(reason, twin.reason),
-      twin.id,
-    )
-    return getFocus(db, twin.id) as FocusItem
+    return reuseFocus(db, twin, { text, state, stamp, evidence, accept, why, reason, input })
   }
 
   const fresh = newFocusId(now)
@@ -284,6 +283,100 @@ export function completeFocus(db: DatabaseSync, id: string, now: Date = new Date
   if (existing === undefined) return undefined
   db.prepare("UPDATE focus SET state = 'done', updated_at = ? WHERE id = ?").run(now.toISOString(), id)
   return getFocus(db, id)
+}
+
+export function focusAgeDays(updatedAt: string, now: Date = new Date()): number {
+  const at = Date.parse(updatedAt)
+  if (!Number.isFinite(at)) return 0
+  return Math.max(0, Math.floor((now.getTime() - at) / DAY_MS))
+}
+
+export function listFocusForPrompt(db: DatabaseSync, opts: ListFocusForPromptOptions = {}): FocusItem[] {
+  const now = opts.now ?? new Date()
+  const limit =
+    typeof opts.limit === "number" && Number.isFinite(opts.limit)
+      ? Math.max(1, Math.trunc(opts.limit))
+      : DEFAULT_PROMPT_FOCUS_LIMIT
+  const rows = db
+    .prepare("SELECT * FROM focus WHERE state IS NULL OR (state <> 'done' AND state <> 'dropped')")
+    .all() as unknown[]
+  return rows
+    .map(mapRow)
+    .sort(
+      (a, b) =>
+        Number(isStale(b, now)) - Number(isStale(a, now)) ||
+        FOCUS_ORDER[a.state] - FOCUS_ORDER[b.state] ||
+        a.updatedAt.localeCompare(b.updatedAt) ||
+        a.id.localeCompare(b.id),
+    )
+    .slice(0, limit)
+}
+
+export function formatFocusLine(item: FocusItem, now: Date = new Date()): string {
+  const days = focusAgeDays(item.updatedAt, now)
+  const head = isStale(item, now) ? `- [stale ${days}d] ${item.state} ${item.id}` : `- [${item.state}] ${item.id}`
+  const evidence =
+    item.evidence === undefined || item.evidence.length === 0
+      ? "no evidence"
+      : `evidence: ${item.evidence.map(clipFocusEvidence).join(", ")}`
+  return `${head} ${oneLineText(item.text)}（${days}d, ${evidence}）`
+}
+
+function oneLineText(text: string): string {
+  return text.replace(/\s+/gu, " ").trim()
+}
+
+function clipFocusEvidence(value: string): string {
+  const text = oneLineText(value)
+  return text.length > FOCUS_EVIDENCE_MAX_CHARS ? `${text.slice(0, FOCUS_EVIDENCE_MAX_CHARS)}…` : text
+}
+
+function findFocusTwin(db: DatabaseSync, text: string): FocusItem | undefined {
+  const wanted = normalizeFocusText(text)
+  const rows = db
+    .prepare("SELECT * FROM focus WHERE state IS NULL OR (state <> 'done' AND state <> 'dropped')")
+    .all() as unknown[]
+  return rows
+    .map(mapRow)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
+    .find((item) => normalizeFocusText(item.text) === wanted)
+}
+
+function mergeEvidence(existing: string[] | undefined, incoming: string[]): string[] {
+  return normalizeEvidence([...(existing ?? []), ...incoming])
+}
+
+function reuseFocus(
+  db: DatabaseSync,
+  twin: FocusItem,
+  next: {
+    text: string
+    state: FocusState | undefined
+    stamp: string
+    evidence: string[] | undefined
+    accept: string | undefined
+    why: string | undefined
+    reason: string | undefined
+    input: UpsertFocusInput
+  },
+): FocusItem {
+  const evidence =
+    next.evidence === undefined ? evidenceJson(twin.evidence ?? []) : evidenceJson(mergeEvidence(twin.evidence, next.evidence))
+  db.prepare(
+    "UPDATE focus SET text = ?, state = ?, updated_at = ?, source = ?, seq = ?, evidence = ?, accept = ?, why = ?, reason = ? WHERE id = ?",
+  ).run(
+    next.text,
+    next.state ?? twin.state,
+    next.stamp,
+    next.input.source ?? "agent",
+    next.input.seq ?? twin.seq ?? null,
+    evidence,
+    mergeFocusField(next.accept, twin.accept),
+    mergeFocusField(next.why, twin.why),
+    mergeFocusField(next.reason, twin.reason),
+    twin.id,
+  )
+  return getFocus(db, twin.id) as FocusItem
 }
 
 function parseFocusEvidence(raw: unknown): string[] {

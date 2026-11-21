@@ -3,7 +3,7 @@ import type { DatabaseSync } from "node:sqlite"
 import { openSession } from "../engine/durable.ts"
 import { listDreamRuns, runDream } from "../memory/dream.ts"
 import type { DreamLlm, DreamResult } from "../memory/dream.ts"
-import { completeFocus, isFocusState, listFocus, upsertFocus } from "../memory/focus.ts"
+import { FOCUS_STATES, FocusError, completeFocus, isFocusState, listFocus, upsertFocusStrict } from "../memory/focus.ts"
 import type { FocusItem } from "../memory/focus.ts"
 import { clampLimit } from "../memory/index.ts"
 import { addMemory, isMemoryKind, listMemories, tombstoneMemory } from "../memory/memories.ts"
@@ -125,14 +125,30 @@ async function handleFocusRoot(
       throw new HttpError(400, "text is required (or an id to update)")
     }
     if (body.state !== undefined && !isFocusState(body.state)) {
-      throw new HttpError(400, "state must be one of open, doing, blocked, done")
+      throw new HttpError(400, `state must be one of ${FOCUS_STATES.join(", ")}`)
     }
-    const item = upsertFocus(db, {
-      ...(updateId !== undefined && updateId !== "" ? { id: updateId } : {}),
-      ...(text !== undefined && text !== "" ? { text } : {}),
-      ...(body.state !== undefined ? { state: String(body.state) } : {}),
-      source: "user",
-    })
+    if (body.evidence !== undefined && (!Array.isArray(body.evidence) || body.evidence.some((value) => typeof value !== "string"))) {
+      throw new HttpError(400, "evidence must be an array of strings")
+    }
+    let item: FocusItem
+    try {
+      item = upsertFocusStrict(db, {
+        ...(updateId !== undefined && updateId !== "" ? { id: updateId } : {}),
+        ...(text !== undefined && text !== "" ? { text } : {}),
+        ...(body.state !== undefined ? { state: String(body.state) } : {}),
+        ...(Array.isArray(body.evidence) ? { evidence: body.evidence as string[] } : {}),
+        ...(typeof body.accept === "string" ? { accept: body.accept } : {}),
+        ...(typeof body.why === "string" ? { why: body.why } : {}),
+        ...(typeof body.reason === "string" ? { reason: body.reason } : {}),
+        source: "user",
+      })
+    } catch (error) {
+      if (error instanceof FocusError) {
+        sendJson(response, 400, { error: error.message, code: error.code })
+        return
+      }
+      throw error
+    }
     sendJson(response, 200, { item: focusView(item) })
     return
   }
@@ -256,7 +272,17 @@ function usageDays(raw: string): number {
 }
 
 function focusView(item: FocusItem): Record<string, unknown> {
-  return { id: item.id, text: item.text, state: item.state, updatedAt: item.updatedAt, seq: item.seq ?? null }
+  return {
+    id: item.id,
+    text: item.text,
+    state: item.state,
+    updatedAt: item.updatedAt,
+    seq: item.seq ?? null,
+    ...(item.evidence !== undefined && item.evidence.length > 0 ? { evidence: item.evidence } : {}),
+    ...(item.accept !== undefined ? { accept: item.accept } : {}),
+    ...(item.why !== undefined ? { why: item.why } : {}),
+    ...(item.reason !== undefined ? { reason: item.reason } : {}),
+  }
 }
 
 function memoryView(row: MemoryRow): Record<string, unknown> {
