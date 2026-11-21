@@ -344,7 +344,7 @@ interface Stream {
   events: SessionEvent[]
   total: number
   since: number
-  turn: { running: boolean; error?: string; aborted?: boolean; startedAt?: string }
+  turn: { running: boolean; error?: string; aborted?: boolean; startedAt?: string; partial?: string }
 }
 
 async function eventsStream(query = ""): Promise<Stream> {
@@ -567,6 +567,31 @@ test("a streaming turn grows turn.partial and drops the key once the answer land
   const answers = whole.events.filter((event) => event.type === "assistant_message")
   assert.equal(answers.at(-1)?.data.text, answer)
   assert.equal(fixture.fake.bodies.at(-1)?.stream, true, "the turn asks the gateway to stream")
+})
+
+test("aborting a streaming turn stops it at once and drops the partial", async () => {
+  fixture.fake.reset()
+  fixture.fake.push({ stream: true, content: "this answer will be cut in the middle of a sentence by the operator" })
+  assert.equal((await send("stream then abort")).status, 202)
+
+  const deadline = Date.now() + 10_000
+  for (;;) {
+    const reply = await api("GET", "/api/agent")
+    const turn = reply.json.turn as { running: boolean; partial?: string }
+    if (!turn.running) break
+    if (typeof turn.partial === "string" && turn.partial.length > 0) break
+    assert.ok(Date.now() < deadline, "the streaming turn never produced a partial")
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+
+  const aborted = await api("POST", "/api/agent/abort")
+  assert.equal(aborted.status, 200, aborted.text)
+  assert.equal(aborted.json.aborted, true)
+
+  const settled = await settle(4000)
+  assert.equal(settled.turn.aborted, true)
+  assert.equal(settled.turn.error, undefined, "an abort is not an error")
+  assert.equal(settled.turn.partial, undefined, "the partial dies with the turn")
 })
 
 test("the model is offered exactly ten tools under fixed names", async () => {
