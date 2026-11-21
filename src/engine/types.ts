@@ -46,6 +46,7 @@ export interface LlmUsage {
 
 export interface LlmResponse {
   text: string
+  thinking?: string
   toolCalls: LlmToolCall[]
   usage: LlmUsage
   finishReason: string
@@ -61,6 +62,7 @@ export interface LlmCompleteRequest {
 
 export interface LlmDeltaInfo {
   reset?: boolean
+  kind?: "text" | "thinking"
 }
 
 export type LlmDelta = (text: string, info?: LlmDeltaInfo) => void

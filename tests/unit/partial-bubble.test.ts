@@ -27,12 +27,16 @@ interface FakeNode {
   parent: FakeNode | null
   rendered: string
   fragment: boolean
+  open: boolean
+  listeners: Record<string, Array<() => void>>
   appendChild(node: FakeNode): FakeNode
   append(...nodes: FakeNode[]): void
   insertBefore(node: FakeNode, anchor: FakeNode | null): FakeNode
   remove(): void
+  addEventListener(type: string, handler: () => void): void
   readonly lastElementChild: FakeNode | null
   readonly nextElementSibling: FakeNode | null
+  readonly previousElementSibling: FakeNode | null
   readonly parentNode: FakeNode | null
 }
 
@@ -46,6 +50,13 @@ function fakeNode(tag: string): FakeNode {
     parent: null as FakeNode | null,
     rendered: "",
     fragment: false,
+    open: false,
+    listeners: {} as Record<string, Array<() => void>>,
+    addEventListener(type: string, handler: () => void): void {
+      const list = node.listeners[type] ?? []
+      list.push(handler)
+      node.listeners[type] = list
+    },
     appendChild(child: FakeNode): FakeNode {
       if (child.fragment) {
         for (const item of child.children.splice(0)) {
@@ -94,6 +105,12 @@ function fakeNode(tag: string): FakeNode {
       const at = parent.children.indexOf(node)
       return at < 0 ? null : (parent.children[at + 1] ?? null)
     },
+    get previousElementSibling(): FakeNode | null {
+      const parent = node.parent
+      if (parent === null) return null
+      const at = parent.children.indexOf(node)
+      return at <= 0 ? null : (parent.children[at - 1] ?? null)
+    },
     get parentNode(): FakeNode | null {
       return node.parent
     },
@@ -104,14 +121,30 @@ function fakeNode(tag: string): FakeNode {
 interface Turn {
   running: boolean
   partial?: string
+  thinking?: string
   startedAt?: string
+}
+
+interface ThinkingNode {
+  row: FakeNode
+  details: FakeNode
+  pre: FakeNode
+  manual: boolean
 }
 
 interface Harness {
   rows: FakeNode
-  state: { turn: Turn; pendingEl: FakeNode | null; partialEl: FakeNode | null; stickToBottom: boolean; rows: unknown[] }
+  state: {
+    turn: Turn
+    pendingEl: FakeNode | null
+    partialEl: FakeNode | null
+    thinkingEl: ThinkingNode | null
+    stickToBottom: boolean
+    rows: unknown[]
+  }
   syncPending: () => void
   syncPartial: () => void
+  syncThinking: () => void
   appendEvents: (events: unknown[]) => void
   partialRows: () => FakeNode[]
   partialText: () => string
@@ -124,6 +157,7 @@ function harness(): Harness {
     turn: { running: false } as Turn,
     pendingEl: null as FakeNode | null,
     partialEl: null as FakeNode | null,
+    thinkingEl: null as ThinkingNode | null,
     stickToBottom: true,
     rows: [] as unknown[],
   }
@@ -171,7 +205,7 @@ function harness(): Harness {
     "noteCursors",
     "scheduleTaskMeasure",
     "scheduleStickToBottom",
-    `${partialSource}\n${appendSource}\nreturn { syncPending, syncPartial, appendEvents }`,
+    `${partialSource}\n${appendSource}\nreturn { syncPending, syncPartial, syncThinking, appendEvents }`,
   ) as (
     els: unknown,
     state: unknown,
@@ -186,7 +220,7 @@ function harness(): Harness {
     noteCursors: unknown,
     scheduleTaskMeasure: unknown,
     scheduleStickToBottom: unknown,
-  ) => { syncPending: () => void; syncPartial: () => void; appendEvents: (events: unknown[]) => void }
+  ) => { syncPending: () => void; syncPartial: () => void; syncThinking: () => void; appendEvents: (events: unknown[]) => void }
 
   const api = factory(
     els,
@@ -275,4 +309,55 @@ test("a turn without partial text and a settled turn both keep the timeline free
   ui.state.turn = { running: false }
   ui.syncPending()
   assert.deepEqual(ui.rowClasses(), [], "a finished turn leaves neither bubble nor pending line")
+})
+
+test("a thinking block sits above the answer and collapses once the answer starts", () => {
+  const ui = harness()
+  ui.state.turn = { running: true, thinking: "想一想" }
+  ui.syncPending()
+  assert.deepEqual(ui.rowClasses(), ["row row-agent row-thinking", "row row-pending"])
+  assert.equal(ui.state.thinkingEl?.pre.textContent, "想一想")
+  assert.equal(ui.state.thinkingEl?.details.open, true)
+
+  ui.state.turn = { running: true, thinking: "想一想更多", partial: "答案" }
+  ui.syncPending()
+  assert.deepEqual(ui.rowClasses(), [
+    "row row-agent row-thinking",
+    "row row-agent row-partial",
+    "row row-pending",
+  ])
+  assert.equal(ui.state.thinkingEl?.details.open, false, "the answer starting collapses the thinking block")
+
+  const listeners = ui.state.thinkingEl?.details.children.find((node) => node.tag === "summary")?.listeners.click ?? []
+  assert.equal(listeners.length, 1, "the title toggles with a click, so Enter and Space work too")
+  listeners[0]?.()
+  if (ui.state.thinkingEl) ui.state.thinkingEl.details.open = true
+
+  ui.state.turn = { running: true, thinking: "想一想更多", partial: "答案更多" }
+  ui.syncPending()
+  assert.equal(ui.state.thinkingEl?.details.open, true, "a manually opened block stays open for the rest of the turn")
+})
+
+test("no thinking block is rendered when the turn has no thinking", () => {
+  const ui = harness()
+  ui.state.turn = { running: true, partial: "答案" }
+  ui.syncPending()
+  assert.equal(ui.rowClasses().some((name) => name.includes("row-thinking")), false)
+  assert.equal(ui.state.thinkingEl, null)
+
+  ui.state.turn = { running: true }
+  ui.syncThinking()
+  assert.equal(ui.rowClasses().some((name) => name.includes("row-thinking")), false)
+})
+
+test("a thinking block disappears when the turn ends", () => {
+  const ui = harness()
+  ui.state.turn = { running: true, thinking: "想一想" }
+  ui.syncPending()
+  assert.equal(ui.rowClasses().some((name) => name.includes("row-thinking")), true)
+
+  ui.state.turn = { running: false }
+  ui.syncPending()
+  assert.equal(ui.rowClasses().some((name) => name.includes("row-thinking")), false)
+  assert.equal(ui.state.thinkingEl, null)
 })

@@ -68,6 +68,7 @@ const state = {
   tools: new Map(),
   pendingEl: null,
   partialEl: null,
+  thinkingEl: null,
   loaded: false,
   exhausted: false,
   loadingEarlier: false,
@@ -347,6 +348,7 @@ function normalizeTurn(turn) {
     running,
     ...(typeof turn.startedAt === "string" ? { startedAt: turn.startedAt } : {}),
     ...(running && typeof turn.partial === "string" && turn.partial !== "" ? { partial: turn.partial } : {}),
+    ...(running && typeof turn.thinking === "string" && turn.thinking !== "" ? { thinking: turn.thinking } : {}),
     ...(typeof turn.error === "string" && turn.error ? { error: turn.error } : {}),
     ...(turn.aborted === true ? { aborted: true } : {}),
   }
@@ -984,6 +986,7 @@ function appendEvents(events) {
   if (!records.length) return
   if (records.some((record) => record.el && record.el.dataset && record.el.dataset.type === "assistant_message")) {
     clearPartial()
+    clearThinking()
   }
   const fragment = document.createDocumentFragment()
   let prevDay = state.rows.length ? state.rows[state.rows.length - 1].day : null
@@ -1143,11 +1146,75 @@ function syncPending() {
       state.pendingEl = null
     }
     syncPartial()
+    syncThinking()
     return
   }
   if (!state.pendingEl) state.pendingEl = buildPending()
   if (els.rows.lastElementChild !== state.pendingEl) els.rows.appendChild(state.pendingEl)
   syncPartial()
+  syncThinking()
+}
+
+function buildThinking() {
+  const row = el("div", "row row-agent row-thinking")
+  const time = document.createElement("time")
+  time.className = "row-time"
+  time.textContent = timeLabel(new Date())
+  const body = el("div", "row-body")
+  const details = document.createElement("details")
+  details.className = "thinking"
+  details.open = true
+  const summary = document.createElement("summary")
+  summary.className = "thinking-title"
+  summary.textContent = "思考"
+  const pre = el("pre", "thinking-body")
+  details.append(summary, pre)
+  body.appendChild(details)
+  row.append(time, body)
+  const node = { row, details, pre, manual: false }
+  summary.addEventListener("click", () => {
+    node.manual = true
+  })
+  return node
+}
+
+function clearThinking() {
+  if (!state.thinkingEl) return
+  state.thinkingEl.row.remove()
+  state.thinkingEl = null
+}
+
+function thinkingText() {
+  const turn = state.turn
+  if (!turn || turn.running !== true || typeof turn.thinking !== "string") return ""
+  return turn.thinking
+}
+
+function syncThinking() {
+  const text = thinkingText()
+  if (!text) {
+    clearThinking()
+    return
+  }
+  if (!state.thinkingEl) state.thinkingEl = buildThinking()
+  const node = state.thinkingEl
+  if (node.pre.textContent !== text) node.pre.textContent = text
+  if (!node.manual) {
+    const open = partialText() === ""
+    if (node.details.open !== open) node.details.open = open
+  }
+  const anchor =
+    state.partialEl && state.partialEl.row.parentNode === els.rows
+      ? state.partialEl.row
+      : state.pendingEl && state.pendingEl.parentNode === els.rows
+        ? state.pendingEl
+        : null
+  if (anchor !== null) {
+    if (anchor.previousElementSibling !== node.row) els.rows.insertBefore(node.row, anchor)
+  } else if (els.rows.lastElementChild !== node.row) {
+    els.rows.appendChild(node.row)
+  }
+  scheduleStickToBottom()
 }
 
 function buildPartial() {

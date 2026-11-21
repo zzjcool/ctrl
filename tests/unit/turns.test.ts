@@ -114,6 +114,43 @@ test("the turn state carries the text of the running turn and drops it on both e
   assert.deepEqual(turns.state("s1"), { running: false }, "a finished turn has no partial key")
 })
 
+test("the turn state keeps thinking apart from the partial answer and drops both at the end", async () => {
+  const turns = new TurnRegistry()
+  let delta: LlmDelta = () => undefined
+  let release: () => void = () => undefined
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  assert.equal(
+    turns.start("s1", async (_signal, onDelta) => {
+      delta = onDelta
+      await gate
+    }),
+    true,
+  )
+  assert.equal(turns.state("s1").thinking, undefined, "no thinking yet means no thinking key")
+
+  delta("先想", { kind: "thinking" })
+  delta("一想", { kind: "thinking" })
+  assert.equal(turns.state("s1").thinking, "先想一想")
+  assert.equal(turns.state("s1").partial, undefined, "thinking never lands in partial")
+
+  delta("正文")
+  assert.equal(turns.state("s1").partial, "正文")
+  assert.equal(turns.state("s1").thinking, "先想一想", "text never lands in thinking")
+
+  delta("", { reset: true })
+  assert.equal(turns.state("s1").partial, undefined)
+  assert.equal(turns.state("s1").thinking, undefined, "a reset clears the thinking too")
+
+  delta("另一段思考", { kind: "thinking" })
+  assert.equal(turns.state("s1").thinking, "另一段思考")
+
+  release()
+  await turns.settled("s1")
+  assert.deepEqual(turns.state("s1"), { running: false }, "a finished turn keeps neither partial nor thinking")
+})
+
 test("createAbortableLlm forwards streaming and injects the signal", async () => {
   const controller = new AbortController()
   const seen: LlmCompleteRequest[] = []

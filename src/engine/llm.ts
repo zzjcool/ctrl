@@ -275,8 +275,10 @@ function parseResponse(payload: unknown): LlmResponse {
   const toolCalls = Array.isArray(message.tool_calls)
     ? message.tool_calls.map(parseToolCall)
     : []
+  const thinking = typeof message.reasoning_content === "string" ? message.reasoning_content : ""
   return {
     text: completionText(message.content),
+    ...(thinking !== "" ? { thinking } : {}),
     toolCalls,
     usage,
     finishReason: typeof choice.finish_reason === "string" ? choice.finish_reason : "unknown",
@@ -346,6 +348,7 @@ function isRetryableStatus(status: number): boolean {
 
 interface StreamState {
   text: string
+  thinking: string
   toolCalls: Map<number, { id: string; name: string; arguments: string }>
   usage: LlmUsage | undefined
   finishReason: string | undefined
@@ -358,7 +361,14 @@ async function readStreamResponse(response: Response, onDelta: LlmDelta): Promis
   const reader = response.body?.getReader()
   if (reader === undefined) throw new Error("Invalid LLM response: missing stream")
   const decoder = new TextDecoder()
-  const state: StreamState = { text: "", toolCalls: new Map(), usage: undefined, finishReason: undefined, done: false }
+  const state: StreamState = {
+    text: "",
+    thinking: "",
+    toolCalls: new Map(),
+    usage: undefined,
+    finishReason: undefined,
+    done: false,
+  }
   let buffer = ""
   while (!state.done) {
     const chunk = await reader.read()
@@ -388,6 +398,7 @@ async function readStreamResponse(response: Response, onDelta: LlmDelta): Promis
     .map(([, call]) => ({ callId: call.id, name: call.name, args: parseToolArguments(call.arguments) }))
   return {
     text: state.text,
+    ...(state.thinking !== "" ? { thinking: state.thinking } : {}),
     toolCalls,
     usage: state.usage ?? parseUsage(undefined),
     finishReason: state.finishReason ?? "unknown",
@@ -402,6 +413,7 @@ async function readWholeResponse(response: Response, onDelta: LlmDelta): Promise
     throw new Error("Invalid LLM response: malformed JSON")
   }
   const parsed = parseResponse(payload)
+  if (parsed.thinking !== undefined && parsed.thinking !== "") onDelta(parsed.thinking, { kind: "thinking" })
   if (parsed.text !== "") onDelta(parsed.text)
   return parsed
 }
@@ -435,6 +447,11 @@ function applyStreamChunk(payload: unknown, state: StreamState, onDelta: LlmDelt
     state.finishReason = choice.finish_reason
   }
   if (!isRecord(choice.delta)) return
+  const reasoning = choice.delta.reasoning_content
+  if (typeof reasoning === "string" && reasoning !== "") {
+    state.thinking += reasoning
+    onDelta(reasoning, { kind: "thinking" })
+  }
   const content = choice.delta.content
   if (typeof content === "string" && content !== "") {
     state.text += content
