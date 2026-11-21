@@ -2,7 +2,7 @@ import type { ServerResponse } from "node:http"
 import { errorMessage } from "../memory/events.ts"
 import { GateError } from "../selfedit/gate.ts"
 import { HttpError, sendJson } from "./http.ts"
-import { syncFocusOnApplied, syncFocusOnClosed } from "./proposal-focus-hook.ts"
+import { syncFocusOnApplied, syncFocusOnClosed } from "../memory/proposal-focus.ts"
 import { methodNotAllowed, notFound } from "./routes.ts"
 import type { AppContext } from "./routes.ts"
 
