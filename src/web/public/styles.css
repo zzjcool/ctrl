@@ -232,7 +232,7 @@ body {
   position: relative;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 4px 0 28px;
+  padding: 4px 0 0;
   scroll-behavior: auto;
 }
 
@@ -283,7 +283,7 @@ body {
 .rows {
   max-width: var(--content-max);
   margin: 0 auto;
-  padding: 0 24px;
+  padding: 0 24px 56px;
 }
 
 .row {
