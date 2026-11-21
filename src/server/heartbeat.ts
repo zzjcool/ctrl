@@ -14,12 +14,39 @@ export const DEFAULT_HEARTBEAT_TICK_MS = 60_000
 export const HEARTBEAT_INSTRUCTION =
   "Decide whether to move one of these forward right now. If none of it is worth doing, say so in one sentence and end the turn — do not spin."
 
+export const PROPOSAL_DECISION_INSTRUCTION =
+  "Every proposal listed above must get a decision this turn — apply or discard with a one-line reason. Leaving them open is not an option."
+
+export const PROPOSAL_BLOCKING_MS = 24 * 60 * 60 * 1000
+
+export interface ProposalSummary {
+  id: string
+  ageMs: number
+  diffstat: string
+  blocking: boolean
+}
+
+export function proposalSummary(
+  proposal: { id: string; createdAt: string; diffstat?: string },
+  now: number,
+): ProposalSummary {
+  const createdAt = Date.parse(proposal.createdAt)
+  const ageMs = Number.isFinite(createdAt) ? Math.max(0, now - createdAt) : 0
+  const diffstat = proposal.diffstat === undefined ? "" : oneLine(proposal.diffstat)
+  return {
+    id: proposal.id,
+    ageMs,
+    diffstat: diffstat === "" ? "no diffstat" : diffstat,
+    blocking: ageMs > PROPOSAL_BLOCKING_MS,
+  }
+}
+
 export interface HeartbeatDeps {
   now: () => number
   usageToday: () => { tokens: number }
   openFocus: () => number
   focusTexts?: () => string[]
-  openProposals: () => number
+  openProposals: () => ProposalSummary[]
   lastEventAt: () => string | undefined
   turnRunning: () => boolean
   start: (text: string) => void
@@ -57,9 +84,20 @@ export function heartbeatText(input: {
   idleMs: number
   openFocus: number
   focus: string[]
-  openProposals: number
+  openProposals: ProposalSummary[]
 }): string {
   const lines = [`${HEARTBEAT_PREFIX} — idle ${formatElapsed(input.idleMs)}.`]
+  const proposals = [
+    ...input.openProposals.filter((proposal) => proposal.blocking),
+    ...input.openProposals.filter((proposal) => !proposal.blocking),
+  ]
+  if (proposals.length > 0) {
+    lines.push(`proposals waiting for approval (${proposals.length}):`)
+    for (const proposal of proposals) {
+      const mark = proposal.blocking ? " [blocking]" : ""
+      lines.push(`- ${proposal.id} (${formatElapsed(proposal.ageMs)} old, ${proposal.diffstat})${mark}`)
+    }
+  }
   const focus = input.focus.slice(0, HEARTBEAT_FOCUS_LINES)
   if (focus.length > 0) {
     lines.push(`open focus (${input.openFocus}):`)
@@ -67,8 +105,8 @@ export function heartbeatText(input: {
   } else if (input.openFocus > 0) {
     lines.push(`open focus: ${input.openFocus} item(s).`)
   }
-  lines.push(`proposals waiting for approval: ${input.openProposals}.`)
   lines.push(HEARTBEAT_INSTRUCTION)
+  if (proposals.length > 0) lines.push(PROPOSAL_DECISION_INSTRUCTION)
   return lines.join("\n")
 }
 
@@ -91,8 +129,8 @@ export function createHeartbeat(deps: HeartbeatDeps, opts: HeartbeatOptions = {}
       const idleMs = now - last
       if (idleMs < idleMinutes * 60_000) return false
       const openFocus = deps.openFocus()
-      const openProposals = deps.openProposals()
-      if (openFocus + openProposals <= 0) return false
+      const proposals = deps.openProposals()
+      if (openFocus <= 0 && proposals.length === 0) return false
       if (deps.usageToday().tokens >= dailyTokenBudget) return false
       const date = heartbeatDate(now)
       const used = deps.readCounter(date)
@@ -101,7 +139,7 @@ export function createHeartbeat(deps: HeartbeatDeps, opts: HeartbeatOptions = {}
         idleMs,
         openFocus,
         focus: deps.focusTexts === undefined ? [] : deps.focusTexts(),
-        openProposals,
+        openProposals: proposals,
       })
       deps.writeCounter(date, used + 1)
       try {

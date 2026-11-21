@@ -304,7 +304,7 @@ test("an old proposals table gains applied_at and merged_commit on open", async 
 
   const db = openMemoryDb(file)
   dbs.push(db)
-  assert.equal(SCHEMA_VERSION, 5)
+  assert.equal(SCHEMA_VERSION, 6)
   const columns = db.prepare("PRAGMA table_info(proposals)").all() as Array<Record<string, unknown>>
   const names = columns.map((row) => String(row.name ?? ""))
   assert.ok(names.includes("applied_at"))

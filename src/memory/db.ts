@@ -1,8 +1,9 @@
 import { mkdirSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
+import { VERIFICATION_FAILED_ERROR, parseProposalTests, testsGreen } from "./proposals.ts"
 
-export const SCHEMA_VERSION = 5
+export const SCHEMA_VERSION = 6
 export const MEMORY_DB_FILENAME = "memory.db"
 
 export function memoryDbPath(agentHome: string): string {
@@ -105,7 +106,8 @@ CREATE TABLE IF NOT EXISTS proposals (
   tests TEXT,
   error TEXT,
   applied_at TEXT,
-  merged_commit TEXT
+  merged_commit TEXT,
+  job_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS proposals_created ON proposals(created_at);
@@ -129,6 +131,8 @@ CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts);
 export const META_SCHEMA_VERSION = "schema_version"
 
 export const META_LAST_INDEXED_SEQ = "last_indexed_seq"
+
+export const META_PENDING_WAKE = "pending_wake"
 
 export function openMemoryDb(file: string): DatabaseSync {
   if (file !== ":memory:") mkdirSync(dirname(file), { recursive: true })
@@ -154,6 +158,7 @@ export function openMemoryDb(file: string): DatabaseSync {
 function migrate(db: DatabaseSync): void {
   ensureProposalsTable(db)
   migrateProposalsColumns(db)
+  migrateProposalStatuses(db)
   ensureUsageTable(db)
   ensureDreamLessonsColumn(db)
   const stored = readMeta(db, META_SCHEMA_VERSION)
@@ -179,6 +184,17 @@ export function migrateProposalsColumns(db: DatabaseSync): void {
   const existing = new Set(columns.map((row) => String(row.name ?? "")))
   if (!existing.has("applied_at")) db.exec("ALTER TABLE proposals ADD COLUMN applied_at TEXT")
   if (!existing.has("merged_commit")) db.exec("ALTER TABLE proposals ADD COLUMN merged_commit TEXT")
+  if (!existing.has("job_id")) db.exec("ALTER TABLE proposals ADD COLUMN job_id TEXT")
+}
+
+export function migrateProposalStatuses(db: DatabaseSync): void {
+  const rows = db.prepare("SELECT id, tests FROM proposals WHERE status = 'open'").all() as Array<Record<string, unknown>>
+  const stale = rows.filter((row) => !testsGreen(parseProposalTests(row.tests)))
+  if (stale.length === 0) return
+  const update = db.prepare(
+    "UPDATE proposals SET status = 'failed', error = CASE WHEN error IS NULL OR trim(error) = '' THEN ? ELSE error END WHERE id = ? AND status = 'open'",
+  )
+  for (const row of stale) update.run(VERIFICATION_FAILED_ERROR, String(row.id ?? ""))
 }
 
 export function ensureUsageTable(db: DatabaseSync): void {

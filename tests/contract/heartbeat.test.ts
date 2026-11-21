@@ -147,7 +147,7 @@ test("an idle heartbeat lands in /api/agent/events under the [ctrl] heartbeat pr
     )
     const text = userMessages(settled).find((candidate) => candidate.startsWith(HEARTBEAT_PREFIX)) as string
     assert.match(text, /contract heartbeat focus/)
-    assert.match(text, /proposals waiting for approval: 0\./)
+    assert.equal(text.includes("proposals waiting for approval"), false, "an empty proposal list keeps the section out")
 
     const date = heartbeatDate(Date.now())
     assert.equal(counterIn(fixture.running.ctx.agentHome, date), "1")
