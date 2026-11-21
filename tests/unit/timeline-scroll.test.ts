@@ -199,7 +199,7 @@ function tailHarness(options: { timeline?: Partial<Timeline>; state?: Partial<St
     toast: (message: string) => void,
     messageOf: (error: unknown) => string,
     TAIL: number,
-  ) => { loadTail: () => Promise<void> }
+  ) => { loadTail: (options?: { scroll?: boolean }) => Promise<void> }
 
   const api = factory(
     observed.els,
@@ -421,4 +421,35 @@ test("without ResizeObserver the fallback poll runs until the reader scrolls up,
   scroller.noteTimelineScroll()
   assert.equal(scroller.state.stickToBottom, true, "returning to the bottom must re-arm the flag")
   assert.equal(scroller.intervals.size, 1, "returning to the bottom must restart the fallback poll")
+})
+
+test("the first screen pins the timeline once, after the tail and the job cards have both landed", () => {
+  const parallel = bootSource.indexOf("await Promise.all([")
+  assert.ok(parallel >= 0, "boot must fetch the tail and the job cards in parallel")
+
+  const pins = [...bootSource.matchAll(/scrollToBottom\(/g)]
+  assert.equal(pins.length, 1, "boot must pin the timeline exactly once")
+  const pin = pins[0].index ?? -1
+  assert.ok(pin > parallel, "the only pin must sit after the parallel load, never inside it")
+  assert.equal(/await loadTail\(\)/.test(bootSource), false, "boot must not let loadTail pin on its own")
+  assert.equal(/await refreshJobs\(\)/.test(bootSource), false, "the job cards must not be awaited after the pin")
+
+  const tail = bootSource.slice(parallel)
+  assert.ok(tail.indexOf("scrollToBottom(") > tail.indexOf("Promise.all(["), "the pin must follow the parallel load")
+})
+
+test("loadTail can be asked to skip its own pin so the first screen only pins once", async () => {
+  const calls = [...appJs.matchAll(/(?<!function )\bloadTail\(([^)]*)\)/g)].map((match) => match[1].trim())
+  assert.deepEqual(calls, ["{ scroll: false }"], "the only caller is the boot, and it must disable the inner pin")
+
+  const off = tailHarness({ timeline: { scrollTop: 0, scrollHeight: 641, clientHeight: 641 } })
+  await off.loadTail({ scroll: false })
+  assert.deepEqual(off.calls, ["appendEvents"], "the tail must still be rendered")
+  assert.equal(off.els.timeline.scrollTop, 0, "scroll:false must leave the scrollbar for the caller")
+  assert.equal(off.state.lastTimelineScrollTop, 0, "skipping the pin must not record a new position")
+
+  const on = tailHarness({ timeline: { scrollTop: 0, scrollHeight: 641, clientHeight: 641 } })
+  await on.loadTail()
+  assert.equal(on.els.timeline.scrollTop, 14468, "the default must keep pinning for every other flow")
+  assert.equal(on.state.lastTimelineScrollTop, 14468, "the default pin must record the new position")
 })
