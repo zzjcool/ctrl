@@ -290,6 +290,39 @@ test("a tool that never returns is cut off by the shared tool cap", async () => 
   assert.match(result.output, /timed out after 60ms/)
 })
 
+test("a tool declaring its own timeout outlives the shared cap", async () => {
+  const started = Date.now()
+  const result = await executeTool(
+    {
+      name: "slow",
+      description: "finishes after the shared cap",
+      parameters: { type: "object", properties: {} },
+      timeoutMs: 400,
+      execute: () => new Promise((resolve) => setTimeout(() => resolve({ ok: true, output: "done" }), 150)),
+    },
+    {},
+    { cwd: "/w", allowBash: false, timeoutMs: 60, maxOutputChars: 8_000 },
+  )
+  assert.equal(result.ok, true)
+  assert.equal(result.output, "done")
+  assert.ok(Date.now() - started >= 140)
+})
+
+test("a tool still honours the shared cap when it declares none", async () => {
+  const result = await executeTool(
+    {
+      name: "slow",
+      description: "finishes after the shared cap",
+      parameters: { type: "object", properties: {} },
+      execute: () => new Promise((resolve) => setTimeout(() => resolve({ ok: true, output: "done" }), 200)),
+    },
+    {},
+    { cwd: "/w", allowBash: false, timeoutMs: 60, maxOutputChars: 8_000 },
+  )
+  assert.equal(result.ok, false)
+  assert.match(result.output, /timed out after 60ms/)
+})
+
 test("a tool call a crashed turn left open is repaired before the model sees it", async () => {
   const { session } = await newSession()
   session.appendUserMessage("run something")
