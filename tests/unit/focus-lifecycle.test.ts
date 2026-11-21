@@ -5,14 +5,17 @@ import { SCHEMA_VERSION, migrate, openMemoryDb, schemaVersion } from "../../src/
 import {
   FocusError,
   STALE_MS,
+  formatFocusLine,
   getFocus,
   isStale,
+  listFocusForPrompt,
   openFocusCount,
   upsertFocus,
   upsertFocusStrict,
   type FocusItem,
   type UpsertFocusInput,
 } from "../../src/memory/focus.ts"
+import { STALE_FOCUS_INSTRUCTION, heartbeatText } from "../../src/server/heartbeat.ts"
 
 function fresh(): DatabaseSync {
   return openMemoryDb(":memory:")
@@ -253,4 +256,156 @@ test("evidence parsing survives garbage, non-strings and duplicates", () => {
   } finally {
     db.close()
   }
+})
+
+function focusRowCount(db: DatabaseSync): number {
+  const row = db.prepare("SELECT count(*) AS n FROM focus").get() as { n: number | bigint }
+  return typeof row.n === "bigint" ? Number(row.n) : row.n
+}
+
+test("the same text in another shape reuses the row instead of adding one", () => {
+  const db = fresh()
+  try {
+    const first = upsertFocus(db, { text: "Ship the Focus panel.", state: "doing", evidence: ["tsc"] })
+    const second = upsertFocus(db, {
+      text: "  ship   THE focus panel",
+      state: "blocked",
+      evidence: ["tsc", "npm test"],
+      why: "等评审",
+    })
+    assert.equal(second.id, first.id)
+    assert.equal(second.text, "ship   THE focus panel")
+    assert.deepEqual(second.evidence, ["tsc", "npm test"])
+    assert.equal(second.why, "等评审")
+
+    const third = upsertFocus(db, { text: "ＳＨＩＰ　ＴＨＥ　ＦＯＣＵＳ　ＰＡＮＥＬ。", state: "open", accept: "面板可见" })
+    assert.equal(third.id, first.id)
+    assert.equal(third.state, "open")
+    assert.equal(third.accept, "面板可见")
+    assert.equal(third.why, "等评审")
+    assert.deepEqual(third.evidence, ["tsc", "npm test"])
+    assert.equal(focusRowCount(db), 1)
+  } finally {
+    db.close()
+  }
+})
+
+test("a finished item is not reused when the same task is mentioned again", () => {
+  const db = fresh()
+  try {
+    const done = upsertFocus(db, { text: "发布 0.1", state: "done", evidence: ["tag"] })
+    const again = upsertFocus(db, { text: "发布 0.1", state: "open", accept: "上线" })
+    assert.notEqual(again.id, done.id)
+    assert.equal((getFocus(db, done.id) as FocusItem).state, "done")
+    assert.equal(focusRowCount(db), 2)
+  } finally {
+    db.close()
+  }
+})
+
+test("the prompt list leads with stale rows, oldest first, and never with finished ones", () => {
+  const db = fresh()
+  try {
+    const now = new Date("2026-03-01T00:00:00.000Z")
+    const insert = db.prepare(
+      "INSERT INTO focus(id, text, state, updated_at, source) VALUES (?, ?, ?, ?, 'agent')",
+    )
+    insert.run("foc-finished", "已完成", "done", "2026-01-01T00:00:00.000Z")
+    insert.run("foc-dropped", "已丢弃", "dropped", "2026-01-01T00:00:00.000Z")
+    insert.run("foc-fresh-doing", "新 doing", "doing", "2026-02-28T00:00:00.000Z")
+    insert.run("foc-fresh-open", "新 open", "open", "2026-02-27T00:00:00.000Z")
+    insert.run("foc-stale-blocked", "陈旧 blocked", "blocked", "2026-02-20T00:00:00.000Z")
+    insert.run("foc-stale-open-a", "陈旧 open a", "open", "2026-02-10T00:00:00.000Z")
+    insert.run("foc-stale-open-b", "陈旧 open b", "open", "2026-02-15T00:00:00.000Z")
+
+    const ids = listFocusForPrompt(db, { now }).map((item) => item.id)
+    assert.deepEqual(ids, [
+      "foc-stale-open-a",
+      "foc-stale-open-b",
+      "foc-stale-blocked",
+      "foc-fresh-doing",
+      "foc-fresh-open",
+    ])
+  } finally {
+    db.close()
+  }
+})
+
+test("the prompt list stops at twenty rows and keeps the oldest", () => {
+  const db = fresh()
+  try {
+    for (let index = 0; index < 25; index += 1) {
+      upsertFocus(db, {
+        text: `任务 ${String(index).padStart(2, "0")}`,
+        state: "doing",
+        evidence: ["x"],
+        now: new Date(Date.UTC(2026, 0, 1, 0, index)),
+      })
+    }
+    const items = listFocusForPrompt(db)
+    assert.equal(items.length, 20)
+    assert.equal(items[0]?.text, "任务 00")
+    assert.equal(items[19]?.text, "任务 19")
+  } finally {
+    db.close()
+  }
+})
+
+test("formatFocusLine spells a row out for the prompt", () => {
+  const now = new Date("2026-03-10T00:00:00.000Z")
+  const plain: FocusItem = {
+    id: "foc-abc",
+    text: "写  README",
+    state: "doing",
+    updatedAt: "2026-03-07T00:00:00.000Z",
+    evidence: ["a", "b"],
+  }
+  assert.equal(formatFocusLine(plain, now), "- [doing] foc-abc 写 README（3d, evidence: a, b）")
+
+  const stale: FocusItem = {
+    id: "foc-abc",
+    text: "收尾",
+    state: "open",
+    updatedAt: "2026-03-05T00:00:00.000Z",
+    evidence: [],
+  }
+  assert.equal(formatFocusLine(stale, now), "- [stale 5d] open foc-abc 收尾（5d, no evidence）")
+
+  const clipped: FocusItem = {
+    id: "foc-long",
+    text: "长证据",
+    state: "blocked",
+    updatedAt: "2026-03-10T00:00:00.000Z",
+    evidence: ["z".repeat(41)],
+  }
+  assert.equal(formatFocusLine(clipped, now), `- [blocked] foc-long 长证据（0d, evidence: ${"z".repeat(40)}…）`)
+})
+
+test("the heartbeat names every stale focus row and drops the section when nothing is stale", () => {
+  const now = new Date("2026-03-10T00:00:00.000Z")
+  const stale: FocusItem = {
+    id: "foc-abc",
+    text: "陈旧任务",
+    state: "open",
+    updatedAt: "2026-03-05T00:00:00.000Z",
+    evidence: [],
+  }
+  const focus = ["- [open] foc-new 新任务（0d, no evidence）"]
+  const quiet = heartbeatText({ idleMs: 90 * 60_000, openFocus: 1, focus, openProposals: [] })
+  assert.equal(quiet.includes(STALE_FOCUS_INSTRUCTION), false, quiet)
+  assert.equal(quiet.includes("stale"), false, quiet)
+
+  const loud = heartbeatText({
+    idleMs: 90 * 60_000,
+    openFocus: 1,
+    focus,
+    staleFocus: [formatFocusLine(stale, now)],
+    openProposals: [],
+  })
+  const lines = loud.split("\n")
+  assert.ok(lines.includes(STALE_FOCUS_INSTRUCTION), loud)
+  const at = lines.findIndex((line) => line.startsWith("- [stale 5d] open foc-abc"))
+  assert.ok(at > 0, loud)
+  assert.equal(lines[at], "- [stale 5d] open foc-abc 陈旧任务（5d, no evidence）")
+  assert.equal(lines[at + 1], "  继续（说明下一步）/ 合并到哪一条 / dropped（必须给 reason）")
 })

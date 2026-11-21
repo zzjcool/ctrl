@@ -19,6 +19,10 @@ export const PROPOSAL_DECISION_INSTRUCTION =
 
 export const PROPOSAL_BLOCKING_MS = 24 * 60 * 60 * 1000
 
+export const STALE_FOCUS_INSTRUCTION = "以下 focus 已超过 3 天没有新证据，本轮必须逐条决策："
+
+export const STALE_FOCUS_OPTIONS = "  继续（说明下一步）/ 合并到哪一条 / dropped（必须给 reason）"
+
 export interface ProposalSummary {
   id: string
   ageMs: number
@@ -46,6 +50,7 @@ export interface HeartbeatDeps {
   usageToday: () => { tokens: number }
   openFocus: () => number
   focusTexts?: () => string[]
+  staleFocusTexts?: () => string[]
   openProposals: () => ProposalSummary[]
   lastEventAt: () => string | undefined
   turnRunning: () => boolean
@@ -84,6 +89,7 @@ export function heartbeatText(input: {
   idleMs: number
   openFocus: number
   focus: string[]
+  staleFocus?: string[]
   openProposals: ProposalSummary[]
 }): string {
   const lines = [`${HEARTBEAT_PREFIX} — idle ${formatElapsed(input.idleMs)}.`]
@@ -104,6 +110,14 @@ export function heartbeatText(input: {
     for (const text of focus) lines.push(`- ${oneLine(text)}`)
   } else if (input.openFocus > 0) {
     lines.push(`open focus: ${input.openFocus} item(s).`)
+  }
+  const stale = (input.staleFocus ?? []).map(oneLine).filter((line) => line !== "")
+  if (stale.length > 0) {
+    lines.push(STALE_FOCUS_INSTRUCTION)
+    for (const line of stale) {
+      lines.push(line)
+      lines.push(STALE_FOCUS_OPTIONS)
+    }
   }
   lines.push(HEARTBEAT_INSTRUCTION)
   if (proposals.length > 0) lines.push(PROPOSAL_DECISION_INSTRUCTION)
@@ -139,6 +153,7 @@ export function createHeartbeat(deps: HeartbeatDeps, opts: HeartbeatOptions = {}
         idleMs,
         openFocus,
         focus: deps.focusTexts === undefined ? [] : deps.focusTexts(),
+        staleFocus: deps.staleFocusTexts === undefined ? [] : deps.staleFocusTexts(),
         openProposals: proposals,
       })
       deps.writeCounter(date, used + 1)
