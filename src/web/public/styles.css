@@ -397,27 +397,27 @@ body {
   margin-bottom: 0;
 }
 
-.row-agent .prose .table-wrap {
+.row-body .table-wrap {
   overflow-x: auto;
   white-space: normal;
 }
 
-.row-agent .prose table {
+.row-body table {
   border-collapse: collapse;
   width: 100%;
   margin: 8px 0;
   font-size: inherit;
 }
 
-.row-agent .prose th,
-.row-agent .prose td {
+.row-body th,
+.row-body td {
   border: 1px solid var(--line);
   padding: 6px 10px;
   text-align: left;
   vertical-align: top;
 }
 
-.row-agent .prose th {
+.row-body th {
   background: var(--code-bg);
   color: var(--fg);
   font-weight: 620;
