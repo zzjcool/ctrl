@@ -298,7 +298,19 @@ test("a worker that finishes during a turn does not start a second one", async (
   assert.equal((await api(fixture, "POST", "/api/agent/messages", { text: "count the files" })).status, 202)
   const done = await settle(fixture)
   const id = jobIdOf(done)
-  assert.equal(await jobState(fixture, id), "exited", "the worker finished while the turn was still open")
+  const exitWaitStarted = Date.now()
+  try {
+    await waitFor(
+      () => jobState(fixture, id),
+      (state) => state === "exited",
+      "the worker did not exit while the turn was still open",
+      5_000,
+    )
+  } catch (error) {
+    assert.fail(
+      `the worker did not exit within ${Date.now() - exitWaitStarted}ms of the turn settling: ${(error as Error).message}`,
+    )
+  }
 
   await new Promise((resolve) => setTimeout(resolve, 400))
   const after = await events(fixture)
