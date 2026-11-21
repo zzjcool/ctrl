@@ -427,7 +427,7 @@ test("a worker past the job timeout is killed by the sweep, and its log says why
     const pid = readJobMeta(agentHome, id)?.pid ?? 0
     assert.equal(isProcessAlive(pid), true)
 
-    const stopped = await runner.sweepTimeouts(Date.now() + 16 * 60_000)
+    const stopped = await runner.sweepTimeouts(Date.now() + 31 * 60_000)
     assert.deepEqual(stopped, [id])
 
     const job = readJob(agentHome, id)
@@ -442,7 +442,7 @@ test("a worker past the job timeout is killed by the sweep, and its log says why
     assert.match(shown.output, /state: killed/)
     assert.match(shown.output, /ctrl: job exceeded 30m — stopped/)
 
-    assert.deepEqual(await runner.sweepTimeouts(Date.now() + 16 * 60_000), [])
+    assert.deepEqual(await runner.sweepTimeouts(Date.now() + 31 * 60_000), [])
   } finally {
     setEnv({})
   }
@@ -462,7 +462,7 @@ test("the sweep leaves a worker alone until it is actually past the timeout", as
     const id = idOf(reply.output)
 
     const startedAt = Date.parse(readJobMeta(agentHome, id)?.startedAt ?? "")
-    assert.deepEqual(await runner.sweepTimeouts(startedAt + 15 * 60_000), [], "elapsed == timeout is not over")
+    assert.deepEqual(await runner.sweepTimeouts(startedAt + 30 * 60_000), [], "elapsed == timeout is not over")
     assert.deepEqual(await runner.sweepTimeouts(), [])
     assert.equal(readJob(agentHome, id)?.state, "running")
 
