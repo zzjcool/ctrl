@@ -62,7 +62,11 @@ CREATE TABLE IF NOT EXISTS focus (
   state TEXT,
   updated_at TEXT,
   source TEXT,
-  seq INTEGER
+  seq INTEGER,
+  evidence TEXT,
+  accept TEXT,
+  why TEXT,
+  reason TEXT
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(body, tokenize='trigram', content='');
@@ -155,12 +159,13 @@ export function openMemoryDb(file: string): DatabaseSync {
   }
 }
 
-function migrate(db: DatabaseSync): void {
+export function migrate(db: DatabaseSync): void {
   ensureProposalsTable(db)
   migrateProposalsColumns(db)
   migrateProposalStatuses(db)
   ensureUsageTable(db)
   ensureDreamLessonsColumn(db)
+  migrateFocusColumns(db)
   const stored = readMeta(db, META_SCHEMA_VERSION)
   if (stored === undefined) {
     writeMeta(db, META_SCHEMA_VERSION, String(SCHEMA_VERSION))
@@ -195,6 +200,16 @@ export function migrateProposalStatuses(db: DatabaseSync): void {
     "UPDATE proposals SET status = 'failed', error = CASE WHEN error IS NULL OR trim(error) = '' THEN ? ELSE error END WHERE id = ? AND status = 'open'",
   )
   for (const row of stale) update.run(VERIFICATION_FAILED_ERROR, String(row.id ?? ""))
+}
+
+export function migrateFocusColumns(db: DatabaseSync): void {
+  const columns = db.prepare("PRAGMA table_info(focus)").all() as Array<Record<string, unknown>>
+  if (columns.length === 0) return
+  const existing = new Set(columns.map((row) => String(row.name ?? "")))
+  if (!existing.has("evidence")) db.exec("ALTER TABLE focus ADD COLUMN evidence TEXT")
+  if (!existing.has("accept")) db.exec("ALTER TABLE focus ADD COLUMN accept TEXT")
+  if (!existing.has("why")) db.exec("ALTER TABLE focus ADD COLUMN why TEXT")
+  if (!existing.has("reason")) db.exec("ALTER TABLE focus ADD COLUMN reason TEXT")
 }
 
 export function ensureUsageTable(db: DatabaseSync): void {
