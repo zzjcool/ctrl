@@ -1,15 +1,18 @@
 import type { DatabaseSync } from "node:sqlite"
 import { readJobLog } from "../jobs/store.ts"
+import { META_PENDING_WAKE, writeMeta } from "../memory/db.ts"
 import {
   DEFAULT_PROPOSAL_LIMIT,
+  NO_CHANGES_ERROR,
   createProposal,
   failingTests,
   getProposal,
   listProposals,
+  proposalStatusFor,
   testsGreen,
   updateProposal,
 } from "../memory/proposals.ts"
-import type { Proposal, ProposalTests } from "../memory/proposals.ts"
+import type { Proposal, ProposalStatus, ProposalTests } from "../memory/proposals.ts"
 import { PACKAGE_JSON, parseNameStatus, protectedReason, touchesPackageJson } from "./apply.ts"
 import {
   git,
@@ -22,6 +25,7 @@ import {
   gitDeleteBranch,
   gitDiff,
   gitDiffNameStatus,
+  gitDiffQuiet,
   gitDiffStat,
   gitHasStagedChanges,
   gitMergeNoFf,
@@ -247,7 +251,12 @@ export class SelfEditGate {
   async apply(id: string): Promise<Proposal> {
     const db = this.requireDb()
     const proposal = this.requireProposal(id)
-    if (proposal.status !== "open") throw new GateError(409, `proposal ${id} is ${proposal.status}`)
+    if (proposal.status !== "open") {
+      if (proposal.status === "failed") {
+        throw new GateError(409, `proposal ${id} failed verification — it cannot be applied`)
+      }
+      throw new GateError(409, `proposal ${id} is ${proposal.status}`)
+    }
     if (!testsGreen(proposal.tests)) {
       const failing = failingTests(proposal.tests)
       throw new GateError(
@@ -281,14 +290,19 @@ export class SelfEditGate {
 
     const mergedCommit = await gitRevParse(this.repoRoot, "HEAD")
     const at = this.now().toISOString()
-    return (
+    const stored =
       updateProposal(db, id, {
         status: "applied",
         endedAt: at,
         appliedAt: at,
         ...(mergedCommit !== undefined ? { mergedCommit } : {}),
       }) ?? proposal
-    )
+    try {
+      writeMeta(db, META_PENDING_WAKE, pendingWakeText(id))
+    } catch (error) {
+      this.warn(`could not queue the post-apply wake for ${id}: ${errorMessage(error)}`)
+    }
+    return stored
   }
 
   private async protection(proposal: Proposal): Promise<string | undefined> {
@@ -354,14 +368,17 @@ export class SelfEditGate {
       if (!commit.ok) commitError = `commit failed: ${clip(commit.stderr)}`
     }
 
-    const diffstat = await this.diffstat(pending)
-    const error = [branchError, jobError, commitError]
+    const changed = await this.changed(pending)
+    const diffstat = changed ? await this.diffstat(pending) : undefined
+    const error = [branchError, jobError, commitError, changed ? undefined : NO_CHANGES_ERROR]
       .filter((part): part is string => part !== undefined && part !== "")
       .join("; ")
+    const status: ProposalStatus = testsGreen(tests) && changed && error === "" ? "open" : "failed"
 
     return this.record({
       pending,
       tests,
+      status,
       summary: this.jobSummary(pending.jobId),
       ...(diffstat !== undefined ? { diffstat } : {}),
       ...(error !== "" ? { error } : {}),
@@ -395,6 +412,11 @@ export class SelfEditGate {
     }
   }
 
+  private async changed(pending: PendingEdit): Promise<boolean> {
+    const result = await gitDiffQuiet(this.repoRoot, pending.base, pending.branch)
+    return result.code !== 0
+  }
+
   private async diffstat(pending: PendingEdit): Promise<string | undefined> {
     const result = await gitDiffStat(this.repoRoot, pending.base, pending.branch)
     const text = result.stdout.trim()
@@ -414,6 +436,7 @@ export class SelfEditGate {
   private record(input: {
     pending: PendingEdit
     tests: ProposalTests
+    status?: ProposalStatus
     summary?: string
     diffstat?: string
     error?: string
@@ -423,13 +446,15 @@ export class SelfEditGate {
       this.warn(`no memory database — proposal ${input.pending.proposalId} was not recorded`)
       return undefined
     }
+    const status = input.status ?? proposalStatusFor(input.tests)
     try {
       return createProposal(db, {
         id: input.pending.proposalId,
         branch: input.pending.branch,
         base: input.pending.base,
         task: input.pending.task,
-        status: "open",
+        status,
+        jobId: input.pending.jobId,
         createdAt: input.pending.createdAt,
         tests: input.tests,
         ...(input.summary !== undefined ? { summary: input.summary } : {}),
@@ -470,6 +495,10 @@ export class SelfEditGate {
     if (proposal === undefined) throw new GateError(404, `no such proposal: ${id}`)
     return proposal
   }
+}
+
+function pendingWakeText(id: string): string {
+  return `[ctrl] you applied ${id}. Run the experience script and a live smoke, then report — if it regressed, fix or revert.`
 }
 
 function jobFailure(exit: SelfEditExit): string | undefined {

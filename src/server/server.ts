@@ -34,10 +34,12 @@ import {
   HEARTBEAT_FOCUS_LINES,
   createHeartbeat,
   heartbeatCounterKey,
+  proposalSummary,
 } from "./heartbeat.ts"
-import type { Heartbeat } from "./heartbeat.ts"
+import type { Heartbeat, ProposalSummary } from "./heartbeat.ts"
 import { sendJson, serveStatic } from "./http.ts"
 import { MEDIA_PREFIX, serveMedia } from "./media-routes.ts"
+import { flushPendingWake } from "./pending-wake.ts"
 import { dreamOnce, handleApiRequest, runTurn, type AppContext } from "./routes.ts"
 import { readSidecar, writeSidecar } from "./sidecar.ts"
 import { TurnRegistry } from "./turns.ts"
@@ -271,7 +273,11 @@ export function buildContext(config: ServerConfig = {}): AppContext {
           listFocus(db, { limit: HEARTBEAT_FOCUS_LINES }).map((item) => item.text),
         ),
       openProposals: () =>
-        withDb(memory, 0, (db) => listProposals(db, { status: "open", limit: MAX_PROPOSAL_LIMIT }).length),
+        withDb(memory, [] as ProposalSummary[], (db) =>
+          listProposals(db, { status: "open", limit: MAX_PROPOSAL_LIMIT }).map((proposal) =>
+            proposalSummary(proposal, Date.now()),
+          ),
+        ),
       lastEventAt: () => {
         const at = lastActivityMs(ensured.home)
         return at === undefined ? undefined : new Date(at).toISOString()
@@ -320,9 +326,10 @@ export function buildContext(config: ServerConfig = {}): AppContext {
     },
   )
 
-  runner.onExit = (job) => {
+  runner.onExit = async (job) => {
+    const proposal = await ctx.selfEdit.handleExit(job)
     ctx.wake.notify(job)
-    return ctx.selfEdit.handleExit(job)
+    return proposal
   }
   return ctx
 }
@@ -401,6 +408,15 @@ export async function startServer(config: ServerConfig = {}): Promise<RunningSer
   bootTrace("listen:ready")
   const address = server.address()
   const port = typeof address === "object" && address !== null ? address.port : requestedPort
+
+  flushPendingWake({
+    db: () => ctx.memory.handle(),
+    inject: (text) => {
+      const log = openSession(LOG_ID, { home: ctx.agentHome })
+      const started = ctx.turns.start(LOG_ID, (signal) => runTurn(ctx, log, text, signal, "wake"))
+      if (!started) throw new Error("a turn is already running for this agent")
+    },
+  })
 
   if (config.dream !== false) {
     ctx.dreams.startTimer()

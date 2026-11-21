@@ -121,6 +121,10 @@ export async function gitDiffStat(repo: string, base: string, branch: string): P
   return await git(repo, ["diff", `${base}...${branch}`, "--stat"])
 }
 
+export async function gitDiffQuiet(repo: string, base: string, branch: string): Promise<CommandResult> {
+  return await git(repo, ["diff", "--quiet", `${base}...${branch}`])
+}
+
 export async function gitDiff(repo: string, base: string, branch: string): Promise<CommandResult> {
   return await git(repo, ["diff", `${base}...${branch}`])
 }

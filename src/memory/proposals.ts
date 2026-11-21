@@ -6,7 +6,11 @@ export const MAX_PROPOSAL_LIMIT = 100
 
 export const PROPOSAL_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/
 
-export type ProposalStatus = "open" | "applied" | "discarded"
+export type ProposalStatus = "open" | "failed" | "applied" | "discarded"
+
+export const NO_CHANGES_ERROR = "the worker produced no changes"
+
+export const VERIFICATION_FAILED_ERROR = "verification did not pass"
 
 export interface ProposalTestResult {
   ok: boolean
@@ -22,6 +26,7 @@ export interface Proposal {
   task: string
   status: ProposalStatus
   createdAt: string
+  jobId?: string
   summary?: string
   diffstat?: string
   endedAt?: string
@@ -37,6 +42,7 @@ export interface ProposalDraft {
   base: string
   task: string
   createdAt?: string
+  jobId?: string
   summary?: string
   diffstat?: string
   status?: ProposalStatus
@@ -46,6 +52,7 @@ export interface ProposalDraft {
 
 export interface ProposalPatch {
   status?: ProposalStatus
+  jobId?: string
   summary?: string
   diffstat?: string
   endedAt?: string
@@ -59,8 +66,8 @@ export function createProposal(db: DatabaseSync, draft: ProposalDraft): Proposal
   const createdAt = draft.createdAt ?? new Date().toISOString()
   const status = draft.status ?? "open"
   db.prepare(
-    "INSERT INTO proposals(id, branch, base, task, summary, diffstat, status, created_at, ended_at, tests, error, applied_at, merged_commit) " +
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO proposals(id, branch, base, task, summary, diffstat, status, created_at, ended_at, tests, error, applied_at, merged_commit, job_id) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     draft.id,
     draft.branch,
@@ -75,6 +82,7 @@ export function createProposal(db: DatabaseSync, draft: ProposalDraft): Proposal
     draft.error ?? null,
     null,
     null,
+    draft.jobId ?? null,
   )
   const stored = getProposal(db, draft.id)
   if (stored !== undefined) return stored
@@ -85,6 +93,7 @@ export function createProposal(db: DatabaseSync, draft: ProposalDraft): Proposal
     task: draft.task,
     status,
     createdAt,
+    ...(draft.jobId !== undefined ? { jobId: draft.jobId } : {}),
     ...(draft.summary !== undefined ? { summary: draft.summary } : {}),
     ...(draft.diffstat !== undefined ? { diffstat: draft.diffstat } : {}),
     ...(draft.tests !== undefined ? { tests: draft.tests } : {}),
@@ -96,7 +105,7 @@ export function updateProposal(db: DatabaseSync, id: string, patch: ProposalPatc
   const current = getProposal(db, id)
   if (current === undefined) return undefined
   db.prepare(
-    "UPDATE proposals SET status = ?, summary = ?, diffstat = ?, ended_at = ?, tests = ?, error = ?, applied_at = ?, merged_commit = ? WHERE id = ?",
+    "UPDATE proposals SET status = ?, summary = ?, diffstat = ?, ended_at = ?, tests = ?, error = ?, applied_at = ?, merged_commit = ?, job_id = ? WHERE id = ?",
   ).run(
     patch.status ?? current.status,
     patch.summary ?? current.summary ?? null,
@@ -106,6 +115,7 @@ export function updateProposal(db: DatabaseSync, id: string, patch: ProposalPatc
     patch.error ?? current.error ?? null,
     patch.appliedAt ?? current.appliedAt ?? null,
     patch.mergedCommit ?? current.mergedCommit ?? null,
+    patch.jobId ?? current.jobId ?? null,
     id,
   )
   return getProposal(db, id)
@@ -113,6 +123,18 @@ export function updateProposal(db: DatabaseSync, id: string, patch: ProposalPatc
 
 export function getProposal(db: DatabaseSync, id: string): Proposal | undefined {
   return toProposal(db.prepare("SELECT * FROM proposals WHERE id = ?").get(id))
+}
+
+export function getProposalByJob(db: DatabaseSync, jobId: string): Proposal | undefined {
+  const key = jobId.trim()
+  if (key === "") return undefined
+  return toProposal(
+    db.prepare("SELECT * FROM proposals WHERE job_id = ? ORDER BY created_at DESC, id DESC LIMIT 1").get(key),
+  )
+}
+
+export function proposalStatusFor(tests: ProposalTests | undefined): ProposalStatus {
+  return testsGreen(tests) ? "open" : "failed"
 }
 
 export function listProposals(
@@ -179,6 +201,7 @@ function toProposal(raw: unknown): Proposal | undefined {
   const createdAt = text(row.created_at)
   if (id === undefined || branch === undefined || base === undefined || task === undefined) return undefined
   if (status === undefined || createdAt === undefined) return undefined
+  const jobId = text(row.job_id)
   const summary = text(row.summary)
   const diffstat = text(row.diffstat)
   const endedAt = text(row.ended_at)
@@ -193,6 +216,7 @@ function toProposal(raw: unknown): Proposal | undefined {
     task,
     status,
     createdAt,
+    ...(jobId !== undefined ? { jobId } : {}),
     ...(summary !== undefined ? { summary } : {}),
     ...(diffstat !== undefined ? { diffstat } : {}),
     ...(endedAt !== undefined ? { endedAt } : {}),
@@ -204,7 +228,9 @@ function toProposal(raw: unknown): Proposal | undefined {
 }
 
 function proposalStatus(value: unknown): ProposalStatus | undefined {
-  return value === "open" || value === "applied" || value === "discarded" ? value : undefined
+  return value === "open" || value === "failed" || value === "applied" || value === "discarded"
+    ? value
+    : undefined
 }
 
 function text(value: unknown): string | undefined {

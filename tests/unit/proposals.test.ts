@@ -174,7 +174,7 @@ test("a red verification run still records the proposal with the failing output"
 
   const proposal = await gate.handleExit({ id: started.jobId ?? "", code: 0 })
   assert.ok(proposal)
-  assert.equal(proposal.status, "open")
+  assert.equal(proposal.status, "failed")
   assert.equal(proposal.branch, "self/20261120-174930")
   assert.equal(proposal.base, "main")
   assert.equal(proposal.tests?.typecheck?.ok, false)
@@ -189,7 +189,7 @@ test("a red verification run still records the proposal with the failing output"
     (error: unknown) => {
       assert.ok(error instanceof GateError)
       assert.equal(error.status, 409)
-      assert.match(error.message, /typecheck/)
+      assert.match(error.message, /failed verification — it cannot be applied/)
       return true
     },
   )
@@ -355,7 +355,7 @@ test("an old memory database gains the proposals table on open", async () => {
 
   const db = openMemoryDb(file)
   dbs.push(db)
-  assert.equal(SCHEMA_VERSION, 5)
+  assert.equal(SCHEMA_VERSION, 6)
   assert.equal(schemaVersion(db), SCHEMA_VERSION)
   const row = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'proposals'").get() as
     | { name?: unknown }

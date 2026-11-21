@@ -294,6 +294,7 @@ async function seedProposal(opts: {
   tests?: ProposalTests
   status?: ProposalStatus
   createdAt?: string
+  jobId?: string
 }): Promise<void> {
   const db = openMemoryDb(memoryDbPath(fixture.running.ctx.agentHome))
   try {
@@ -305,6 +306,7 @@ async function seedProposal(opts: {
       status: opts.status ?? "open",
       createdAt: opts.createdAt ?? new Date().toISOString(),
       ...(opts.tests !== undefined ? { tests: opts.tests } : {}),
+      ...(opts.jobId !== undefined ? { jobId: opts.jobId } : {}),
     })
   } finally {
     db.close()
@@ -871,6 +873,46 @@ test("discarding a proposal deletes its branch and marks it discarded", async ()
   assert.equal(red?.status, "discarded")
 
   assert.equal((await api("POST", "/api/proposals/green/discard")).status, 409)
+})
+
+test("a failed proposal keeps the old detail keys, gains a job id and cannot be applied", async () => {
+  await seedProposal({
+    id: "failed-one",
+    branch: "self/failed-one",
+    status: "failed",
+    jobId: "20261121T155859Z-failedone",
+    tests: { typecheck: { ok: true } },
+    createdAt: "2026-03-01T00:00:00.000Z",
+  })
+
+  const listed = await api("GET", "/api/proposals")
+  assert.equal(listed.status, 200, listed.text)
+  const failed = (listed.json.proposals as Array<Record<string, any>>).find((proposal) => proposal.id === "failed-one")
+  assert.ok(failed, JSON.stringify(listed.json))
+  assert.equal(failed.status, "failed")
+  assert.equal(failed.jobId, "20261121T155859Z-failedone")
+
+  const detail = await api("GET", "/api/proposals/failed-one")
+  assert.equal(detail.status, 200, detail.text)
+  const proposal = detail.json.proposal as Record<string, any>
+  for (const key of ["id", "branch", "base", "task", "status", "createdAt", "tests", "jobId"]) {
+    assert.ok(key in proposal, `GET /api/proposals/<id> dropped ${key}`)
+  }
+  assert.equal(proposal.id, "failed-one")
+  assert.equal(proposal.branch, "self/failed-one")
+  assert.equal(proposal.base, "main")
+  assert.equal(proposal.task, "contract failed-one")
+  assert.equal(proposal.status, "failed")
+  assert.deepEqual(proposal.tests, { typecheck: { ok: true } })
+  assert.equal(typeof detail.json.diff, "string")
+
+  const applied = await api("POST", "/api/proposals/failed-one/apply")
+  assert.equal(applied.status, 409, applied.text)
+  assert.equal(applied.json.error, "proposal failed-one failed verification — it cannot be applied")
+
+  const discarded = await api("POST", "/api/proposals/failed-one/discard")
+  assert.equal(discarded.status, 200, discarded.text)
+  assert.equal(discarded.json.proposal.status, "discarded")
 })
 
 test("the usage ledger counts every model call and buckets it by local day", async () => {
