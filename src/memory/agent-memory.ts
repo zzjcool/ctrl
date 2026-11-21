@@ -9,7 +9,11 @@ import {
   type MemoryRow,
 } from "./memories.ts"
 
-const ENGINE_KINDS: readonly MemoryKind[] = ["fact", "preference", "event", "skill"]
+const ENGINE_KINDS: readonly MemoryKind[] = ["fact", "preference", "event", "skill", "lesson"]
+
+const KIND_FAMILIES: Readonly<Record<string, readonly string[]>> = {
+  skill: ["skill", LESSON_KIND],
+}
 
 export const LESSON_RECALL_BOOST = 1.2
 
@@ -68,9 +72,10 @@ export function createSqliteAgentMemory(opts: SqliteAgentMemoryOptions): AgentMe
         ...(query.includeSuperseded === true ? { includeSuperseded: true } : {}),
         now: at,
       })
-      const kinds = query.kinds === undefined ? undefined : new Set(query.kinds.filter(isEngineKind))
+      const kinds =
+        query.kinds === undefined ? undefined : new Set<string>(query.kinds.filter(isEngineKind).flatMap(kindFamily))
       return scored
-        .filter((entry) => kinds === undefined || kinds.has(engineKind(entry.row.kind)))
+        .filter((entry) => kinds === undefined || kinds.has(entry.row.kind) || kinds.has(engineKind(entry.row.kind)))
         .map((entry) => ({
           row: entry.row,
           score: entry.score * (entry.row.kind === LESSON_KIND ? LESSON_RECALL_BOOST : 1),
@@ -84,6 +89,10 @@ export function createSqliteAgentMemory(opts: SqliteAgentMemoryOptions): AgentMe
 
 export function engineKind(kind: string): MemoryKind {
   return isEngineKind(kind) ? kind : "fact"
+}
+
+export function kindFamily(kind: MemoryKind): readonly string[] {
+  return KIND_FAMILIES[kind] ?? [kind]
 }
 
 function isEngineKind(value: unknown): value is MemoryKind {

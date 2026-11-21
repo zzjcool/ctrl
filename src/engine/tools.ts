@@ -26,9 +26,20 @@ function schema(properties: Record<string, unknown>, required: string[]): Record
 const tools: ToolSpec[] = [
   {
     name: "remember",
-    description: "Write a fact, preference, event, or skill to long-term memory.",
+    description:
+      "Write a durable memory to long-term memory. Pick kind deliberately: fact for stable facts about the user, " +
+      "the codebase or the environment; preference for how the user wants you to work; event for something that " +
+      "happened at a point in time; skill for reusable how-to knowledge (a command, a workflow, a recipe); " +
+      "lesson for experience to do differently next time — a mistake you made, a pitfall you hit, what went " +
+      "wrong and what to do instead. Prefer lesson over skill whenever the text is about avoiding a repeat.",
     parameters: schema({
-      kind: { type: "string", enum: ["fact", "preference", "event", "skill"] },
+      kind: {
+        type: "string",
+        enum: ["fact", "preference", "event", "skill", "lesson"],
+        description:
+          "fact | preference | event | skill | lesson. Use lesson for lessons learned: what went wrong, pitfalls, " +
+          "and how to do it better next time. Use skill only for reusable procedures with no failure story.",
+      },
       text: { type: "string" },
       tags: { type: "array", items: { type: "string" } },
       salience: {
@@ -63,11 +74,13 @@ const tools: ToolSpec[] = [
   },
   {
     name: "recall",
-    description: "Search long-term memory for relevant entries.",
+    description:
+      "Search long-term memory for relevant entries. kinds=[skill] also returns lessons, since lessons are " +
+      "skill-shaped knowledge; kinds=[lesson] returns only lessons.",
     parameters: schema({
       text: { type: "string" },
       limit: { type: "integer", minimum: 1 },
-      kinds: { type: "array", items: { type: "string", enum: ["fact", "preference", "event", "skill"] } },
+      kinds: { type: "array", items: { type: "string", enum: ["fact", "preference", "event", "skill", "lesson"] } },
     }, ["text"]),
     async execute(args, ctx) {
       if (!ctx.recall) return { ok: false, output: "memory unavailable" }
@@ -230,7 +243,7 @@ function positiveInteger(value: number, fallback: number): number {
 }
 
 function isMemoryKind(value: unknown): value is MemoryKind {
-  return value === "fact" || value === "preference" || value === "event" || value === "skill"
+  return value === "fact" || value === "preference" || value === "event" || value === "skill" || value === "lesson"
 }
 
 function stringArray(value: unknown): string[] | undefined {

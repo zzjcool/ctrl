@@ -127,7 +127,7 @@ export interface SessionMeta {
   lastSeq: number
 }
 
-export type MemoryKind = "fact" | "preference" | "event" | "skill"
+export type MemoryKind = "fact" | "preference" | "event" | "skill" | "lesson"
 
 export interface MemoryEntry {
   id: string

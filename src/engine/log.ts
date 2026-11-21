@@ -593,7 +593,8 @@ export function isMemoryEntry(value: unknown): value is MemoryEntry {
   if (value === null || typeof value !== "object") return false
   const entry = value as Partial<MemoryEntry>
   return typeof entry.id === "string" && typeof entry.seq === "number" && typeof entry.ts === "string" &&
-    (entry.kind === "fact" || entry.kind === "preference" || entry.kind === "event" || entry.kind === "skill") &&
+    (entry.kind === "fact" || entry.kind === "preference" || entry.kind === "event" || entry.kind === "skill" ||
+      entry.kind === "lesson") &&
     typeof entry.text === "string" && Array.isArray(entry.tags) && entry.tags.every((tag) => typeof tag === "string") &&
     typeof entry.salience === "number" && (entry.supersededBy === undefined || typeof entry.supersededBy === "string")
 }

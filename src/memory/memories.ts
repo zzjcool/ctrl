@@ -22,6 +22,12 @@ export const MAX_SEARCH_TERMS = 64
 
 const TERM_CANDIDATES = 40
 
+const QUERY_SYNONYMS: Readonly<Record<string, readonly string[]>> = {
+  lesson: ["经验", "教训"],
+  经验: ["lesson"],
+  教训: ["lesson"],
+}
+
 export interface MemoryRow {
   id: string
   kind: string
@@ -285,7 +291,11 @@ export function searchTerms(query: string): string[] {
   if (normalized === "") return []
   const terms: string[] = []
   const push = (term: string): void => {
-    if (term !== "" && terms.length < MAX_SEARCH_TERMS && !terms.includes(term)) terms.push(term)
+    if (term === "" || terms.includes(term)) return
+    if (terms.length < MAX_SEARCH_TERMS) terms.push(term)
+    for (const synonym of QUERY_SYNONYMS[term] ?? []) {
+      if (terms.length < MAX_SEARCH_TERMS && !terms.includes(synonym)) terms.push(synonym)
+    }
   }
 
   for (const word of normalized.split(/[^\p{L}\p{N}_]+/u)) {
