@@ -22,7 +22,7 @@ export const DEFAULT_PI_BIN = "pi"
 export const DEFAULT_PI_PROVIDER = "any-endpoint"
 export const DEFAULT_MAX_WORKERS = 3
 
-export const DEFAULT_JOB_TIMEOUT_MINUTES = 15
+export const DEFAULT_JOB_TIMEOUT_MINUTES = 30
 
 export const DEFAULT_STALL_MINUTES = 8
 

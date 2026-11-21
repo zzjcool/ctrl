@@ -421,7 +421,7 @@ test("a worker past the job timeout is killed by the sweep, and its log says why
   const runner = makeRunner()
   const work = await scratchDir("ctrl-jobs-work-")
   try {
-    assert.equal(runner.jobTimeoutMinutes, 15)
+    assert.equal(runner.jobTimeoutMinutes, 30)
     const reply = runner.delegate({ task: "never finishes" }, work)
     const id = idOf(reply.output)
     const pid = readJobMeta(agentHome, id)?.pid ?? 0
@@ -436,11 +436,11 @@ test("a worker past the job timeout is killed by the sweep, and its log says why
     assert.equal(isProcessAlive(pid), false, "the worker's process group is gone")
 
     const log = readJobLog(agentHome, id, { full: true }).text
-    assert.match(log, /ctrl: job exceeded 15m — stopped/)
+    assert.match(log, /ctrl: job exceeded 30m — stopped/)
     const status = jobTool(runner, "job_status")
     const shown = await status.execute({ id }, toolContext(work))
     assert.match(shown.output, /state: killed/)
-    assert.match(shown.output, /ctrl: job exceeded 15m — stopped/)
+    assert.match(shown.output, /ctrl: job exceeded 30m — stopped/)
 
     assert.deepEqual(await runner.sweepTimeouts(Date.now() + 16 * 60_000), [])
   } finally {
