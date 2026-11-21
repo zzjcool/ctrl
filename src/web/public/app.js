@@ -647,7 +647,10 @@ function createJobCard(name) {
   details.className = "tool-out"
   details.hidden = true
   const summary = document.createElement("summary")
-  summary.textContent = "输出"
+  const truncatedEl = el("span", "job-truncated", "· 已截断")
+  truncatedEl.title = "只显示了输出的末尾，完整内容请查看 job 日志"
+  truncatedEl.hidden = true
+  summary.append("输出", truncatedEl)
   const pre = el("pre", "tool-pre", "")
   details.append(summary, pre)
 
@@ -664,6 +667,7 @@ function createJobCard(name) {
     toggle,
     metaEl,
     details,
+    truncatedEl,
     pre,
     jobId: "",
     callTs: null,
@@ -721,12 +725,17 @@ function toggleJobTask(card, force) {
   measureJobTask(card)
 }
 
+function outputIsTruncated(output) {
+  return typeof output === "string" && output.trimStart().startsWith("…")
+}
+
 function applyJobToCard(card, job) {
   const jobState = job.state || "unknown"
   card.root.dataset.state = jobState
   card.badgeState.textContent = badgeText(jobState, job.code)
   if (job.elapsedMs !== null) card.durEl.textContent = formatDuration(job.elapsedMs)
   if (job.task && !card.taskEl.textContent) setJobTask(card, job.task)
+  if (card.truncatedEl) card.truncatedEl.hidden = !outputIsTruncated(job.output)
   if (typeof job.output === "string" && job.output.trim()) {
     card.pre.textContent = job.output.trim()
     card.pre.classList.remove("is-empty")
