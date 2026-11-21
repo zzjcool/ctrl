@@ -72,3 +72,51 @@ test("empty input renders nothing", () => {
   assert.equal(renderMarkdown(""), "")
   assert.equal(renderMarkdown("   \n\n  "), "")
 })
+
+test("a pipe table with an alignment row renders a table", () => {
+  const html = renderMarkdown("| a | b |\n|---|---|\n| 1 | 2 |")
+  assert.equal(
+    html,
+    '<div class="table-wrap"><table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table></div>',
+  )
+})
+
+test("a pipe row without an alignment row stays a paragraph", () => {
+  const html = renderMarkdown("| a | b |")
+  assert.equal(html, '<p class="prose">| a | b |</p>')
+  assert.ok(!html.includes("<table"))
+})
+
+test("alignment markers map to per column text-align styles", () => {
+  const html = renderMarkdown("| a | b | c | d |\n|:---|:---:|---:|---|\n| 1 | 2 | 3 | 4 |")
+  assert.equal(
+    html,
+    '<div class="table-wrap"><table><thead><tr><th style="text-align:left">a</th><th style="text-align:center">b</th><th style="text-align:right">c</th><th>d</th></tr></thead><tbody><tr><td style="text-align:left">1</td><td style="text-align:center">2</td><td style="text-align:right">3</td><td>4</td></tr></tbody></table></div>',
+  )
+})
+
+test("escaped pipes stay inside a single cell", () => {
+  const html = renderMarkdown("| a \\| b | c |\n|---|---|")
+  assert.equal(
+    html,
+    '<div class="table-wrap"><table><thead><tr><th>a | b</th><th>c</th></tr></thead><tbody></tbody></table></div>',
+  )
+  assert.equal((html.match(/<th[ >]/g) ?? []).length, 2)
+})
+
+test("inline markup inside table cells still renders", () => {
+  const html = renderMarkdown("| **bold** | `code` |\n|---|---|")
+  assert.equal(
+    html,
+    '<div class="table-wrap"><table><thead><tr><th><strong>bold</strong></th><th><code>code</code></th></tr></thead><tbody></tbody></table></div>',
+  )
+})
+
+test("rows with too many cells are truncated to the header width", () => {
+  const html = renderMarkdown("| a | b |\n|---|---|\n| 1 | 2 | 3 |")
+  assert.equal(
+    html,
+    '<div class="table-wrap"><table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table></div>',
+  )
+  assert.equal((html.match(/<td>/g) ?? []).length, 2)
+})

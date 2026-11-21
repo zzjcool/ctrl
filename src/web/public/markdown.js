@@ -107,6 +107,66 @@ function fenceHtml(lang, body) {
   return `<div class="fence">${label}<pre><code class="fence-code">${body}</code></pre></div>`
 }
 
+function tableRowFrom(line) {
+  if (!line || !line.includes("|")) return null
+  const cells = []
+  let cell = ""
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index]
+    if (char === "\\" && line[index + 1] === "|") {
+      cell += "|"
+      index += 1
+      continue
+    }
+    if (char === "|") {
+      cells.push(cell.trim())
+      cell = ""
+      continue
+    }
+    cell += char
+  }
+  cells.push(cell.trim())
+  if (cells.length > 1 && cells[0] === "") cells.shift()
+  if (cells.length > 1 && cells[cells.length - 1] === "") cells.pop()
+  return cells
+}
+
+function isTableAlignLine(line) {
+  const cells = tableRowFrom(line)
+  if (!cells || !cells.length) return false
+  return cells.every((cell) => /^:?-+:?$/.test(cell))
+}
+
+function tableAlignments(line) {
+  const cells = tableRowFrom(line) ?? []
+  return cells.map((cell) => {
+    const left = cell.startsWith(":")
+    const right = cell.endsWith(":")
+    if (left && right) return "center"
+    if (right) return "right"
+    if (left) return "left"
+    return ""
+  })
+}
+
+function tableHtml(lines) {
+  const header = tableRowFrom(lines[0]) ?? []
+  const aligns = tableAlignments(lines[1])
+  const width = header.length
+  const style = (index) => (aligns[index] ? ` style="text-align:${aligns[index]}"` : "")
+  const row = (cells, tag) => {
+    const parts = []
+    for (let index = 0; index < width; index += 1) {
+      const content = index < cells.length ? renderInline(cells[index]) : ""
+      parts.push(`<${tag}${style(index)}>${content}</${tag}>`)
+    }
+    return parts.join("")
+  }
+  const head = `<thead><tr>${row(header, "th")}</tr></thead>`
+  const body = lines.slice(2).map((line) => `<tr>${row(tableRowFrom(line) ?? [], "td")}</tr>`)
+  return `<div class="table-wrap"><table>${head}<tbody>${body.join("")}</tbody></table></div>`
+}
+
 function renderBlocks(source) {
   if (!source.trim()) return ""
   const lines = source.split("\n")
@@ -167,6 +227,17 @@ function renderBlocks(source) {
       flushParagraph()
       out.push("<hr>")
       index += 1
+      continue
+    }
+    if (tableRowFrom(line) && isTableAlignLine(lines[index + 1])) {
+      flushParagraph()
+      const rows = [line, lines[index + 1]]
+      index += 2
+      while (index < lines.length && lines[index].trim() && tableRowFrom(lines[index])) {
+        rows.push(lines[index])
+        index += 1
+      }
+      out.push(tableHtml(rows))
       continue
     }
     if (listItemFrom(line)) {
