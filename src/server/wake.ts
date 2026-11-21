@@ -3,8 +3,8 @@ import type { Session } from "../engine/durable.ts"
 import { readJobMeta, updateJobMeta } from "../jobs/store.ts"
 import type { JobView } from "../jobs/store.ts"
 import { formatElapsed } from "../jobs/tools.ts"
-import { NO_CHANGES_ERROR, getProposalByJob } from "../memory/proposals.ts"
-import type { Proposal } from "../memory/proposals.ts"
+import { getProposalByJob } from "../memory/proposals.ts"
+import type { Proposal, ProposalReason } from "../memory/proposals.ts"
 import { LOG_ID } from "./agents.ts"
 import { runTurn } from "./routes.ts"
 import type { AppContext } from "./routes.ts"
@@ -13,19 +13,28 @@ export const WAKE_PREFIX = "[ctrl] worker"
 
 export const PROPOSAL_WAKE_PREFIX = "[ctrl]"
 
+const REASON_WAKE_TEXT: Record<ProposalReason, string> = {
+  green: "全绿——直接 apply_proposal 合入，合完再跑一遍验证。",
+  verification_failed: "验证没过，不会自动合；让它改到全绿，或写一句理由 discard。",
+  no_changes: "worker 没改出任何东西，没什么可合的；要改就重新 self_edit。",
+  timeout: "跑太久被停掉了，结果不完整，不会自动合；拆小一点重新 self_edit，或写一句理由 discard。",
+  worker_failed: "worker 自己失败了，结果不可信，不会自动合；查一下再 self_edit，或写一句理由 discard。",
+}
+
+const UNKNOWN_REASON_TEXT = "没有记录失败原因（老提案），不确定能不能合；看一眼 diff 和测试再决定 apply 还是 discard。"
+
+const UNKNOWN_REASON_OPEN_TEXT = "验证全绿（老提案没记 reason），可以 apply_proposal 合入，合完再跑一遍验证。"
+
 export function wakeText(job: JobView): string {
   return `${WAKE_PREFIX} ${job.id} finished (${job.state}, ${formatElapsed(job.elapsedMs)}) — report the result to the user.`
 }
 
 export function proposalWakeText(job: JobView, proposal: Proposal): string {
   const lead = `${PROPOSAL_WAKE_PREFIX} ${job.id} finished → proposal ${proposal.id}`
-  if (proposal.status === "open") {
-    return `${lead} is green. Apply it now with apply_proposal, then verify.`
-  }
-  if (proposal.error !== undefined && proposal.error.includes(NO_CHANGES_ERROR)) {
-    return `${lead} produced no changes; nothing to apply.`
-  }
-  return `${lead} failed verification. Fix it (self_edit again) or discard it with a one-line reason — decide now.`
+  const reason = proposal.reason ?? null
+  if (reason !== null) return `${lead} ${REASON_WAKE_TEXT[reason]}`
+  if (proposal.status === "open") return `${lead} ${UNKNOWN_REASON_OPEN_TEXT}`
+  return `${lead} ${UNKNOWN_REASON_TEXT}`
 }
 
 export function wakeTextFor(job: JobView, proposal: Proposal | undefined): string {
