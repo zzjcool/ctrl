@@ -22,11 +22,13 @@ interface FakeReply {
   content?: string
   toolCalls?: FakeToolCall[]
   delayMs?: number
+  stream?: boolean
 }
 
 interface FakeRequestBody {
   messages: Array<{ role: string; content: string }>
   tools?: Array<{ type: string; function: { name: string } }>
+  stream?: boolean
 }
 
 interface FakeLlm {
@@ -58,13 +60,50 @@ async function startFakeLlm(): Promise<FakeLlm> {
 
       }
       const reply = queue.shift() ?? { content: "(no further script)" }
+      const toolCalls = reply.toolCalls?.map((call, index) => ({
+        id: `call-${requests}-${index}`,
+        type: "function",
+        function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+      }))
+      const sendStream = () => {
+        if (response.destroyed || response.writableEnded) return
+        const content = reply.content ?? ""
+        const pieces = content.match(/[^ ]+ */g) ?? []
+        const frame = (delta: Record<string, unknown>, finish?: string) =>
+          `data: ${JSON.stringify({
+            id: `chatcmpl-${requests}`,
+            object: "chat.completion.chunk",
+            model: "fake-model",
+            choices: [
+              { index: 0, delta, ...(finish === undefined ? {} : { finish_reason: finish }) },
+            ],
+          })}\n\n`
+        response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" })
+        response.write(frame({ role: "assistant", content: "" }))
+        let index = 0
+        const step = () => {
+          if (response.destroyed || response.writableEnded) return
+          if (index < pieces.length) {
+            response.write(frame({ content: pieces[index] }))
+            index += 1
+            const timer = setTimeout(() => {
+              timers.delete(timer)
+              step()
+            }, 120)
+            timers.add(timer)
+            return
+          }
+          response.write(frame({}, toolCalls && toolCalls.length > 0 ? "tool_calls" : "stop"))
+          response.write(
+            `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`,
+          )
+          response.write("data: [DONE]\n\n")
+          response.end()
+        }
+        step()
+      }
       const sendReply = () => {
         if (response.destroyed || response.writableEnded) return
-        const toolCalls = reply.toolCalls?.map((call, index) => ({
-          id: `call-${requests}-${index}`,
-          type: "function",
-          function: { name: call.name, arguments: JSON.stringify(call.arguments) },
-        }))
         const payload = {
           id: `chatcmpl-${requests}`,
           object: "chat.completion",
@@ -86,7 +125,9 @@ async function startFakeLlm(): Promise<FakeLlm> {
         response.writeHead(200, { "content-type": "application/json" })
         response.end(JSON.stringify(payload))
       }
-      if (reply.delayMs && reply.delayMs > 0) {
+      if (reply.stream === true) {
+        sendStream()
+      } else if (reply.delayMs && reply.delayMs > 0) {
         const timer = setTimeout(() => {
           timers.delete(timer)
           sendReply()
@@ -303,7 +344,7 @@ interface Stream {
   events: SessionEvent[]
   total: number
   since: number
-  turn: { running: boolean; error?: string; aborted?: boolean; startedAt?: string }
+  turn: { running: boolean; error?: string; aborted?: boolean; startedAt?: string; partial?: string }
 }
 
 async function eventsStream(query = ""): Promise<Stream> {
@@ -485,6 +526,72 @@ test("a message is accepted once with 202, refused with 409 while a turn runs an
   assert.equal((await api("POST", "/api/agent/messages", {})).status, 400)
   assert.equal((await api("POST", "/api/agent/messages", { text: 42 })).status, 400)
   assert.equal((await api("GET", "/api/agent/messages")).status, 405)
+})
+
+test("a streaming turn grows turn.partial and drops the key once the answer lands", async () => {
+  fixture.fake.reset()
+  const answer = "streaming grows the partial bubble word by word"
+  fixture.fake.push({ stream: true, content: answer })
+  const accepted = await send("stream this answer")
+  assert.equal(accepted.status, 202, accepted.text)
+  assert.equal(accepted.json.turn.partial, undefined, "a turn without text yet omits partial")
+
+  const seen: string[] = []
+  const deadline = Date.now() + 10_000
+  for (;;) {
+    const reply = await api("GET", "/api/agent")
+    assert.equal(reply.status, 200, reply.text)
+    const turn = reply.json.turn as { running: boolean; partial?: string }
+    if (!turn.running) break
+    assert.ok(turn.partial === undefined || typeof turn.partial === "string", "partial is a string or absent")
+    if (typeof turn.partial === "string") {
+      assert.ok(answer.startsWith(turn.partial), `partial must be a prefix of the answer: ${turn.partial}`)
+      if (seen[seen.length - 1] !== turn.partial) seen.push(turn.partial)
+    }
+    if (Date.now() > deadline) throw new Error("the streaming turn never finished")
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+
+  assert.ok(seen.length >= 2, `expected at least two growing samples, got ${JSON.stringify(seen)}`)
+  assert.ok((seen[0] ?? "").length > 0, "the first sample already carries text")
+  assert.ok(
+    (seen[seen.length - 1] ?? "").length > (seen[0] ?? "").length,
+    `partial must grow: ${JSON.stringify(seen)}`,
+  )
+
+  const detail = await api("GET", "/api/agent")
+  assert.equal(detail.json.turn.running, false)
+  assert.equal(detail.json.turn.partial, undefined, "a settled turn has no partial key")
+
+  const whole = await eventsStream("?since=0")
+  const answers = whole.events.filter((event) => event.type === "assistant_message")
+  assert.equal(answers.at(-1)?.data.text, answer)
+  assert.equal(fixture.fake.bodies.at(-1)?.stream, true, "the turn asks the gateway to stream")
+})
+
+test("aborting a streaming turn stops it at once and drops the partial", async () => {
+  fixture.fake.reset()
+  fixture.fake.push({ stream: true, content: "this answer will be cut in the middle of a sentence by the operator" })
+  assert.equal((await send("stream then abort")).status, 202)
+
+  const deadline = Date.now() + 10_000
+  for (;;) {
+    const reply = await api("GET", "/api/agent")
+    const turn = reply.json.turn as { running: boolean; partial?: string }
+    if (!turn.running) break
+    if (typeof turn.partial === "string" && turn.partial.length > 0) break
+    assert.ok(Date.now() < deadline, "the streaming turn never produced a partial")
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+
+  const aborted = await api("POST", "/api/agent/abort")
+  assert.equal(aborted.status, 200, aborted.text)
+  assert.equal(aborted.json.aborted, true)
+
+  const settled = await settle(4000)
+  assert.equal(settled.turn.aborted, true)
+  assert.equal(settled.turn.error, undefined, "an abort is not an error")
+  assert.equal(settled.turn.partial, undefined, "the partial dies with the turn")
 })
 
 test("the model is offered exactly ten tools under fixed names", async () => {

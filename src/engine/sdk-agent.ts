@@ -25,7 +25,9 @@ import type { MemoryStore } from "./memory.ts"
 import { executeTool, toLlmTools } from "./tools.ts"
 import type {
   LlmClient,
+  LlmCompleteRequest,
   LlmContentPart,
+  LlmDelta,
   LlmMessage,
   LlmResponse,
   LlmToolCall,
@@ -102,7 +104,7 @@ export type DurableAgentRunOptions = AgentRunOptions & {
   agentDir?: string
   maxRecall?: number
   maxMemoryChars?: number
-  onDelta?: (text: string) => void
+  onDelta?: LlmDelta
   onCompaction?: (record: CompactionRecord) => void
 }
 
@@ -161,38 +163,73 @@ export async function runAgent(opts: DurableAgentRunOptions): Promise<AgentRunRe
 
   const model = sdkModel()
   const modelTools = toLlmTools(opts.tools)
-  const completeTurn = async (context: TranscriptContext, signal: AbortSignal | undefined): Promise<AssistantMessage> => {
+  const completeTurn = async (
+    context: TranscriptContext,
+    signal: AbortSignal | undefined,
+    stream: AssistantMessageEventStream,
+  ): Promise<TurnAnswer> => {
     const compacting = inCompaction
     if (!compacting) {
       steps += 1
       session.appendAssistantPending({ model: opts.llm.model, step: steps - 1 })
     }
-    const request = {
+    const request: LlmCompleteRequest = {
       messages: toWire(context.messages),
       tools: modelTools,
       ...(signal !== undefined ? { signal } : {}),
     }
-    const response = await opts.llm.complete(request)
+    const streamed = !compacting ? opts.llm.completeStream : undefined
+    const live = streamed === undefined ? undefined : openStream(stream)
+    let response: LlmResponse
+    if (streamed !== undefined && live !== undefined) {
+      response = await streamed.call(opts.llm, request, (text, info) => {
+        if (info?.reset === true) resetStream(live)
+        else pushStreamText(stream, live, text)
+        opts.onDelta?.(text, info)
+      })
+      pushStreamTextEnd(stream, live)
+    } else {
+      response = await opts.llm.complete(request)
+    }
     usage = addUsage(usage, response.usage)
     const answered = toAssistantMessage(response, steps >= maxSteps)
     if (!compacting) {
       lastText = answered.text
+      if (live === undefined && answered.text !== "") opts.onDelta?.(answered.text)
       session.appendAssistantMessage({
         text: answered.text,
         ...(answered.calls.length > 0 ? { toolCalls: answered.calls } : {}),
       })
+      opts.onDelta?.("", { reset: true })
     }
-    return answered.message
+    return { message: answered.message, live }
   }
 
-  const answer = (context: TranscriptContext, signal: AbortSignal | undefined): AssistantMessageEventStream =>
-    answerStream(
-      () => completeTurn(context, signal),
-      (error) =>
-        recordFailure(error, session, inCompaction, (value) => {
+  const answer = (context: TranscriptContext, signal: AbortSignal | undefined): AssistantMessageEventStream => {
+    const stream = createAssistantMessageEventStream()
+    void (async () => {
+      let result: TurnAnswer
+      try {
+        result = await completeTurn(context, signal, stream)
+      } catch (error) {
+        const failed = recordFailure(error, session, inCompaction, (value) => {
           failure = value
-        }),
-    )
+        })
+        stream.push({ type: "error", reason: "error", error: failed })
+        stream.end(failed)
+        return
+      }
+      if (result.live === undefined) replayAnswer(stream, result.message)
+      else closeStream(stream, result.live, result.message)
+      stream.push({
+        type: "done",
+        reason: result.message.stopReason as "stop" | "toolUse" | "length",
+        message: result.message,
+      })
+      stream.end(result.message)
+    })()
+    return stream
+  }
 
   const provider = createProvider({
     id: SDK_PROVIDER,
@@ -236,9 +273,6 @@ export async function runAgent(opts: DurableAgentRunOptions): Promise<AgentRunRe
 
   const unsubscribe = agent.subscribe((event) => {
     switch (event.type) {
-      case "message_update":
-        if (event.assistantMessageEvent.type === "text_delta") opts.onDelta?.(event.assistantMessageEvent.delta)
-        break
       case "compaction_start":
         inCompaction = true
         break
@@ -319,47 +353,89 @@ function recordFailure(
   }
 }
 
-function answerStream(
-  answer: () => Promise<AssistantMessage>,
-  onError: (error: unknown) => AssistantMessage,
-): AssistantMessageEventStream {
-  const stream = createAssistantMessageEventStream()
-  void (async () => {
-    let message: AssistantMessage
-    try {
-      message = await answer()
-    } catch (error) {
-      const failed = onError(error)
-      stream.push({ type: "error", reason: "error", error: failed })
-      stream.end(failed)
-      return
+interface TurnAnswer {
+  message: AssistantMessage
+  live: LiveAnswer | undefined
+}
+
+interface LiveAnswer {
+  partial: AssistantMessage
+  textIndex: number
+  text: string
+}
+
+function openStream(stream: AssistantMessageEventStream): LiveAnswer {
+  const partial: AssistantMessage = {
+    role: "assistant",
+    content: [],
+    api: SDK_PROVIDER,
+    provider: SDK_PROVIDER,
+    model: SDK_MODEL_ID,
+    usage: zeroSdkUsage(),
+    stopReason: "pending",
+    timestamp: Date.now(),
+  }
+  stream.push({ type: "start", partial })
+  return { partial, textIndex: -1, text: "" }
+}
+
+function pushStreamText(stream: AssistantMessageEventStream, live: LiveAnswer, delta: string): void {
+  if (delta === "") return
+  if (live.textIndex < 0) {
+    live.partial.content.push({ type: "text", text: "" })
+    live.textIndex = live.partial.content.length - 1
+    stream.push({ type: "text_start", contentIndex: live.textIndex, partial: live.partial })
+  }
+  live.text += delta
+  const block = live.partial.content[live.textIndex]
+  if (block !== undefined && block.type === "text") block.text = live.text
+  stream.push({ type: "text_delta", contentIndex: live.textIndex, delta, partial: live.partial })
+}
+
+function resetStream(live: LiveAnswer): void {
+  live.text = ""
+  const block = live.partial.content[live.textIndex]
+  if (block !== undefined && block.type === "text") block.text = ""
+}
+
+function pushStreamTextEnd(stream: AssistantMessageEventStream, live: LiveAnswer): void {
+  if (live.textIndex < 0) return
+  stream.push({ type: "text_end", contentIndex: live.textIndex, content: live.text, partial: live.partial })
+}
+
+function closeStream(stream: AssistantMessageEventStream, live: LiveAnswer, message: AssistantMessage): void {
+  for (const block of message.content) {
+    if (block.type !== "toolCall") continue
+    live.partial.content.push(block)
+    const contentIndex = live.partial.content.length - 1
+    stream.push({ type: "toolcall_start", contentIndex, partial: live.partial })
+    stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: live.partial })
+  }
+}
+
+function replayAnswer(stream: AssistantMessageEventStream, message: AssistantMessage): void {
+  const partial: AssistantMessage = { ...message, content: [], stopReason: "pending" }
+  stream.push({ type: "start", partial })
+  for (let index = 0; index < message.content.length; index += 1) {
+    const block = message.content[index]
+    if (block === undefined) continue
+    if (block.type === "text") {
+      partial.content = [...partial.content, { type: "text", text: "" }]
+      stream.push({ type: "text_start", contentIndex: index, partial })
+      partial.content[index] = { type: "text", text: block.text }
+      stream.push({ type: "text_delta", contentIndex: index, delta: block.text, partial })
+      stream.push({ type: "text_end", contentIndex: index, content: block.text, partial })
+      continue
     }
-    const partial: AssistantMessage = { ...message, content: [], stopReason: "pending" }
-    stream.push({ type: "start", partial })
-    for (let index = 0; index < message.content.length; index += 1) {
-      const block = message.content[index]
-      if (block === undefined) continue
-      if (block.type === "text") {
-        partial.content = [...partial.content, { type: "text", text: "" }]
-        stream.push({ type: "text_start", contentIndex: index, partial })
-        partial.content[index] = { type: "text", text: block.text }
-        stream.push({ type: "text_delta", contentIndex: index, delta: block.text, partial })
-        stream.push({ type: "text_end", contentIndex: index, content: block.text, partial })
-        continue
-      }
-      if (block.type === "toolCall") {
-        partial.content = [
-          ...partial.content,
-          { type: "toolCall", id: block.id, name: block.name, arguments: block.arguments },
-        ]
-        stream.push({ type: "toolcall_start", contentIndex: index, partial })
-        stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial })
-      }
+    if (block.type === "toolCall") {
+      partial.content = [
+        ...partial.content,
+        { type: "toolCall", id: block.id, name: block.name, arguments: block.arguments },
+      ]
+      stream.push({ type: "toolcall_start", contentIndex: index, partial })
+      stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial })
     }
-    stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse" | "length", message })
-    stream.end(message)
-  })()
-  return stream
+  }
 }
 
 function toAssistantMessage(response: LlmResponse, limited: boolean): { text: string; calls: ToolCall[]; message: AssistantMessage } {

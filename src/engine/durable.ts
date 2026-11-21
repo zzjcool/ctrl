@@ -40,6 +40,8 @@ export type {
   LlmClient,
   LlmCompleteRequest,
   LlmContentPart,
+  LlmDelta,
+  LlmDeltaInfo,
   LlmMessage,
   LlmResponse,
   LlmToolCall,

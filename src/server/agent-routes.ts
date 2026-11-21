@@ -7,7 +7,7 @@ import {
   repairSession,
   runAgent,
 } from "../engine/durable.ts"
-import type { LlmClient, Session, SessionSink } from "../engine/durable.ts"
+import type { LlmClient, LlmDelta, Session, SessionSink } from "../engine/durable.ts"
 import { attachmentSink } from "../media/attachments.ts"
 import { MAX_IMAGE_BYTES, imageType, saveImage } from "../media/images.ts"
 import type { UsageKind } from "../memory/usage.ts"
@@ -103,7 +103,7 @@ async function acceptMessage(
   const text = typeof body.text === "string" ? body.text.trim() : ""
   if (text === "") throw new HttpError(400, "text must be a non-empty string")
   const log = openSession(LOG_ID, { home: ctx.agentHome })
-  const started = ctx.turns.start(LOG_ID, (signal) => runTurn(ctx, log, text, signal))
+  const started = ctx.turns.start(LOG_ID, (signal, onDelta) => runTurn(ctx, log, text, signal, "turn", onDelta))
   if (!started) throw new HttpError(409, "a turn is already running for this agent")
   sendJson(response, 202, { accepted: true, turn: ctx.turns.state(LOG_ID) })
 }
@@ -188,9 +188,10 @@ export async function runTurn(
   text: string,
   signal: AbortSignal,
   origin: UsageKind = "turn",
+  onDelta?: LlmDelta,
 ): Promise<void> {
   try {
-    await runTurnOnce(ctx, log, text, signal, origin)
+    await runTurnOnce(ctx, log, text, signal, origin, onDelta)
   } finally {
     importAfterTurn(ctx)
   }
@@ -233,6 +234,7 @@ async function runTurnOnce(
   text: string,
   signal: AbortSignal,
   origin: UsageKind,
+  onDelta?: LlmDelta,
 ): Promise<void> {
   const meta = log.meta()
   const sidecar = readSidecar(ctx.agentHome, LOG_ID)
@@ -263,6 +265,7 @@ async function runTurnOnce(
       agentDir: ctx.agentHome,
       maxSteps: ctx.maxSteps,
       allowBash: false,
+      ...(onDelta !== undefined ? { onDelta } : {}),
       onCompaction: (record) => {
         recordCompactionSummary(ctx.memory.handle(), { ...record, at: new Date() })
       },

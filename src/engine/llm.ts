@@ -5,6 +5,7 @@ import type {
   LlmClient,
   LlmCompleteRequest,
   LlmContentPart,
+  LlmDelta,
   LlmMessage,
   LlmResponse,
   LlmToolCall,
@@ -64,6 +65,8 @@ export interface ChatCompletionsClientOptions {
 }
 
 const REASONING_EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const
+
+const STREAM_DONE = "[DONE]"
 
 function normalizeEffort(value: string | undefined): string | undefined {
   if (value === undefined) return undefined
@@ -136,11 +139,55 @@ export function createChatCompletionsClient(
           }
         }
 
-        if (attempt < attempts) {
-          const randomValue = Math.min(1, Math.max(0, random()))
-          const backoff = baseDelayMs * 2 ** (attempt - 1)
-          await sleep(backoff * (0.5 + randomValue))
+        if (attempt < attempts) await waitBeforeRetry(attempt, baseDelayMs, random, sleep)
+      }
+
+      throw new Error(`LLM request failed after ${attempts} attempts: ${lastError?.message ?? "unknown error"}`)
+    },
+    async completeStream(req: LlmCompleteRequest, onDelta: LlmDelta): Promise<LlmResponse> {
+      const body: ChatCompletionRequestBody = {
+        ...toRequestBody(model, req, reasoningEffort, defaultMaxTokens),
+        stream: true,
+      }
+      let lastError: Error | undefined
+
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        if (attempt > 1) onDelta("", { reset: true })
+        let response: Response | undefined
+        try {
+          response = await fetchImpl(`${baseUrl}/chat/completions`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${apiKey}`,
+              "content-type": "application/json",
+              accept: "text/event-stream",
+            },
+            body: JSON.stringify(body),
+            signal: req.signal,
+          })
+        } catch {
+          if (req.signal?.aborted) throw new Error("LLM request aborted")
+
+          lastError = new Error("LLM network request failed")
         }
+
+        if (response !== undefined) {
+          if (!response.ok) {
+            if (!isRetryableStatus(response.status)) {
+              throw new Error(`LLM request failed with HTTP ${response.status}`)
+            }
+            lastError = new Error(`LLM request failed with HTTP ${response.status}`)
+          } else {
+            try {
+              return await readStreamResponse(response, onDelta)
+            } catch (error) {
+              if (req.signal?.aborted) throw new Error("LLM request aborted")
+              lastError = error instanceof Error ? error : new Error(String(error))
+            }
+          }
+        }
+
+        if (attempt < attempts) await waitBeforeRetry(attempt, baseDelayMs, random, sleep)
       }
 
       throw new Error(`LLM request failed after ${attempts} attempts: ${lastError?.message ?? "unknown error"}`)
@@ -155,6 +202,7 @@ interface ChatCompletionRequestBody {
   temperature?: number
   tools?: Record<string, unknown>[]
   reasoning_effort?: string
+  stream?: boolean
 }
 
 function toRequestBody(
@@ -294,6 +342,141 @@ function finiteNumber(value: unknown, fallback = 0): number {
 
 function isRetryableStatus(status: number): boolean {
   return status === 429 || (status >= 500 && status < 600)
+}
+
+interface StreamState {
+  text: string
+  toolCalls: Map<number, { id: string; name: string; arguments: string }>
+  usage: LlmUsage | undefined
+  finishReason: string | undefined
+  done: boolean
+}
+
+async function readStreamResponse(response: Response, onDelta: LlmDelta): Promise<LlmResponse> {
+  const contentType = response.headers.get("content-type") ?? ""
+  if (!contentType.includes("text/event-stream")) return await readWholeResponse(response, onDelta)
+  const reader = response.body?.getReader()
+  if (reader === undefined) throw new Error("Invalid LLM response: missing stream")
+  const decoder = new TextDecoder()
+  const state: StreamState = { text: "", toolCalls: new Map(), usage: undefined, finishReason: undefined, done: false }
+  let buffer = ""
+  while (!state.done) {
+    const chunk = await reader.read()
+    if (chunk.done) break
+    buffer += decoder.decode(chunk.value, { stream: true })
+    let cut = buffer.indexOf("\n")
+    while (cut >= 0) {
+      const line = buffer.slice(0, cut)
+      buffer = buffer.slice(cut + 1)
+      if (readStreamLine(line, state, onDelta)) break
+      cut = buffer.indexOf("\n")
+    }
+  }
+  if (!state.done && buffer !== "") readStreamLine(buffer, state, onDelta)
+  if (state.done) {
+    try {
+      await reader.cancel()
+    } catch {
+
+    }
+  }
+  if (!state.done && state.finishReason === undefined) {
+    throw new Error("LLM stream ended before the completion finished")
+  }
+  const toolCalls = [...state.toolCalls.entries()]
+    .sort((left, right) => left[0] - right[0])
+    .map(([, call]) => ({ callId: call.id, name: call.name, args: parseToolArguments(call.arguments) }))
+  return {
+    text: state.text,
+    toolCalls,
+    usage: state.usage ?? parseUsage(undefined),
+    finishReason: state.finishReason ?? "unknown",
+  }
+}
+
+async function readWholeResponse(response: Response, onDelta: LlmDelta): Promise<LlmResponse> {
+  let payload: unknown
+  try {
+    payload = await response.json()
+  } catch {
+    throw new Error("Invalid LLM response: malformed JSON")
+  }
+  const parsed = parseResponse(payload)
+  if (parsed.text !== "") onDelta(parsed.text)
+  return parsed
+}
+
+function readStreamLine(raw: string, state: StreamState, onDelta: LlmDelta): boolean {
+  const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw
+  if (line === "" || line.startsWith(":")) return false
+  if (!line.startsWith("data:")) return false
+  const data = line.slice(5).trim()
+  if (data === "") return false
+  if (data === STREAM_DONE) {
+    state.done = true
+    return true
+  }
+  let payload: unknown
+  try {
+    payload = JSON.parse(data)
+  } catch {
+    throw new Error("Invalid LLM response: malformed JSON")
+  }
+  applyStreamChunk(payload, state, onDelta)
+  return false
+}
+
+function applyStreamChunk(payload: unknown, state: StreamState, onDelta: LlmDelta): void {
+  if (!isRecord(payload)) throw new Error("Invalid LLM response: malformed chunk")
+  if (isRecord(payload.usage)) state.usage = parseUsage(payload.usage)
+  const choice = Array.isArray(payload.choices) ? payload.choices[0] : undefined
+  if (!isRecord(choice)) return
+  if (typeof choice.finish_reason === "string" && choice.finish_reason !== "") {
+    state.finishReason = choice.finish_reason
+  }
+  if (!isRecord(choice.delta)) return
+  const content = choice.delta.content
+  if (typeof content === "string" && content !== "") {
+    state.text += content
+    onDelta(content)
+  }
+  if (!Array.isArray(choice.delta.tool_calls)) return
+  for (const fragment of choice.delta.tool_calls) mergeToolCallFragment(fragment, state)
+}
+
+function mergeToolCallFragment(fragment: unknown, state: StreamState): void {
+  if (!isRecord(fragment)) return
+  const index = typeof fragment.index === "number" && Number.isFinite(fragment.index)
+    ? Math.floor(fragment.index)
+    : state.toolCalls.size
+  const call = state.toolCalls.get(index) ?? { id: "", name: "", arguments: "" }
+  const fn = isRecord(fragment.function) ? fragment.function : {}
+  call.id = mergeFragment(call.id, typeof fragment.id === "string" ? fragment.id : "")
+  call.name = mergeFragment(call.name, typeof fn.name === "string" ? fn.name : "")
+  if (typeof fn.arguments === "string") call.arguments += fn.arguments
+  state.toolCalls.set(index, call)
+}
+
+function mergeFragment(current: string, incoming: string): string {
+  if (incoming === "") return current
+  if (current === "") return incoming
+  if (current === incoming || current.endsWith(incoming)) return current
+  return current + incoming
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+async function waitBeforeRetry(
+  attempt: number,
+  baseDelayMs: number,
+  random: () => number,
+  sleep: (milliseconds: number) => Promise<void>,
+): Promise<void> {
+  const randomValue = Math.min(1, Math.max(0, random()))
+  const backoff = baseDelayMs * 2 ** (attempt - 1)
+  await sleep(backoff * (0.5 + randomValue))
 }
 
 function normalizeAttempts(value: number): number {

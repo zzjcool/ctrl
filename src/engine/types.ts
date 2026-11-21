@@ -59,9 +59,16 @@ export interface LlmCompleteRequest {
   signal?: AbortSignal
 }
 
+export interface LlmDeltaInfo {
+  reset?: boolean
+}
+
+export type LlmDelta = (text: string, info?: LlmDeltaInfo) => void
+
 export interface LlmClient {
   readonly model: string
   complete(req: LlmCompleteRequest): Promise<LlmResponse>
+  completeStream?(req: LlmCompleteRequest, onDelta: LlmDelta): Promise<LlmResponse>
 }
 
 export interface ToolCall {

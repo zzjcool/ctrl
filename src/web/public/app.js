@@ -67,6 +67,7 @@ const state = {
 
   tools: new Map(),
   pendingEl: null,
+  partialEl: null,
   loaded: false,
   exhausted: false,
   loadingEarlier: false,
@@ -345,6 +346,7 @@ function normalizeTurn(turn) {
   return {
     running,
     ...(typeof turn.startedAt === "string" ? { startedAt: turn.startedAt } : {}),
+    ...(running && typeof turn.partial === "string" && turn.partial !== "" ? { partial: turn.partial } : {}),
     ...(typeof turn.error === "string" && turn.error ? { error: turn.error } : {}),
     ...(turn.aborted === true ? { aborted: true } : {}),
   }
@@ -980,6 +982,9 @@ function appendEvents(events) {
   }
   noteCursors(events)
   if (!records.length) return
+  if (records.some((record) => record.el && record.el.dataset && record.el.dataset.type === "assistant_message")) {
+    clearPartial()
+  }
   const fragment = document.createDocumentFragment()
   let prevDay = state.rows.length ? state.rows[state.rows.length - 1].day : null
   for (const record of records) {
@@ -1137,10 +1142,49 @@ function syncPending() {
       state.pendingEl.remove()
       state.pendingEl = null
     }
+    syncPartial()
     return
   }
   if (!state.pendingEl) state.pendingEl = buildPending()
   if (els.rows.lastElementChild !== state.pendingEl) els.rows.appendChild(state.pendingEl)
+  syncPartial()
+}
+
+function buildPartial() {
+  const row = el("div", "row row-agent row-partial")
+  const time = document.createElement("time")
+  time.className = "row-time"
+  time.textContent = timeLabel(new Date())
+  const body = el("div", "row-body")
+  row.append(time, body)
+  return { row, body }
+}
+
+function clearPartial() {
+  if (!state.partialEl) return
+  state.partialEl.row.remove()
+  state.partialEl = null
+}
+
+function partialText() {
+  const turn = state.turn
+  if (!turn || turn.running !== true || typeof turn.partial !== "string") return ""
+  return turn.partial
+}
+
+function syncPartial() {
+  const text = partialText()
+  if (!text) {
+    clearPartial()
+    return
+  }
+  if (!state.partialEl) state.partialEl = buildPartial()
+  renderProse(state.partialEl.body, text)
+  const anchor = state.pendingEl && state.pendingEl.parentNode === els.rows ? state.pendingEl : null
+  if (anchor ? state.partialEl.row.nextElementSibling !== anchor : els.rows.lastElementChild !== state.partialEl.row) {
+    els.rows.insertBefore(state.partialEl.row, anchor)
+  }
+  scheduleStickToBottom()
 }
 
 const FOCUS_RANK = { doing: 0, open: 1, blocked: 2, done: 3 }
