@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { readFile } from "node:fs/promises"
 import { test } from "node:test"
 import { renderMarkdown } from "../../src/web/public/markdown.js"
 
@@ -119,4 +120,45 @@ test("rows with too many cells are truncated to the header width", () => {
     '<div class="table-wrap"><table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table></div>',
   )
   assert.equal((html.match(/<td>/g) ?? []).length, 2)
+})
+
+function cssSelectors(css: string): string[] {
+  return [...css.matchAll(/(^|\})([^{}@]+)\{/g)]
+    .flatMap((match) => match[2].split(","))
+    .map((selector) => selector.trim().replace(/\s+/g, " "))
+    .filter((selector) => selector.length > 0)
+}
+
+function lastCompound(selector: string): string {
+  const parts = selector.split(/\s*[>+~]\s*|\s+/).filter(Boolean)
+  return parts[parts.length - 1] ?? ""
+}
+
+function isTableRule(selector: string): boolean {
+  return /^(\.table-wrap|table|thead|tbody|tr|th|td)\b/.test(lastCompound(selector))
+}
+
+test("table styles hang off a real ancestor instead of the paragraph class", async () => {
+  const css = await readFile(new URL("../../src/web/public/styles.css", import.meta.url), "utf8")
+  const tableRules = cssSelectors(css).filter(isTableRule)
+  assert.ok(tableRules.length >= 1, "expected at least one rule that targets .table-wrap or a table node")
+  const dead = tableRules.filter((selector) => selector.split(/\s*[>+~]\s*|\s+/).slice(0, -1).includes(".prose"))
+  assert.deepEqual(dead, [])
+  const live = tableRules.filter((selector) => selector.split(/\s*[>+~]\s*|\s+/).slice(0, -1).includes(".row-body"))
+  assert.ok(live.length >= 3, `expected .table-wrap, table, th and td rules scoped under .row-body, got ${live.join(" | ")}`)
+  assert.ok(tableRules.some((selector) => lastCompound(selector) === ".table-wrap"))
+  assert.ok(tableRules.some((selector) => lastCompound(selector) === "table"))
+  assert.ok(tableRules.some((selector) => lastCompound(selector) === "th"))
+  assert.ok(tableRules.some((selector) => lastCompound(selector) === "td"))
+})
+
+test("a rendered table is a sibling of paragraphs, never nested inside one", () => {
+  const html = renderMarkdown("intro\n\n| a | b |\n|---|---|\n| 1 | 2 |")
+  assert.ok(html.includes('<p class="prose">intro</p>'))
+  assert.ok(html.includes('<div class="table-wrap"><table>'))
+  assert.ok(!html.includes('<p class="prose"><div class="table-wrap">'))
+  const paragraphBodies = [...html.matchAll(/<p class="prose">([^]*?)<\/p>/g)].map((match) => match[1])
+  assert.equal(paragraphBodies.length, 1)
+  assert.ok(paragraphBodies.every((body) => !body.includes("table-wrap") && !body.includes("<table")))
+  assert.ok(html.indexOf('class="table-wrap"') > html.indexOf('<p class="prose">intro</p>'))
 })
