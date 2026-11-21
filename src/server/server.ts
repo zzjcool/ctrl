@@ -121,7 +121,13 @@ export interface RunningServer {
   close(): Promise<void>
 }
 
+function bootTrace(stage: string): void {
+  if (process.env.CTRL_BOOT_TRACE !== "1") return
+  console.error(`ctrl: boot ${stage} +${process.uptime().toFixed(2)}s`)
+}
+
 export function buildContext(config: ServerConfig = {}): AppContext {
+  bootTrace("context:start")
   const env = config.env ?? process.env
   const workspace = config.workspace?.trim() || process.cwd()
   const model = config.model?.trim() || env.PI_DURABLE_MODEL || DEFAULT_MODEL
@@ -144,6 +150,7 @@ export function buildContext(config: ServerConfig = {}): AppContext {
   const requestedAgent = config.agent?.trim()
   const agentName = requestedAgent !== undefined && requestedAgent !== "" ? requestedAgent : DEFAULT_AGENT
   const ensured = ensureAgent({ root, name: agentName, cwd: workspace, model })
+  bootTrace("context:agent")
 
   writeSidecar(ensured.home, LOG_ID, {
     cwd: workspace,
@@ -379,6 +386,7 @@ export function createAppServer(config: ServerConfig = {}): { server: Server; ct
 }
 
 export async function startServer(config: ServerConfig = {}): Promise<RunningServer> {
+  bootTrace("listen:start")
   const { server, ctx } = createAppServer(config)
   const host = config.host ?? DEFAULT_HOST
   const requestedPort = config.port ?? DEFAULT_PORT
@@ -390,6 +398,7 @@ export async function startServer(config: ServerConfig = {}): Promise<RunningSer
       resolve()
     })
   })
+  bootTrace("listen:ready")
   const address = server.address()
   const port = typeof address === "object" && address !== null ? address.port : requestedPort
 
