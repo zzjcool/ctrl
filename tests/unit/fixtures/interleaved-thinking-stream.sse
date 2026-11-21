@@ -1,0 +1,14 @@
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"第一步："}}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"读题。"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"先读题，"}}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"第二步：","content":"同时补充。"}}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"作答。"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"再作答。"},"finish_reason":"stop"}]}
+
+data: [DONE]
+

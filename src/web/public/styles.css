@@ -710,6 +710,55 @@ body {
   color: var(--fg-faint);
 }
 
+.thinking {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.thinking-title {
+  padding: 5px 11px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  color: var(--fg-dim);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.thinking-title::-webkit-details-marker {
+  display: none;
+}
+
+.thinking-title::before {
+  content: "▸ ";
+}
+
+.thinking[open] .thinking-title::before {
+  content: "▾ ";
+}
+
+.thinking-title:hover {
+  color: var(--fg);
+}
+
+.thinking-body {
+  margin: 0;
+  padding: 9px 11px 11px;
+  max-height: 260px;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  background: var(--code-bg);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .spin {
   width: 9px;
   height: 9px;

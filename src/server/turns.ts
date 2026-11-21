@@ -4,6 +4,7 @@ export interface TurnState {
   running: boolean
   startedAt?: string
   partial?: string
+  thinking?: string
   error?: string
   aborted?: boolean
 }
@@ -15,6 +16,7 @@ interface TurnEntry {
   startedAt: string
   running: boolean
   partial: string
+  thinking: string
   error?: string
   aborted: boolean
   done: Promise<void>
@@ -33,6 +35,7 @@ export class TurnRegistry {
       startedAt: new Date().toISOString(),
       running: true,
       partial: "",
+      thinking: "",
       aborted: false,
       done: Promise.resolve(),
     }
@@ -40,7 +43,13 @@ export class TurnRegistry {
     entry.done = (async () => {
       try {
         await run(controller.signal, (text, info) => {
-          entry.partial = info?.reset === true ? "" : entry.partial + text
+          if (info?.reset === true) {
+            entry.partial = ""
+            entry.thinking = ""
+            return
+          }
+          if (info?.kind === "thinking") entry.thinking += text
+          else entry.partial += text
         })
       } catch (error) {
 
@@ -48,6 +57,7 @@ export class TurnRegistry {
       } finally {
         entry.running = false
         entry.partial = ""
+        entry.thinking = ""
       }
     })()
     return true
@@ -73,6 +83,7 @@ export class TurnRegistry {
         running: true,
         startedAt: entry.startedAt,
         ...(entry.partial !== "" ? { partial: entry.partial } : {}),
+        ...(entry.thinking !== "" ? { thinking: entry.thinking } : {}),
       }
     }
     return {

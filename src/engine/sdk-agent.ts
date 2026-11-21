@@ -184,6 +184,7 @@ export async function runAgent(opts: DurableAgentRunOptions): Promise<AgentRunRe
     if (streamed !== undefined && live !== undefined) {
       response = await streamed.call(opts.llm, request, (text, info) => {
         if (info?.reset === true) resetStream(live)
+        else if (info?.kind === "thinking") pushStreamThinking(stream, live, text)
         else pushStreamText(stream, live, text)
         opts.onDelta?.(text, info)
       })
@@ -195,7 +196,12 @@ export async function runAgent(opts: DurableAgentRunOptions): Promise<AgentRunRe
     const answered = toAssistantMessage(response, steps >= maxSteps)
     if (!compacting) {
       lastText = answered.text
-      if (live === undefined && answered.text !== "") opts.onDelta?.(answered.text)
+      if (live === undefined) {
+        if (response.thinking !== undefined && response.thinking !== "") {
+          opts.onDelta?.(response.thinking, { kind: "thinking" })
+        }
+        if (answered.text !== "") opts.onDelta?.(answered.text)
+      }
       session.appendAssistantMessage({
         text: answered.text,
         ...(answered.calls.length > 0 ? { toolCalls: answered.calls } : {}),
@@ -358,13 +364,17 @@ interface TurnAnswer {
   live: LiveAnswer | undefined
 }
 
-interface LiveAnswer {
+export interface LiveAnswer {
   partial: AssistantMessage
   textIndex: number
   text: string
+  textOpen: boolean
+  thinkingIndex: number
+  thinking: string
+  thinkingOpen: boolean
 }
 
-function openStream(stream: AssistantMessageEventStream): LiveAnswer {
+export function openStream(stream: AssistantMessageEventStream): LiveAnswer {
   const partial: AssistantMessage = {
     role: "assistant",
     content: [],
@@ -376,14 +386,41 @@ function openStream(stream: AssistantMessageEventStream): LiveAnswer {
     timestamp: Date.now(),
   }
   stream.push({ type: "start", partial })
-  return { partial, textIndex: -1, text: "" }
+  return {
+    partial,
+    textIndex: -1,
+    text: "",
+    textOpen: false,
+    thinkingIndex: -1,
+    thinking: "",
+    thinkingOpen: false,
+  }
 }
 
-function pushStreamText(stream: AssistantMessageEventStream, live: LiveAnswer, delta: string): void {
+export function pushStreamThinking(stream: AssistantMessageEventStream, live: LiveAnswer, delta: string): void {
   if (delta === "") return
-  if (live.textIndex < 0) {
+  closeText(stream, live)
+  if (!live.thinkingOpen) {
+    live.partial.content.push({ type: "thinking", thinking: "" })
+    live.thinkingIndex = live.partial.content.length - 1
+    live.thinking = ""
+    live.thinkingOpen = true
+    stream.push({ type: "thinking_start", contentIndex: live.thinkingIndex, partial: live.partial })
+  }
+  live.thinking += delta
+  const block = live.partial.content[live.thinkingIndex]
+  if (block !== undefined && block.type === "thinking") block.thinking = live.thinking
+  stream.push({ type: "thinking_delta", contentIndex: live.thinkingIndex, delta, partial: live.partial })
+}
+
+export function pushStreamText(stream: AssistantMessageEventStream, live: LiveAnswer, delta: string): void {
+  if (delta === "") return
+  closeThinking(stream, live)
+  if (!live.textOpen) {
     live.partial.content.push({ type: "text", text: "" })
     live.textIndex = live.partial.content.length - 1
+    live.text = ""
+    live.textOpen = true
     stream.push({ type: "text_start", contentIndex: live.textIndex, partial: live.partial })
   }
   live.text += delta
@@ -392,18 +429,40 @@ function pushStreamText(stream: AssistantMessageEventStream, live: LiveAnswer, d
   stream.push({ type: "text_delta", contentIndex: live.textIndex, delta, partial: live.partial })
 }
 
-function resetStream(live: LiveAnswer): void {
-  live.text = ""
-  const block = live.partial.content[live.textIndex]
-  if (block !== undefined && block.type === "text") block.text = ""
+function closeThinking(stream: AssistantMessageEventStream, live: LiveAnswer): void {
+  if (!live.thinkingOpen) return
+  live.thinkingOpen = false
+  if (live.thinking === "") {
+    if (live.thinkingIndex === live.partial.content.length - 1) {
+      live.partial.content.pop()
+      live.thinkingIndex = -1
+    }
+    return
+  }
+  stream.push({ type: "thinking_end", contentIndex: live.thinkingIndex, content: live.thinking, partial: live.partial })
 }
 
-function pushStreamTextEnd(stream: AssistantMessageEventStream, live: LiveAnswer): void {
-  if (live.textIndex < 0) return
+function closeText(stream: AssistantMessageEventStream, live: LiveAnswer): void {
+  if (!live.textOpen) return
+  live.textOpen = false
   stream.push({ type: "text_end", contentIndex: live.textIndex, content: live.text, partial: live.partial })
 }
 
-function closeStream(stream: AssistantMessageEventStream, live: LiveAnswer, message: AssistantMessage): void {
+export function resetStream(live: LiveAnswer): void {
+  live.text = ""
+  const block = live.partial.content[live.textIndex]
+  if (block !== undefined && block.type === "text") block.text = ""
+  live.thinking = ""
+  const thinkingBlock = live.partial.content[live.thinkingIndex]
+  if (thinkingBlock !== undefined && thinkingBlock.type === "thinking") thinkingBlock.thinking = ""
+}
+
+export function pushStreamTextEnd(stream: AssistantMessageEventStream, live: LiveAnswer): void {
+  closeThinking(stream, live)
+  closeText(stream, live)
+}
+
+export function closeStream(stream: AssistantMessageEventStream, live: LiveAnswer, message: AssistantMessage): void {
   for (const block of message.content) {
     if (block.type !== "toolCall") continue
     live.partial.content.push(block)

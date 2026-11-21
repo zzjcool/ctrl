@@ -20,6 +20,7 @@ interface FakeToolCall {
 
 interface FakeReply {
   content?: string
+  reasoning?: string
   toolCalls?: FakeToolCall[]
   delayMs?: number
   stream?: boolean
@@ -69,6 +70,8 @@ async function startFakeLlm(): Promise<FakeLlm> {
         if (response.destroyed || response.writableEnded) return
         const content = reply.content ?? ""
         const pieces = content.match(/[^ ]+ */g) ?? []
+        const reasoning = reply.reasoning ?? ""
+        const thoughts = reasoning.match(/[^ ]+ */g) ?? []
         const frame = (delta: Record<string, unknown>, finish?: string) =>
           `data: ${JSON.stringify({
             id: `chatcmpl-${requests}`,
@@ -81,8 +84,19 @@ async function startFakeLlm(): Promise<FakeLlm> {
         response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" })
         response.write(frame({ role: "assistant", content: "" }))
         let index = 0
+        let thought = 0
         const step = () => {
           if (response.destroyed || response.writableEnded) return
+          if (thought < thoughts.length) {
+            response.write(frame({ reasoning_content: thoughts[thought] }))
+            thought += 1
+            const timer = setTimeout(() => {
+              timers.delete(timer)
+              step()
+            }, 70)
+            timers.add(timer)
+            return
+          }
           if (index < pieces.length) {
             response.write(frame({ content: pieces[index] }))
             index += 1
@@ -526,6 +540,54 @@ test("a message is accepted once with 202, refused with 409 while a turn runs an
   assert.equal((await api("POST", "/api/agent/messages", {})).status, 400)
   assert.equal((await api("POST", "/api/agent/messages", { text: 42 })).status, 400)
   assert.equal((await api("GET", "/api/agent/messages")).status, 405)
+})
+
+test("a streaming turn exposes turn.thinking without leaking it into partial or the log", async () => {
+  fixture.fake.reset()
+  const reasoning = "recall the rule then answer"
+  const answer = "final answer"
+  fixture.fake.push({ stream: true, reasoning, content: answer })
+  const accepted = await send("think first")
+  assert.equal(accepted.status, 202, accepted.text)
+
+  const thoughts: string[] = []
+  const parts: string[] = []
+  const deadline = Date.now() + 10_000
+  for (;;) {
+    const reply = await api("GET", "/api/agent")
+    assert.equal(reply.status, 200, reply.text)
+    const turn = reply.json.turn as { running: boolean; partial?: string; thinking?: string }
+    if (!turn.running) break
+    assert.ok(turn.thinking === undefined || typeof turn.thinking === "string")
+    if (typeof turn.thinking === "string") {
+      assert.ok(reasoning.startsWith(turn.thinking), `thinking must be a prefix: ${turn.thinking}`)
+      if (thoughts.at(-1) !== turn.thinking) thoughts.push(turn.thinking)
+    }
+    if (typeof turn.partial === "string") {
+      assert.ok(answer.startsWith(turn.partial), `partial must be a prefix of the answer: ${turn.partial}`)
+      assert.equal(turn.partial.includes(reasoning.slice(0, 8)), false, "thinking never shows up as the answer")
+      if (parts.at(-1) !== turn.partial) parts.push(turn.partial)
+    }
+    if (Date.now() > deadline) throw new Error("the thinking turn never finished")
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+
+  assert.ok(thoughts.length >= 1, `expected at least one thinking sample, got ${JSON.stringify(thoughts)}`)
+  assert.ok((thoughts[0] ?? "").length > 0, "the first thinking sample already carries text")
+  assert.ok(parts.length >= 1, "the answer still streams into partial")
+
+  const detail = await api("GET", "/api/agent")
+  assert.equal(detail.json.turn.running, false)
+  assert.equal(detail.json.turn.thinking, undefined, "a settled turn has no thinking key")
+  assert.equal(detail.json.turn.partial, undefined, "a settled turn has no partial key")
+
+  const whole = await eventsStream("?since=0")
+  for (const event of whole.events) {
+    assert.equal(Object.hasOwn(event.data as Record<string, unknown>, "thinking"), false, "thinking must never enter the log")
+    assert.equal(JSON.stringify(event).includes(reasoning), false, "the reasoning text must never be persisted")
+  }
+  const answers = whole.events.filter((event) => event.type === "assistant_message")
+  assert.equal(answers.at(-1)?.data.text, answer)
 })
 
 test("a streaming turn grows turn.partial and drops the key once the answer lands", async () => {
