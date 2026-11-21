@@ -5,10 +5,23 @@ import path from "node:path"
 import { after, test } from "node:test"
 import { openMemoryDb } from "../../src/memory/db.ts"
 import { buildTools, type MemoryEntry } from "../../src/engine/durable.ts"
-import { createSqliteAgentMemory, engineKind, toEntry } from "../../src/memory/agent-memory.ts"
+import {
+  createSqliteAgentMemory,
+  engineKind,
+  LESSON_RECALL_BOOST,
+  toEntry,
+} from "../../src/memory/agent-memory.ts"
 import { runDream, type DreamLlm } from "../../src/memory/dream.ts"
 import type { LogEvent } from "../../src/memory/events.ts"
-import { addMemory, searchTerms, supersedeMemory, updateMemory } from "../../src/memory/memories.ts"
+import {
+  addMemory,
+  getMemory,
+  searchMemories,
+  searchMemoriesScored,
+  searchTerms,
+  supersedeMemory,
+  updateMemory,
+} from "../../src/memory/memories.ts"
 import { createSearchContextTool } from "../../src/memory/tools.ts"
 import { createMemoryIndex } from "../../src/memory/index.ts"
 import type { DatabaseSync } from "node:sqlite"
@@ -244,6 +257,118 @@ test("search_context lists memories as memories, ahead of the event hits", async
       assert.match(paged.output, /no matches/)
     } finally {
       index.close()
+    }
+  } finally {
+    db.close()
+  }
+})
+
+test("a query for lesson fans out to the Chinese words for it", () => {
+  const terms = searchTerms("lesson")
+  assert.ok(terms.includes("经验"), `expected 经验 in ${JSON.stringify(terms)}`)
+  assert.ok(terms.includes("教训"), `expected 教训 in ${JSON.stringify(terms)}`)
+  assert.ok(searchTerms("经验").includes("lesson"), "a Chinese query must reach the English kind")
+  assert.ok(searchTerms("教训").includes("lesson"), "the other Chinese word must reach it too")
+
+  const db = openMemoryDb(":memory:")
+  try {
+    const lesson = addMemory(db, {
+      kind: "lesson",
+      text: "应用前跑齐 typecheck 与四套测试",
+      tags: ["lesson", "code"],
+    }).memory
+    addMemory(db, { kind: "skill", text: "部署走 herdr", tags: ["deploy"] })
+    const hits = searchMemories(db, "经验")
+    assert.ok(hits.some((row) => row.id === lesson.id), "经验 must find a lesson through its tag, not just its text")
+    assert.ok(hits.every((row) => row.id === lesson.id), "nothing unrelated may ride along")
+  } finally {
+    db.close()
+  }
+})
+
+test("recall treats a lesson as skill-shaped knowledge, in one direction only", () => {
+  const db = openMemoryDb(":memory:")
+  try {
+    const memory = createSqliteAgentMemory({ db })
+    const lesson = addMemory(db, {
+      kind: "lesson",
+      text: "always run the full test suite before proposing a change",
+    }).memory
+    const skill = addMemory(db, { kind: "skill", text: "propose a change only after the full test suite runs" }).memory
+    const fact = addMemory(db, { kind: "fact", text: "the full test suite lives under tests" }).memory
+
+    const skills = memory.recall({ text: "full test suite", kinds: ["skill"], limit: 10 })
+    const skillIds = skills.map((hit) => hit.entry.id)
+    assert.ok(skillIds.includes(lesson.id), "kinds=[skill] must include lessons")
+    assert.ok(skillIds.includes(skill.id), "kinds=[skill] must still include skills")
+    assert.ok(!skillIds.includes(fact.id), "kinds=[skill] must not drag facts in")
+
+    const lessons = memory.recall({ text: "full test suite", kinds: ["lesson"], limit: 10 })
+    assert.deepEqual(lessons.map((hit) => hit.entry.id), [lesson.id], "kinds=[lesson] is lessons only")
+    assert.ok(!lessons.some((hit) => hit.entry.kind === "skill"), "a skill is not a lesson")
+  } finally {
+    db.close()
+  }
+})
+
+test("the remember tool offers lesson and files it as a lesson", async () => {
+  const db = openMemoryDb(":memory:")
+  try {
+    const memory = createSqliteAgentMemory({ db })
+    const remember = buildTools().find((tool) => tool.name === "remember")
+    assert.ok(remember, "the engine ships a remember tool")
+    const properties = remember.parameters.properties as Record<string, { enum?: unknown[]; description?: string }>
+    const kind = properties.kind
+    assert.ok(kind?.enum?.includes("lesson"), "lesson must be an offerable kind")
+    assert.match(kind?.description ?? "", /lesson/i, "the kind parameter must explain when to pick lesson")
+    assert.match(remember.description, /lesson/i, "the tool description must name lesson")
+
+    const written = await remember.execute(
+      { kind: "lesson", text: "when the build fails, read the first error before the last" },
+      { ...context, remember: (input) => memory.remember(input) },
+    )
+    assert.equal(written.ok, true, written.output)
+    const entry = JSON.parse(written.output) as MemoryEntry
+    assert.equal(getMemory(db, entry.id)?.kind, "lesson", "the row on disk is a lesson")
+  } finally {
+    db.close()
+  }
+})
+
+test("the literal word keeps its hits and an unfiltered recall keeps its ids and scores", () => {
+  const db = openMemoryDb(":memory:")
+  try {
+    const memory = createSqliteAgentMemory({ db })
+    const lesson = addMemory(db, {
+      kind: "lesson",
+      text: "always run the full test suite before proposing a change",
+      tags: ["lesson", "code"],
+      importance: 0.9,
+    }).memory
+    const skill = addMemory(db, {
+      kind: "skill",
+      text: "check the lesson list before writing a plan",
+      tags: ["lesson"],
+    }).memory
+    addMemory(db, { kind: "fact", text: "the build box runs linux" })
+
+    const literal = searchMemories(db, "lesson", { limit: 10 })
+    assert.deepEqual(
+      literal.map((row) => row.id).sort(),
+      [lesson.id, skill.id].sort(),
+      "the literal word still finds both rows",
+    )
+
+    const unfiltered = memory.recall({ text: "lesson", limit: 10 })
+    assert.deepEqual(unfiltered.map((hit) => hit.entry.id).sort(), [lesson.id, skill.id].sort())
+    const scored = searchMemoriesScored(db, "lesson", { limit: 30 })
+    for (const hit of unfiltered) {
+      const base = scored.find((entry) => entry.row.id === hit.entry.id)
+      const expected = (base?.score ?? 0) * (base?.row.kind === "lesson" ? LESSON_RECALL_BOOST : 1)
+      assert.ok(
+        Math.abs(hit.score - expected) < 1e-6 * Math.max(1, expected),
+        `score for ${hit.entry.id} must stay untouched`,
+      )
     }
   } finally {
     db.close()

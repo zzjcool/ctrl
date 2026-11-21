@@ -53,7 +53,7 @@ function tokenize(value: string): string[] {
 }
 
 function isMemoryKind(value: unknown): value is MemoryKind {
-  return value === "fact" || value === "preference" || value === "event" || value === "skill"
+  return value === "fact" || value === "preference" || value === "event" || value === "skill" || value === "lesson"
 }
 
 
