@@ -24,7 +24,9 @@ function constantOf(name: string): string {
 const scrollerSource = sliceFrom("let stickObserver", "function updateLoadEarlier")
 const tailSource = sliceFrom("async function loadTail", "async function loadEarlier")
 const bootSource = sliceFrom("async function tryLoadAgent", "function bind")
+const bootFnSource = sliceFrom("async function boot", "void boot()")
 const constantsSource = ["NEAR_BOTTOM_PX", "STICK_POLL_MS", "STICK_UP_PX"].map(constantOf).join("\n")
+const bootConstantsSource = ["POLL_RUNNING_MS", "POLL_IDLE_MS"].map(constantOf).join("\n")
 
 type Timeline = { scrollTop: number; scrollHeight: number; clientHeight: number }
 
@@ -58,6 +60,8 @@ type ScrollerApi = {
   scheduleStickToBottom: () => void
   noteTimelineScroll: () => void
   watchTimelineGrowth: () => void
+  setBooting: (value: boolean) => void
+  isBooting: () => boolean
 }
 
 type Scroller = Observed & ScrollerApi
@@ -150,6 +154,7 @@ function fakes(options: { timeline?: Partial<Timeline>; state?: Partial<State> }
 
 function harness(options: {
   resizeObserver: boolean
+  booting?: boolean
   timeline?: Partial<Timeline>
   state?: Partial<State>
 }): Scroller {
@@ -157,7 +162,8 @@ function harness(options: {
   const body = [
     constantsSource,
     scrollerSource,
-    "return { scrollToBottom, stopStickToBottom, stickOnce, scheduleStickToBottom, noteTimelineScroll, watchTimelineGrowth }",
+    `booting = ${options.booting === true ? "true" : "false"}`,
+    "return { scrollToBottom, stopStickToBottom, stickOnce, scheduleStickToBottom, noteTimelineScroll, watchTimelineGrowth, setBooting: (value) => { booting = value }, isBooting: () => booting }",
   ].join("\n")
 
   const factory = new Function("els", "state", "window", "ResizeObserver", body) as (
@@ -272,6 +278,69 @@ function bootHarness(options: { timeline?: Partial<Timeline>; state?: Partial<St
 
   const api = factory(observed.els, observed.state, fakeWindow, Observer, ...stubs)
   return { ...observed, ...api, calls }
+}
+
+function bootFlowHarness(options: { timeline?: Partial<Timeline>; state?: Partial<State>; attempts: boolean[] }) {
+  const { observed, fakeWindow, Observer } = fakes(options)
+  const calls: string[] = []
+  const attempts = [...options.attempts]
+  let bootingProbe: () => boolean = () => true
+  const body = [constantsSource, bootConstantsSource, scrollerSource, bootFnSource, "return { boot, scheduleStickToBottom, isBooting: () => booting }"].join(
+    "\n",
+  )
+
+  const stubbed = [
+    "bind",
+    "autosize",
+    "renderFocus",
+    "renderWorkers",
+    "renderProposals",
+    "renderDream",
+    "updateHead",
+    "updateEmpty",
+    "updateLoadEarlier",
+    "updateComposer",
+    "tryLoadAgent",
+    "toast",
+    "sleep",
+    "schedulePoll",
+  ]
+  const factory = new Function("els", "state", "window", "ResizeObserver", ...stubbed, body) as (
+    els: Observed["els"],
+    state: State,
+    window: object,
+    ResizeObserver: unknown,
+    ...stubs: unknown[]
+  ) => { boot: () => Promise<void>; scheduleStickToBottom: () => void; isBooting: () => boolean }
+
+  const stubs = [
+    () => calls.push("bind"),
+    () => calls.push("autosize"),
+    () => calls.push("renderFocus"),
+    () => calls.push("renderWorkers"),
+    () => calls.push("renderProposals"),
+    () => calls.push("renderDream"),
+    () => calls.push("updateHead"),
+    () => calls.push("updateEmpty"),
+    () => calls.push("updateLoadEarlier"),
+    () => calls.push("updateComposer"),
+    async () => {
+      const ok = attempts.length > 0 ? attempts.shift() : true
+      calls.push(`tryLoadAgent:${ok ? "ok" : "fail"}:booting=${bootingProbe()}`)
+      if (ok) {
+        observed.state.loaded = true
+        observed.els.timeline.scrollHeight = 9000
+      }
+      return ok
+    },
+    () => calls.push("toast"),
+    async () => calls.push("sleep"),
+    (ms: number) => calls.push(`schedulePoll:${ms}`),
+  ]
+
+  const api = factory(observed.els, observed.state, fakeWindow, Observer, ...stubs)
+  bootingProbe = api.isBooting
+  return { ...observed, ...api, calls, attempts }
 }
 
 function initialState(): Record<string, unknown> {
@@ -452,4 +521,77 @@ test("loadTail can be asked to skip its own pin so the first screen only pins on
   await on.loadTail()
   assert.equal(on.els.timeline.scrollTop, 14468, "the default must keep pinning for every other flow")
   assert.equal(on.state.lastTimelineScrollTop, 14468, "the default pin must record the new position")
+})
+
+test("no stick frame may be queued while the first screen is still booting", () => {
+  const guard = /function scheduleStickToBottom\(\) \{\s*if \(booting \|\| !state\.stickToBottom \|\| stickFrame\) return/.exec(appJs)
+  assert.ok(guard, "scheduleStickToBottom must bail out before queueing a frame while boot is running")
+
+  const scroller = harness({ resizeObserver: true, booting: true, timeline: { scrollHeight: 14468 } })
+  assert.equal(scroller.isBooting(), true, "the guard starts on so the empty first paint cannot pin")
+  scroller.els.timeline.scrollTop = 0
+  scroller.scheduleStickToBottom()
+  assert.equal(scroller.frames.size, 0, "appendEvents must not be able to queue a stale pin during boot")
+  assert.equal(scroller.els.timeline.scrollTop, 0, "the timeline must stay put before the data lands")
+
+  scroller.setBooting(false)
+  scroller.scheduleStickToBottom()
+  assert.equal(scroller.frames.size, 1, "after boot the same call must queue a frame again")
+  scroller.flushFrames()
+  assert.equal(scroller.els.timeline.scrollTop, 14468, "late growth after boot still follows the newest message")
+})
+
+test("boot clears the guard after the retry loop and only re-pins when the stick is on", async () => {
+  for (const stickToBottom of [true, false]) {
+    const boot = bootFlowHarness({
+      timeline: { scrollTop: 4000, scrollHeight: 9000, clientHeight: 641 },
+      state: { stickToBottom, lastTimelineScrollTop: 4000 },
+      attempts: [true],
+    })
+    await boot.boot()
+    assert.equal(boot.isBooting(), false, "a finished boot must release the guard")
+    assert.ok(boot.calls.includes("schedulePoll:2500"), "the idle poll must start only after the guard is released")
+    assert.equal(boot.calls.filter((call) => call === "tryLoadAgent:ok:booting=true").length, 1, "the guard is on while boot loads")
+    assert.equal(
+      boot.els.timeline.scrollTop,
+      stickToBottom ? 9000 : 4000,
+      `boot must re-pin only when the stick is on (stick=${stickToBottom})`,
+    )
+
+    boot.els.timeline.scrollHeight = 9440
+    boot.scheduleStickToBottom()
+    assert.equal(boot.frames.size, stickToBottom ? 1 : 0, "after boot the guard must never block the normal stick path")
+  }
+})
+
+test("boot keeps the guard on across a failed attempt and the tryLoadAgent pin ignores it", async () => {
+  const retried = bootFlowHarness({
+    timeline: { scrollTop: 4000, scrollHeight: 9000, clientHeight: 641 },
+    state: { stickToBottom: true, lastTimelineScrollTop: 4000 },
+    attempts: [false, true],
+  })
+  await retried.boot()
+  assert.deepEqual(
+    retried.calls.filter((call) => call.startsWith("tryLoadAgent:")),
+    ["tryLoadAgent:fail:booting=true", "tryLoadAgent:ok:booting=true"],
+    "a failed attempt must not release the guard before the retry runs",
+  )
+  assert.equal(retried.isBooting(), false, "the guard must be released once the retry loop ends")
+  assert.equal(retried.els.timeline.scrollTop, 9000, "the first screen still lands on the bottom after a retry")
+  assert.equal(retried.calls.filter((call) => call === "toast").length, 1, "the retry warning is unchanged")
+
+  assert.equal(bootSource.includes("booting"), false, "the one first-screen pin must not consult the boot guard")
+  const pins = [...bootSource.matchAll(/scrollToBottom\(/g)]
+  assert.equal(pins.length, 1, "tryLoadAgent still pins exactly once")
+  assert.ok(
+    bootSource.indexOf("scheduleStickToBottom()") > bootSource.indexOf("scrollToBottom("),
+    "the scheduled pin must stay after the direct first-screen pin",
+  )
+
+  const boot = bootHarness({
+    timeline: { scrollTop: 0, scrollHeight: 9000, clientHeight: 641 },
+    state: { stickToBottom: true, lastTimelineScrollTop: 0, eventCount: 5 },
+  })
+  assert.equal(await boot.tryLoadAgent(), true)
+  assert.equal(boot.els.timeline.scrollTop, 9000, "the first-screen pin must work while the guard is still on")
 })

@@ -1045,6 +1045,7 @@ function prependEvents(events) {
 let stickObserver = null
 let stickPoll = 0
 let stickFrame = 0
+let booting = true
 
 function timelineGap() {
   return els.timeline.scrollHeight - els.timeline.clientHeight - els.timeline.scrollTop
@@ -1093,7 +1094,7 @@ function stickOnce() {
 }
 
 function scheduleStickToBottom() {
-  if (!state.stickToBottom || stickFrame) return
+  if (booting || !state.stickToBottom || stickFrame) return
   stickFrame = window.requestAnimationFrame(() => {
     stickFrame = 0
     stickOnce()
@@ -2609,6 +2610,8 @@ async function boot() {
     await sleep(Math.min(1200 * attempt, 8000))
   }
 
+  booting = false
+  if (state.stickToBottom) scrollToBottom()
   schedulePoll(state.turn && state.turn.running ? POLL_RUNNING_MS : POLL_IDLE_MS)
 }
 
