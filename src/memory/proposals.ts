@@ -8,9 +8,24 @@ export const PROPOSAL_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/
 
 export type ProposalStatus = "open" | "failed" | "applied" | "discarded"
 
-export type ProposalReason = "green" | "verification_failed" | "no_changes" | "timeout" | "worker_failed"
+export type ProposalReason =
+  | "green"
+  | "verification_failed"
+  | "no_changes"
+  | "timeout"
+  | "worker_failed"
+  | "post_boot_failed"
+  | "experience_failed"
 
-export const PROPOSAL_REASONS: ProposalReason[] = ["green", "verification_failed", "no_changes", "timeout", "worker_failed"]
+export const PROPOSAL_REASONS: ProposalReason[] = [
+  "green",
+  "verification_failed",
+  "no_changes",
+  "timeout",
+  "worker_failed",
+  "post_boot_failed",
+  "experience_failed",
+]
 
 export const NO_CHANGES_ERROR = "the worker produced no changes"
 

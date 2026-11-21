@@ -30,13 +30,23 @@ const api = new Function(
 }
 
 test("every reason code has a console label", () => {
-  assert.deepEqual(api.PROPOSAL_REASONS, ["green", "verification_failed", "no_changes", "timeout", "worker_failed"])
+  assert.deepEqual(api.PROPOSAL_REASONS, [
+    "green",
+    "verification_failed",
+    "no_changes",
+    "timeout",
+    "worker_failed",
+    "post_boot_failed",
+    "experience_failed",
+  ])
   assert.equal(api.proposalReasonText("green"), "全绿")
   assert.equal(api.proposalReasonText("verification_failed"), "验证失败")
   assert.equal(api.proposalReasonText("no_changes"), "空 diff")
   assert.equal(api.proposalReasonText("timeout"), "超时")
   assert.equal(api.proposalReasonText("worker_failed"), "worker 失败")
-  assert.equal(new Set(Object.values(api.PROPOSAL_REASON_TEXT)).size, 5)
+  assert.equal(api.proposalReasonText("post_boot_failed"), "启动自检失败")
+  assert.equal(api.proposalReasonText("experience_failed"), "体验自检失败")
+  assert.equal(new Set(Object.values(api.PROPOSAL_REASON_TEXT)).size, 7)
 })
 
 test("an unknown or missing reason normalizes to null instead of a label", () => {
