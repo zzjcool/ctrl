@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto"
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import path from "node:path"
-import type { LlmClient, LlmContentPart, LlmMessage } from "../engine/durable.ts"
+import type { LlmClient, LlmCompleteRequest, LlmContentPart, LlmDelta, LlmMessage } from "../engine/durable.ts"
 
 export const MEDIA_DIR = "media"
 
@@ -144,9 +144,17 @@ export function withImageParts(message: LlmMessage): LlmMessage {
 }
 
 export function createImageLlm(base: LlmClient): LlmClient {
+  const stream = base.completeStream
+  const withImages = (request: LlmCompleteRequest): LlmCompleteRequest => ({
+    ...request,
+    messages: request.messages.map(withImageParts),
+  })
   return {
     model: base.model,
-    complete: (request) => base.complete({ ...request, messages: request.messages.map(withImageParts) }),
+    complete: (request) => base.complete(withImages(request)),
+    ...(stream === undefined
+      ? {}
+      : { completeStream: (request: LlmCompleteRequest, onDelta: LlmDelta) => stream.call(base, withImages(request), onDelta) }),
   }
 }
 

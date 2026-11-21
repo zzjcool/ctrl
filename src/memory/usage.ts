@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite"
-import type { LlmClient, LlmCompleteRequest, LlmResponse } from "../engine/durable.ts"
+import type { LlmClient, LlmCompleteRequest, LlmDelta, LlmResponse } from "../engine/durable.ts"
 import { errorMessage, isRecord } from "./events.ts"
 
 export const USAGE_DEFAULT_DAYS = 7
@@ -62,20 +62,28 @@ export function recordUsage(db: DatabaseSync, entry: UsageEntry): void {
 }
 
 export function createRecordingLlm(client: LlmClient, opts: RecordingLlmOptions): LlmClient {
+  const stream = client.completeStream
+  const record = async (run: () => Promise<LlmResponse>): Promise<LlmResponse> => {
+    const startedAt = Date.now()
+    let response: LlmResponse
+    try {
+      response = await run()
+    } catch (error) {
+      writeUsage(opts, client.model, undefined, Date.now() - startedAt, false)
+      throw error
+    }
+    writeUsage(opts, client.model, response, Date.now() - startedAt, true)
+    return response
+  }
   return {
     model: client.model,
-    async complete(req: LlmCompleteRequest): Promise<LlmResponse> {
-      const startedAt = Date.now()
-      let response: LlmResponse
-      try {
-        response = await client.complete(req)
-      } catch (error) {
-        writeUsage(opts, client.model, undefined, Date.now() - startedAt, false)
-        throw error
-      }
-      writeUsage(opts, client.model, response, Date.now() - startedAt, true)
-      return response
-    },
+    complete: (req: LlmCompleteRequest) => record(() => client.complete(req)),
+    ...(stream === undefined
+      ? {}
+      : {
+          completeStream: (req: LlmCompleteRequest, onDelta: LlmDelta) =>
+            record(() => stream.call(client, req, onDelta)),
+        }),
   }
 }
 

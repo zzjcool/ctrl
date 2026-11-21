@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import type { LlmCompleteRequest, LlmResponse } from "../../src/engine/durable.ts"
+import type { LlmCompleteRequest, LlmDelta, LlmResponse } from "../../src/engine/durable.ts"
 import { createAbortableLlm, TurnRegistry } from "../../src/server/turns.ts"
 
 test("state of an unknown session is idle", () => {
@@ -81,6 +81,66 @@ test("shutdown aborts everything that is still running", async () => {
   await turns.shutdown()
   assert.deepEqual(aborted.sort(), ["a", "b"])
   assert.equal(turns.isRunning("a"), false)
+})
+
+test("the turn state carries the text of the running turn and drops it on both ends", async () => {
+  const turns = new TurnRegistry()
+  let delta: (text: string, info?: { reset?: boolean }) => void = () => undefined
+  let release: () => void = () => undefined
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  assert.equal(
+    turns.start("s1", async (_signal, onDelta) => {
+      delta = onDelta
+      await gate
+    }),
+    true,
+  )
+  assert.deepEqual(turns.state("s1").partial, undefined, "no text yet means no partial key")
+
+  delta("half ")
+  delta("an answer")
+  assert.equal(turns.state("s1").partial, "half an answer")
+
+  delta("", { reset: true })
+  assert.equal(turns.state("s1").partial, undefined, "a reset empties the partial")
+
+  delta("complete")
+  assert.equal(turns.state("s1").partial, "complete")
+
+  release()
+  await turns.settled("s1")
+  assert.deepEqual(turns.state("s1"), { running: false }, "a finished turn has no partial key")
+})
+
+test("createAbortableLlm forwards streaming and injects the signal", async () => {
+  const controller = new AbortController()
+  const seen: LlmCompleteRequest[] = []
+  const base = {
+    model: "test-model",
+    async complete(): Promise<LlmResponse> {
+      throw new Error("the streaming path was expected")
+    },
+    async completeStream(req: LlmCompleteRequest, onDelta: LlmDelta): Promise<LlmResponse> {
+      seen.push(req)
+      onDelta("streamed")
+      return {
+        text: "streamed",
+        toolCalls: [],
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        finishReason: "stop",
+      }
+    },
+  }
+  const wrapped = createAbortableLlm(base, controller.signal)
+  const deltas: string[] = []
+  const response = await wrapped.completeStream!({ messages: [{ role: "user", content: "hi" }] }, (text) => {
+    deltas.push(text)
+  })
+  assert.equal(response.text, "streamed")
+  assert.deepEqual(deltas, ["streamed"])
+  assert.equal(seen[0]?.signal, controller.signal)
 })
 
 test("createAbortableLlm injects the signal and keeps the model", async () => {
