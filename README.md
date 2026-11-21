@@ -76,6 +76,47 @@ launchd 调的是 `~/.local/bin/ctrl-supervise.sh`（不在仓库里）：起服
 `/api/health` 不通就丢掉未提交改动重试，还不行回滚到 `~/.ctrl/known-good`，
 再不行就停下。日志：`~/Library/Logs/ctrl-serve.log`。
 
+## 启动自检
+
+`node scripts/verify-boot.mjs` 是晋升门禁：只有它全绿，才允许把当前 HEAD 晋升成
+`~/.ctrl/known-good`。只读，不写任何服务端状态。六项按序跑，任一项失败立即停：
+
+| 检查 | 打哪个接口 | 判据 |
+| --- | --- | --- |
+| health | `GET /api/health` | `status === "ok"` |
+| agent | `GET /api/agent` | 有 `turn` 字段 |
+| memories.lesson | `GET /api/memories?kind=lesson` | `memories` 长度 > 0 |
+| focus | `GET /api/focus` | 合法 JSON |
+| page | `GET /` | HTML 里有时间线容器 |
+| experience | `scripts/experience.mjs` | `0 failing` 且 exit 0 |
+
+实测返回形状（`100.115.91.57:7333`）：
+
+| 接口 | 形状 |
+| --- | --- |
+| `GET /api/health` | `{"status":"ok","agent":"scout"}` |
+| `GET /api/agent` | `{agent, session{…}, resumePoint{…}, turn{…}, memory{…}, context{…}}` |
+| `GET /api/memories?kind=lesson` | `{"memories":[{id,kind,text,tags,importance,confidence,createdAt,updatedAt,sourceFrom,sourceTo}],"count":N}` |
+| `GET /api/focus` | `{"items":[{id,text,state,updatedAt,seq,accept,…}]}` |
+| `GET /` | HTML，时间线是 `<main class="timeline" id="timeline">` |
+| `scripts/experience.mjs` | 首行 `experience <url> — N widths, M failing` |
+
+两个坑：`turn` 是对象不是数字——`{running,startedAt?,partial?,thinking?}`
+（`src/server/turns.ts` 的 `TurnRegistry.state()`）；`memories` 挂在 `memories` 字段里，
+不是裸数组。`experience.mjs` **必须**同时带 `--url` 和 `--out`，缺了直接抛参数错误。
+
+输出契约（supervisor 就 grep 这两行）：全绿最后一行 `verify-boot: PASS`、exit 0；
+失败最后一行 `verify-boot: FAIL at step N (<name>)`、exit 1（参数错是 `step 0 (args)`）。
+中途每步一行 `verify-boot: N/6 <name> ok|FAIL (elapsed) [detail]`。
+
+参数：`--base`（默认 `http://100.115.91.57:7333`，也可用 `CTRL_VERIFY_BASE`）、
+`--skip-experience`（跳过第 6 项，第 5 项后直接 PASS）、`--timeout`（单次请求毫秒，
+默认 2500）、`--verbose`（把每步响应体前 200 字符打到 stdout）。
+
+传输层失败（超时 / ECONNREFUSED / DNS）会重试一次再判 FAIL：线上进程有 2-3 秒的
+事件循环停顿尖峰（`/` 见过 3.2s），一次慢响应不等于启动失败。HTTP 状态码不重试，
+直接判 FAIL。
+
 ## 三条规矩
 
 1. **代码是唯一的事实**。文档只在施工期存在，实现完成即删除；设计决定留在

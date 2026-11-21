@@ -1,37 +1,4 @@
 #!/usr/bin/env node
-/**
- * 启动后自检：只有本脚本通过，才允许把当前 HEAD 晋升为 known-good。
- *
- * 逐个探测受管进程的真实接口（只读，不写任何服务端状态）。
- * 任一项失败立即 abort，最后一行是 `verify-boot: FAIL at step N (<name>)`，exit 1；
- * 全部通过时最后一行是 `verify-boot: PASS`，exit 0（supervisor 靠这两个字符串判定）。
- *
- * 侦察得到的真实返回结构（2026-11，实测 100.115.91.57:7333）：
- *   GET /api/health                 200 {"status":"ok","agent":"scout"}
- *                                   → 判据：status === "ok"（含 agent 字段，不校验）
- *   GET /api/agent                  200 {"agent","session","resumePoint","turn","memory","context"}
- *                                   → turn 字段存在，但**不是数字**，而是对象
- *                                     {"running":boolean,"startedAt"?,"partial"?,"thinking"?}
- *                                     （src/server/turns.ts TurnRegistry.state()）
- *                                     → 判据：有 turn 字段；打印 turn=running|idle
- *   GET /api/memories?kind=lesson   200 {"memories":[{id,kind,text,tags,importance,confidence,
- *                                       createdAt,updatedAt,sourceFrom,sourceTo}],"count":N}
- *                                   → 判据：memories 数组长度 > 0（服务端还给了 count，二者应一致）
- *   GET /api/focus                  200 {"items":[{id,text,state,updatedAt,seq,accept,...}]}
- *                                   → 判据：合法 JSON（数组是 items，不是顶层数组）
- *   GET /                         200 HTML，时间线容器是 <main class="timeline" id="timeline">
- *                                   → 判据：HTML 里出现 id="timeline"
- *   第 6 项跑 scripts/experience.mjs —— 它**必须**带 --url 和 --out（缺了会抛 args 错误），
- *   输出首行 `experience <url> — N widths, M failing`，据此取 M 与退出码。
- *
- * 用法：
- *   node scripts/verify-boot.mjs [--base http://100.115.91.57:7333] [--skip-experience]
- *                                [--timeout 2500] [--verbose]
- *
- * 说明：传输层失败（超时/连接拒绝/DNS）重试一次再判 FAIL，因为线上进程实测有 2-3s 的
- * 事件循环停顿尖峰（/ 曾见 3.2s），一次慢响应不等于启动失败；HTTP 状态码不重试。
- * --skip-experience 直接跳过第 6 项（此时第 5 项后直接打 PASS）。
- */
 import { spawn } from "node:child_process"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -50,12 +17,13 @@ const EXPERIENCE_KILL_MS = 180_000
 
 const EXPERIENCE_TAIL_LINES = 8
 
-const SNIPPET_LIMIT = 200
+const SNIPPET_MAX_CHARS = 200
 
-const NAME_WIDTH = 17
+const STEP_NAME_PAD_WIDTH = 17
 
-/** 传输层失败最多试两次（见 request() 注释）。 */
-const TRANSPORT_ATTEMPTS = 2
+const TRANSPORT_ATTEMPTS_PER_REQUEST = 2
+
+const UNKNOWN_TRANSPORT_FAILURE = "request failed"
 
 const TOTAL_STEPS = 6
 
@@ -65,8 +33,7 @@ const EXIT_FAILED = 1
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 
-/** 时间线容器：src/web/public/index.html 里是 <main class="timeline" id="timeline" ...> */
-const TIMELINE_CONTAINER = 'id="timeline"'
+const TIMELINE_CONTAINER_MARKER = 'id="timeline"'
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error)
@@ -84,7 +51,7 @@ function scrub(text) {
 function snippet(text) {
   const cleaned = scrub(text).replace(/\s+/g, " ").trim()
   if (cleaned === "") return "<empty>"
-  return cleaned.length > SNIPPET_LIMIT ? `${cleaned.slice(0, SNIPPET_LIMIT)}…` : cleaned
+  return cleaned.length > SNIPPET_MAX_CHARS ? `${cleaned.slice(0, SNIPPET_MAX_CHARS)}…` : cleaned
 }
 
 function parsePositiveInt(text) {
@@ -138,8 +105,7 @@ function baseOf(base) {
   return `${base}/`
 }
 
-/** 把 fetch 的各类失败（拒绝连接、超时、DNS）转成一句人话，不抛原始异常。 */
-function describeFetchError(error, timeoutMs) {
+function describeTransportFailure(error, timeoutMs) {
   const name = error instanceof Error ? error.name : ""
   if (name === "TimeoutError" || name === "AbortError") return `timeout after ${timeoutMs}ms`
   const cause = error instanceof Error ? error.cause : undefined
@@ -149,18 +115,12 @@ function describeFetchError(error, timeoutMs) {
     const combined = `${code} ${message}`.trim()
     if (combined !== "") return combined === "ECONNREFUSED" ? "ECONNREFUSED (nothing listening)" : combined
   }
-  return errorMessage(error) || "request failed"
+  return errorMessage(error) || UNKNOWN_TRANSPORT_FAILURE
 }
 
-/**
- * 单次 GET。传输层失败（超时 / 连接拒绝 / DNS）重试一次：
- * 线上进程偶尔出现 2-3s 的事件循环停顿（实测 / 有 3.2s 的尖峰），
- * 一次慢响应不足以证明启动失败，但确定性的失败（127.0.0.1 无监听）重试后仍然失败。
- * 只看传输层：HTTP 4xx/5xx 不重试，直接交给检查项判 FAIL。
- */
-async function request(url, timeoutMs) {
-  let reason = "request failed"
-  for (let attempt = 1; attempt <= TRANSPORT_ATTEMPTS; attempt += 1) {
+async function requestWithTransportRetry(url, timeoutMs) {
+  let reason = UNKNOWN_TRANSPORT_FAILURE
+  for (let attempt = 1; attempt <= TRANSPORT_ATTEMPTS_PER_REQUEST; attempt += 1) {
     try {
       const response = await fetch(url, {
         method: "GET",
@@ -171,7 +131,7 @@ async function request(url, timeoutMs) {
       const text = await response.text()
       return { ok: true, status: response.status, text, attempts: attempt }
     } catch (error) {
-      reason = describeFetchError(error, timeoutMs)
+      reason = describeTransportFailure(error, timeoutMs)
     }
   }
   return { ok: false, reason }
@@ -199,82 +159,81 @@ function turnLabel(turn) {
   return "present"
 }
 
-/** 检查项统一返回 { detail }：失败时 throw 一个带 detail 的 Error。 */
-function fail(detail) {
+function failStep(detail) {
   const error = new Error(detail)
   error.detail = detail
   throw error
 }
 
-function failureDetail(error) {
+function stepFailureDetail(error) {
   const detail = error?.detail
   return typeof detail === "string" && detail !== "" ? detail : errorMessage(error)
 }
 
 async function checkHealth(ctx) {
   const url = urlFor(ctx.base, "/api/health")
-  const reply = await request(url, ctx.timeoutMs)
-  if (!reply.ok) fail(reply.reason)
+  const reply = await requestWithTransportRetry(url, ctx.timeoutMs)
+  if (!reply.ok) failStep(reply.reason)
   ctx.snippet("health", `HTTP ${reply.status} ${reply.text}`)
-  if (reply.status !== 200) fail(`HTTP ${reply.status} (expected 200)`)
+  if (reply.status !== 200) failStep(`HTTP ${reply.status} (expected 200)`)
   const body = parseJsonBody(reply.text)
-  if (!body.ok) fail(body.reason)
+  if (!body.ok) failStep(body.reason)
   if (!isPlainObject(body.value) || body.value.status !== "ok") {
-    fail(`status=${snippet(JSON.stringify(body.value.status))} (expected "ok")`)
+    failStep(`status=${snippet(JSON.stringify(body.value.status))} (expected "ok")`)
   }
   return { detail: "" }
 }
 
 async function checkAgent(ctx) {
   const url = urlFor(ctx.base, "/api/agent")
-  const reply = await request(url, ctx.timeoutMs)
-  if (!reply.ok) fail(reply.reason)
+  const reply = await requestWithTransportRetry(url, ctx.timeoutMs)
+  if (!reply.ok) failStep(reply.reason)
   ctx.snippet("agent", `HTTP ${reply.status} ${reply.text}`)
-  if (reply.status !== 200) fail(`HTTP ${reply.status} (expected 200)`)
+  if (reply.status !== 200) failStep(`HTTP ${reply.status} (expected 200)`)
   const body = parseJsonBody(reply.text)
-  if (!body.ok) fail(body.reason)
-  if (!isPlainObject(body.value)) fail("body is not a JSON object")
-  if (!("turn" in body.value)) fail(`no turn field (keys: ${Object.keys(body.value).join(",") || "none"})`)
+  if (!body.ok) failStep(body.reason)
+  if (!isPlainObject(body.value)) failStep("body is not a JSON object")
+  if (!("turn" in body.value)) failStep(`no turn field (keys: ${Object.keys(body.value).join(",") || "none"})`)
   return { detail: `turn=${turnLabel(body.value.turn)}` }
 }
 
 async function checkMemories(ctx) {
   const url = urlFor(ctx.base, "/api/memories?kind=lesson")
-  const reply = await request(url, ctx.timeoutMs)
-  if (!reply.ok) fail(reply.reason)
+  const reply = await requestWithTransportRetry(url, ctx.timeoutMs)
+  if (!reply.ok) failStep(reply.reason)
   ctx.snippet("memories.lesson", `HTTP ${reply.status} ${reply.text}`)
-  if (reply.status !== 200) fail(`HTTP ${reply.status} (expected 200)`)
+  if (reply.status !== 200) failStep(`HTTP ${reply.status} (expected 200)`)
   const body = parseJsonBody(reply.text)
-  if (!body.ok) fail(body.reason)
+  if (!body.ok) failStep(body.reason)
   const rows = Array.isArray(body.value)
     ? body.value
     : isPlainObject(body.value) && Array.isArray(body.value.memories)
       ? body.value.memories
       : undefined
-  if (rows === undefined) fail("no memories array in body")
+  if (rows === undefined) failStep("no memories array in body")
   const count = rows.length
-  if (count <= 0) fail("count=0 (expected > 0)")
+  if (count <= 0) failStep("count=0 (expected > 0)")
   return { detail: `count=${count}` }
 }
 
 async function checkFocus(ctx) {
   const url = urlFor(ctx.base, "/api/focus")
-  const reply = await request(url, ctx.timeoutMs)
-  if (!reply.ok) fail(reply.reason)
+  const reply = await requestWithTransportRetry(url, ctx.timeoutMs)
+  if (!reply.ok) failStep(reply.reason)
   ctx.snippet("focus", `HTTP ${reply.status} ${reply.text}`)
-  if (reply.status !== 200) fail(`HTTP ${reply.status} (expected 200)`)
+  if (reply.status !== 200) failStep(`HTTP ${reply.status} (expected 200)`)
   const body = parseJsonBody(reply.text)
-  if (!body.ok) fail(body.reason)
+  if (!body.ok) failStep(body.reason)
   return { detail: "" }
 }
 
 async function checkPage(ctx) {
   const url = baseOf(ctx.base)
-  const reply = await request(url, ctx.timeoutMs)
-  if (!reply.ok) fail(reply.reason)
+  const reply = await requestWithTransportRetry(url, ctx.timeoutMs)
+  if (!reply.ok) failStep(reply.reason)
   ctx.snippet("page", `HTTP ${reply.status} ${reply.text}`)
-  if (reply.status !== 200) fail(`HTTP ${reply.status} (expected 200)`)
-  if (!reply.text.includes(TIMELINE_CONTAINER)) fail(`no ${TIMELINE_CONTAINER} in HTML (timeline container missing)`)
+  if (reply.status !== 200) failStep(`HTTP ${reply.status} (expected 200)`)
+  if (!reply.text.includes(TIMELINE_CONTAINER_MARKER)) failStep(`no ${TIMELINE_CONTAINER_MARKER} in HTML (timeline container missing)`)
   return { detail: "timeline container found" }
 }
 
@@ -346,15 +305,15 @@ function experienceTail(output) {
 async function checkExperience(ctx) {
   const result = await runExperience(ctx)
   ctx.snippet("experience", result.output ?? result.reason ?? "")
-  if (!result.ok) fail(result.reason)
-  if (result.signal !== null && result.signal !== undefined) fail(`experience.mjs killed by ${result.signal}`)
+  if (!result.ok) failStep(result.reason)
+  if (result.signal !== null && result.signal !== undefined) failStep(`experience.mjs killed by ${result.signal}`)
   const failing = failingCount(result.output)
   if (failing === undefined) {
     const tail = experienceTail(result.output)
-    fail(`exit=${result.code}, no "N failing" summary (${tail === "" ? "no output" : tail})`)
+    failStep(`exit=${result.code}, no "N failing" summary (${tail === "" ? "no output" : tail})`)
   }
-  if (failing !== 0) fail(`failing=${failing} (expected 0) — ${experienceTail(result.output)}`)
-  if (result.code !== 0) fail(`exit=${result.code} with failing=0`)
+  if (failing !== 0) failStep(`failing=${failing} (expected 0) — ${experienceTail(result.output)}`)
+  if (result.code !== 0) failStep(`exit=${result.code} with failing=0`)
   return { detail: "0 failing" }
 }
 
@@ -371,7 +330,7 @@ function buildSteps(skipExperience) {
 }
 
 function line(index, name, status, elapsedMs, detail) {
-  const head = `verify-boot: ${index}/${TOTAL_STEPS} ${name.padEnd(NAME_WIDTH)}${status}  (${Math.round(elapsedMs)}ms)`
+  const head = `verify-boot: ${index}/${TOTAL_STEPS} ${name.padEnd(STEP_NAME_PAD_WIDTH)}${status}  (${Math.round(elapsedMs)}ms)`
   return detail === "" || detail === undefined ? head : `${head}  ${detail}`
 }
 
@@ -406,7 +365,7 @@ async function run() {
         process.stdout.write(`${line(number, step.name, "ok", elapsed, result?.detail ?? "")}\n`)
       } catch (error) {
         const elapsed = Date.now() - startedAt
-        process.stdout.write(`${line(number, step.name, "FAIL", elapsed, failureDetail(error))}\n`)
+        process.stdout.write(`${line(number, step.name, "FAIL", elapsed, stepFailureDetail(error))}\n`)
         process.stdout.write(`verify-boot: FAIL at step ${number} (${step.name})\n`)
         process.exitCode = EXIT_FAILED
         return
