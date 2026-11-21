@@ -14,7 +14,7 @@ import type { UsageKind } from "../memory/usage.ts"
 import { lastDreamAt, readProfile } from "../memory/dream.ts"
 import { listFocus, openFocusCount } from "../memory/focus.ts"
 import { liveMemoryCount } from "../memory/memories.ts"
-import { compressWindow, windowInfo } from "../memory/window.ts"
+import { recordCompactionSummary, windowInfo } from "../memory/window.ts"
 import { LOG_ID } from "./agents.ts"
 import { HttpError, readBody, readJson, sendJson } from "./http.ts"
 import { conversationEvents, errorMessage, JOB_MESSAGE_KIND, methodNotAllowed, notFound, pageEvents } from "./routes.ts"
@@ -246,17 +246,6 @@ async function runTurnOnce(
     throw error
   }
 
-  try {
-    await compressWindow(log, {
-      llm: createAbortableLlm(base, signal),
-      budget: ctx.contextBudget,
-      ...(ctx.memory.handle() !== undefined ? { db: ctx.memory.handle() } : {}),
-      signal,
-    })
-  } catch {
-
-  }
-
   const before = log.events().length
   const sink = origin === "wake" ? jobLifecycleSession(log) : log
   const session = attachmentSink(sink, ctx.attachments, (text) => {
@@ -271,9 +260,12 @@ async function runTurnOnce(
       memory: ctx.agentMemory,
       tools: ctx.tools,
       cwd,
+      agentDir: ctx.agentHome,
       maxSteps: ctx.maxSteps,
-      compactThreshold: Number.MAX_SAFE_INTEGER,
       allowBash: false,
+      onCompaction: (record) => {
+        recordCompactionSummary(ctx.memory.handle(), { ...record, at: new Date() })
+      },
       systemPrompt: buildSystemPrompt({
         name: ctx.agent,
         cwd,

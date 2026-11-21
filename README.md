@@ -10,7 +10,7 @@
 ```text
 浏览器                 ctrl（本地）                         pi worker
 ┌──────────┐   HTTP   ┌─────────────────────────┐  spawn   ┌──────────────────┐
-│ 一个时间线 │ ───────► │ pi-durable              │ ───────► │ pi -p "<task>"   │
+│ 一个时间线 │ ───────► │ 官方 pi SDK             │ ───────► │ pi -p "<task>"   │
 │ 一直往下  │ ◄─────── │  append-only 日志 + 记忆 │ ◄─────── │ 读/改/跑，随便它  │
 └──────────┘          │ delegate / job_status    │  输出落盘 └──────────────────┘
                       └─────────────────────────┘
@@ -54,7 +54,7 @@
 
 | 项目 | 是什么 | ctrl 怎么用它 |
 | --- | --- | --- |
-| [pi-durable](https://github.com/zzjcool/pi-durable) | append-only 会话、记忆、agent 循环、压缩 | 引擎，唯一 import 处是 `src/engine/durable.ts` |
+| [pi-coding-agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) | 会话、上下文、压缩、agent 循环 | 引擎，唯一出口是 `src/engine/durable.ts` |
 | pi | 真正会读代码、改文件、跑命令的 agent | 每次派活起一个 `pi -p` 子进程 |
 | herdr / kraal | 机器与终端 | 无关（v1 之后再说） |
 
@@ -62,7 +62,7 @@
 
 沿用 pi-durable / pi-async / pi-legion 的家规：TypeScript strict、ESM、无构建步骤
 （`node --experimental-strip-types` 直接跑 `.ts`）、相对 import 带 `.ts` 后缀、
-测试用 `node:test`、零运行时依赖（Node builtins only）。
+测试用 `node:test`、运行时依赖只有官方 pi SDK。
 
 ## 运行
 
