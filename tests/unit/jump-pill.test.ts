@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url"
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const appJs = readFileSync(path.join(repoRoot, "src/web/public/app.js"), "utf8")
 const html = readFileSync(path.join(repoRoot, "src/web/public/index.html"), "utf8")
+const styles = readFileSync(path.join(repoRoot, "src/web/public/styles.css"), "utf8")
 
 function sliceFrom(marker: string, until: string): string {
   const start = appJs.indexOf(marker)
@@ -20,6 +21,49 @@ function constantOf(name: string): string {
   const found = new RegExp(`const ${name} = [^\\n]+`).exec(appJs)
   assert.ok(found, `app.js is missing the ${name} constant`)
   return found[0]
+}
+
+function blockOf(selector: string): string {
+  const pattern = new RegExp(`(?:^|\\n)${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`)
+  const found = pattern.exec(styles)
+  assert.ok(found, `styles.css is missing the ${selector} rule`)
+  return String(found[1]).replace(/\s+/g, " ").trim()
+}
+
+function pxOf(block: string, property: string): number | undefined {
+  const match = new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+)`).exec(block)
+  const px = match?.[1] === undefined ? null : /(-?\d+(?:\.\d+)?)px/.exec(match[1])
+  return px?.[1] === undefined ? undefined : Number(px[1])
+}
+
+function paddingBottomOf(block: string): number {
+  const longhand = pxOf(block, "padding-bottom")
+  if (longhand !== undefined) return longhand
+  const shorthand = /(?:^|;)\s*padding\s*:\s*([^;]+)/.exec(block)
+  assert.ok(shorthand?.[1] !== undefined, `rule has no padding: ${block}`)
+  const parts = String(shorthand[1])
+    .trim()
+    .split(/\s+/)
+    .map((part) => {
+      const px = /(-?\d+(?:\.\d+)?)px/.exec(part)
+      return px?.[1] === undefined ? 0 : Number(px[1])
+    })
+  assert.ok(parts.length > 0, `padding shorthand is empty: ${shorthand[1]}`)
+  if (parts.length === 1) return parts[0]
+  if (parts.length === 2) return parts[0]
+  return parts[2]
+}
+
+function pillHeightFrom(block: string): number {
+  const padding = /(?:^|;)\s*padding\s*:\s*([^;]+)/.exec(block)?.[1] ?? ""
+  const numbers = [...padding.matchAll(/(\d+(?:\.\d+)?)px/g)].map((entry) => Number(entry[1]))
+  const vertical = numbers.length >= 2 ? numbers[0] * 2 : (numbers[0] ?? 0) * 2
+  const fontSize = pxOf(block, "font-size") ?? 12
+  const lineHeight = pxOf(block, "line-height")
+  const ratio = Number(/(?:^|;)\s*line-height\s*:\s*([\d.]+)(?:\s*;|\s*$)/.exec(block)?.[1] ?? 1.4)
+  const lineBox = lineHeight ?? ratio * fontSize
+  const border = pxOf(block, "border") ?? 0
+  return Math.ceil(vertical + lineBox + border * 2)
 }
 
 const constantsSource = ["NEAR_BOTTOM_PX", "STICK_POLL_MS", "STICK_UP_PX"].map(constantOf).join("\n")
@@ -326,4 +370,34 @@ test("the status bar shows — until the agent snapshot lands, and a real zero s
   head.state.eventCount = 0
   head.updateHead()
   assert.equal(head.els.events.textContent, "0", "a real empty log must still read 0")
+})
+
+test("the newest content can be scrolled clear of the jump pill instead of under it", () => {
+  const rowsPadding = paddingBottomOf(blockOf(".rows"))
+  const timelinePadding = paddingBottomOf(blockOf(".timeline"))
+  const pill = blockOf(".jump-pill")
+  const dock = blockOf(".jump-dock")
+  const bound = (pxOf(dock, "bottom") ?? 0) + pillHeightFrom(pill)
+
+  assert.equal(
+    timelinePadding,
+    0,
+    `.timeline keeps ${timelinePadding}px of bottom padding, which lifts the sticky dock by that much and squeezes the pill into the text`,
+  )
+  assert.ok(
+    rowsPadding >= bound,
+    `the scroller reserves ${rowsPadding}px below the rows but the pill needs ${bound}px: content would still land behind it`,
+  )
+  assert.ok(rowsPadding >= 56, `the reserved band shrank to ${rowsPadding}px, below the 56px the pill needs on a phone`)
+  assert.ok(
+    rowsPadding - bound <= 24,
+    `the reserved band grew to ${rowsPadding}px against a ${bound}px pill, adding dead space above the composer`,
+  )
+})
+
+test("the jump dock stays a non-interactive sticky anchor while the pill stays clickable", () => {
+  const dock = blockOf(".jump-dock")
+  assert.match(dock, /position:\s*sticky/, `the dock must stay sticky, got: ${dock}`)
+  assert.match(dock, /pointer-events:\s*none/, `the zero-height dock must not eat clicks, got: ${dock}`)
+  assert.match(blockOf(".jump-pill"), /pointer-events:\s*auto/, "the pill must opt back into clicks")
 })
