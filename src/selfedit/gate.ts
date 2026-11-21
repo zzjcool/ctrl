@@ -390,12 +390,18 @@ export class SelfEditGate {
     for (let index = 0; index < this.verifyCommands.length; index += 1) {
       const command = this.verifyCommands[index] as string
       const name = VERIFY_SLOTS[index] ?? `step${index}`
-      tests[name] = await this.verifyOne(command)
+      tests[name] = await this.verifyOne(command, name !== "typecheck")
     }
     return tests
   }
 
-  private async verifyOne(command: string): Promise<{ ok: boolean; output?: string }> {
+  private async verifyOne(command: string, retry: boolean): Promise<{ ok: boolean; output?: string }> {
+    const first = await this.runVerify(command)
+    if (first.ok || !retry) return first
+    return await this.runVerify(command)
+  }
+
+  private async runVerify(command: string): Promise<{ ok: boolean; output?: string }> {
     try {
       const result = await runCommand(command, [], {
         cwd: this.repoRoot,

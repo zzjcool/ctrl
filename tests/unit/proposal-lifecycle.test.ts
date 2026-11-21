@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { DatabaseSync } from "node:sqlite"
@@ -152,6 +152,39 @@ test("a worker that changes nothing records a failed proposal instead of an open
       return true
     },
   )
+})
+
+test("a suite that fails once and passes on the retry is green", async () => {
+  const repo = await makeRepo()
+  const db = await makeDb()
+  const side = await scratch("ctrl-lifecycle-retry-")
+  const marker = path.join(side, "marker")
+  const log = path.join(side, "log")
+  const flaky = `echo run >> ${log}; if [ -f ${marker} ]; then true; else touch ${marker}; false; fi`
+  const gate = makeGate({ repo, db, verifyCommands: ["true", flaky] })
+
+  const started = await gate.start("flaky suite")
+  assert.equal(started.ok, true, started.output)
+  await writeFile(path.join(repo, "flaky.txt"), "one\n", "utf8")
+  const proposal = await gate.handleExit({ id: started.jobId ?? "", code: 0 })
+  assert.ok(proposal)
+  assert.equal(proposal.status, "open")
+  assert.equal(proposal.tests?.unit?.ok, true, "the retry turns the suite green")
+  assert.equal((await readFile(log, "utf8")).trim().split("\n").length, 2, "the failing suite ran exactly twice")
+})
+
+test("a green suite runs once and a deterministic typecheck never retries", async () => {
+  const repo = await makeRepo()
+  const db = await makeDb()
+  const side = await scratch("ctrl-lifecycle-single-")
+  const log = path.join(side, "log")
+  const gate = makeGate({ repo, db, verifyCommands: [`echo run >> ${log}; true`, "true"] })
+
+  const started = await gate.start("single run")
+  assert.equal(started.ok, true, started.output)
+  await writeFile(path.join(repo, "quick.txt"), "one\n", "utf8")
+  await gate.handleExit({ id: started.jobId ?? "", code: 0 })
+  assert.equal((await readFile(log, "utf8")).trim().split("\n").length, 1)
 })
 
 test("a red proposal is failed at birth and apply refuses it with the verification message", async () => {
